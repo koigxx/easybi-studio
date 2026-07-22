@@ -44,17 +44,6 @@ export async function computePrecheck(
   if (!hasConfig) missing.push('构建配置');
 
   const publishedVersions = await listDirs(join(workspaceRoot, 'knowledge', 'versions'));
-  const draftDirs = await listDirs(join(workspaceRoot, 'knowledge', 'drafts'));
-  const hasKnowledge = publishedVersions.length > 0 || draftDirs.length > 0;
-  items.push({
-    key: 'knowledge',
-    label: '存在知识库（草稿或已发布）',
-    ok: hasKnowledge,
-    detail: hasKnowledge
-      ? `已发布 ${publishedVersions.length}，草稿 ${draftDirs.length}`
-      : '尚无知识库',
-  });
-  if (!hasKnowledge) missing.push('知识库');
 
   const reportPkgs = await listDirs(join(workspaceRoot, 'reports', 'packages'));
   items.push({
@@ -65,6 +54,16 @@ export async function computePrecheck(
   });
   if (reportPkgs.length === 0) missing.push('报表包');
 
+  // Knowledge must be published to build any artifact (hard gate).
+  const knowledgePublished = publishedVersions.length > 0;
+  items.push({
+    key: 'published-knowledge',
+    label: '知识库已发布',
+    ok: knowledgePublished,
+    detail: knowledgePublished ? `已发布 ${publishedVersions.length} 个版本` : '需要已发布知识库版本',
+  });
+  if (!knowledgePublished) missing.push('已发布知识库');
+
   // development-only when the knowledge is not published.
   const developmentOnly = publishedVersions.length === 0;
 
@@ -72,23 +71,16 @@ export async function computePrecheck(
   if (level !== 'development') {
     const hasReal = false; // real sync export result would be required
     items.push({
-      key: 'published-knowledge',
-      label: '知识库已发布',
-      ok: publishedVersions.length > 0,
-      detail: publishedVersions.length > 0 ? '已发布' : '需要已发布知识库版本',
-    });
-    items.push({
       key: 'real-sync-export',
       label: '真实同步导出通过',
       ok: hasReal,
       detail: '候选/生产制品需要真实同步导出通过（第一版不支持构建）',
     });
-    if (publishedVersions.length === 0) missing.push('已发布知识库');
     missing.push('真实导出验收');
     if (level === 'production') missing.push('生产签名与 Secret 初始化');
   }
 
-  const baseReady = hasConfig && hasKnowledge && reportPkgs.length > 0;
+  const baseReady = hasConfig && reportPkgs.length > 0 && knowledgePublished;
   const buildable = level === 'development' ? baseReady : false;
 
   return { level, buildable, items, missing, developmentOnly };

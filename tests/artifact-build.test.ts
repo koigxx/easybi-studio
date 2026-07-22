@@ -24,8 +24,10 @@ beforeAll(async () => {
   ws = await mkdtemp(join(tmpdir(), 'easybi-art-'));
   await mkdir(join(ws, 'config'), { recursive: true });
   await mkdir(join(ws, 'reports', 'plans'), { recursive: true });
+  // A published knowledge version (required by the hard gate) + a draft alongside.
+  await mkdir(join(ws, 'knowledge', 'versions', 'v1'), { recursive: true });
+  await writeFile(join(ws, 'knowledge', 'versions', 'v1', 'manifest.json'), '{"catalog_status":"published"}');
   await mkdir(join(ws, 'knowledge', 'drafts', 'd1'), { recursive: true });
-  // A draft (not published) -> development-only.
   await writeFile(join(ws, 'knowledge', 'drafts', 'd1', 'manifest.json'), '{"catalog_status":"draft"}');
   // Config with a secret that must be redacted in the artifact.
   await writeFile(
@@ -57,16 +59,31 @@ afterAll(async () => {
 });
 
 maybe('artifact precheck and development build', () => {
-  it('development is buildable; candidate/production are not', async () => {
+  it('development is buildable with published knowledge; candidate/production are not', async () => {
     const dev = await computePrecheck(ws, 'development');
     expect(dev.buildable).toBe(true);
-    expect(dev.developmentOnly).toBe(true);
+    // Published knowledge present -> not development-only.
+    expect(dev.developmentOnly).toBe(false);
+    expect(dev.items.find((i) => i.key === 'published-knowledge')?.ok).toBe(true);
     const cand = await computePrecheck(ws, 'candidate');
     expect(cand.buildable).toBe(false);
     expect(cand.missing).toContain('真实导出验收');
     const prod = await computePrecheck(ws, 'production');
     expect(prod.buildable).toBe(false);
     expect(prod.missing.join('')).toContain('生产签名');
+  });
+
+  it('requires published knowledge to build (hard gate)', async () => {
+    const draftWs = await mkdtemp(join(tmpdir(), 'easybi-art-draft-'));
+    await mkdir(join(draftWs, 'config'), { recursive: true });
+    await writeFile(join(draftWs, 'config', 'easy-bi.json'), '{}');
+    await mkdir(join(draftWs, 'knowledge', 'drafts', 'd1'), { recursive: true });
+    await writeFile(join(draftWs, 'knowledge', 'drafts', 'd1', 'manifest.json'), '{"catalog_status":"draft"}');
+    await mkdir(join(draftWs, 'reports', 'packages', 'r', '0.1.0-draft'), { recursive: true });
+    const pc = await computePrecheck(draftWs, 'development');
+    expect(pc.buildable).toBe(false);
+    expect(pc.missing).toContain('已发布知识库');
+    await rm(draftWs, { recursive: true, force: true });
   });
 
   it('builds a development tar.gz with checksums and redacted secrets', async () => {
@@ -77,7 +94,6 @@ maybe('artifact precheck and development build', () => {
       version: '0.1.0',
       now: '2026-07-18T00:00:00.000Z',
     });
-    expect(rec.developmentOnly).toBe(true);
     expect(rec.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(rec.file).toContain('outputs/artifacts/easybi-development-0.1.0.tar.gz');
 
@@ -106,5 +122,55 @@ maybe('artifact precheck and development build', () => {
     await expect(
       buildArtifact({ workspaceRoot: ws, projectId: 'art', level: 'candidate', version: '0.2.0', now: 'x' }),
     ).rejects.toBeInstanceOf(ArtifactBuildError);
+  });
+});
+
+// Selection test runs unconditionally (no report CLI needed — packages are
+// hand-seeded to exercise the ship-only-selected logic).
+describe('artifact selection ships only chosen report packages', () => {
+  it('copies only selected packages and prunes reports/index.json', async () => {
+    const w = await mkdtemp(join(tmpdir(), 'easybi-art-sel-'));
+    await mkdir(join(w, 'config'), { recursive: true });
+    await writeFile(join(w, 'config', 'easy-bi.json'), '{}');
+    await mkdir(join(w, 'knowledge', 'versions', 'v1'), { recursive: true });
+    await writeFile(join(w, 'knowledge', 'versions', 'v1', 'manifest.json'), '{"catalog_status":"published"}');
+    // Two report packages; we'll ship only report-1.
+    await mkdir(join(w, 'reports', 'packages', 'report-1', '0.1.0-draft'), { recursive: true });
+    await writeFile(join(w, 'reports', 'packages', 'report-1', '0.1.0-draft', 'f.txt'), 'one');
+    await mkdir(join(w, 'reports', 'packages', 'report-2', '0.1.0-draft'), { recursive: true });
+    await writeFile(join(w, 'reports', 'packages', 'report-2', '0.1.0-draft', 'f.txt'), 'two');
+    await writeFile(
+      join(w, 'reports', 'index.json'),
+      JSON.stringify({
+        reports: [
+          { id: 'report-1', name: '报表一', version: '0.1.0-draft', path: 'packages/report-1/0.1.0-draft' },
+          { id: 'report-2', name: '报表二', version: '0.1.0-draft', path: 'packages/report-2/0.1.0-draft' },
+        ],
+      }),
+    );
+
+    await buildArtifact({
+      workspaceRoot: w,
+      projectId: 'sel',
+      level: 'development',
+      version: '0.9.0',
+      reportVersions: { 'report-1': '0.1.0-draft' },
+      now: '2026-07-18T00:00:00.000Z',
+    });
+
+    const out = join(w, 'unpacked');
+    await mkdir(out, { recursive: true });
+    spawnSync('tar', ['-xzf', join(w, 'outputs', 'artifacts', 'easybi-development-0.9.0.tar.gz'), '-C', out]);
+
+    // Only report-1 shipped.
+    expect(existsSync(join(out, 'reports', 'packages', 'report-1', '0.1.0-draft', 'f.txt'))).toBe(true);
+    expect(existsSync(join(out, 'reports', 'packages', 'report-2'))).toBe(false);
+    // index.json pruned to the selection.
+    const idx = JSON.parse(await readFile(join(out, 'reports', 'index.json'), 'utf8')) as {
+      reports: Array<{ id: string }>;
+    };
+    expect(idx.reports.map((r) => r.id)).toEqual(['report-1']);
+
+    await rm(w, { recursive: true, force: true });
   });
 });

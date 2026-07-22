@@ -35,6 +35,27 @@ async function copyTree(src: string, dest: string): Promise<void> {
   });
 }
 
+/**
+ * Copy only the selected report package dirs (reports/packages/<id>/<version>)
+ * into the staged tree. Missing selections are skipped silently — the caller
+ * validates the selection is non-empty. Used to ship only the report packages
+ * the user picked, not the whole workspace.
+ */
+async function copySelectedPackages(
+  srcRoot: string,
+  destRoot: string,
+  selected: Array<{ id: string; version: string }>,
+): Promise<void> {
+  for (const { id, version } of selected) {
+    const src = join(srcRoot, id, version);
+    if (!(await exists(src))) continue;
+    await cp(src, join(destRoot, id, version), {
+      recursive: true,
+      filter: (s) => !STAGE_EXCLUDE.test(s),
+    });
+  }
+}
+
 /** Redact secret-bearing config into the staged copy (never ship raw secrets). */
 async function stageConfig(srcFile: string, destFile: string): Promise<void> {
   if (!(await exists(srcFile))) return;
@@ -63,6 +84,33 @@ function redactSecretsDeep(node: unknown): void {
       }
     }
   }
+}
+
+/**
+ * Stage a pruned reports/index.json holding only the selected packages, so the
+ * shipped artifact registers exactly the report packages it contains. Tolerates
+ * a missing/unreadable source index (writes an empty registry then).
+ */
+async function stageReportIndex(
+  workspaceRoot: string,
+  stageRoot: string,
+  selected: Array<{ id: string; version: string }>,
+): Promise<void> {
+  const keep = new Set(selected.map((s) => `${s.id}@${s.version}`));
+  let entries: Array<Record<string, unknown>> = [];
+  try {
+    const raw = await readFile(join(workspaceRoot, 'reports', 'index.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { reports?: Array<Record<string, unknown>> };
+    entries = (parsed.reports ?? []).filter((r) => keep.has(`${String(r.id)}@${String(r.version)}`));
+  } catch {
+    entries = [];
+  }
+  await mkdir(join(stageRoot, 'reports'), { recursive: true });
+  await writeFile(
+    join(stageRoot, 'reports', 'index.json'),
+    JSON.stringify({ reports: entries }, null, 2) + '\n',
+    'utf8',
+  );
 }
 
 async function listFilesRec(root: string): Promise<string[]> {
@@ -126,7 +174,25 @@ export async function buildArtifact(options: BuildArtifactOptions): Promise<Arti
   );
   await copyTree(join(workspaceRoot, 'knowledge', 'versions'), join(stageRoot, 'knowledge', 'versions'));
   await copyTree(join(workspaceRoot, 'knowledge', 'drafts'), join(stageRoot, 'knowledge', 'drafts'));
-  await copyTree(join(workspaceRoot, 'reports', 'packages'), join(stageRoot, 'reports', 'packages'));
+
+  // Report packages: ship only the selected ones when a selection is given;
+  // otherwise ship all (backward compatible). Also stage a matching
+  // reports/index.json so the artifact registers exactly what it ships.
+  const selection = Object.entries(options.reportVersions ?? {}).map(([id, version]) => ({
+    id,
+    version: String(version),
+  }));
+  if (selection.length > 0) {
+    await copySelectedPackages(
+      join(workspaceRoot, 'reports', 'packages'),
+      join(stageRoot, 'reports', 'packages'),
+      selection,
+    );
+    await stageReportIndex(workspaceRoot, stageRoot, selection);
+  } else {
+    await copyTree(join(workspaceRoot, 'reports', 'packages'), join(stageRoot, 'reports', 'packages'));
+  }
+
   await copyTree(join(workspaceRoot, 'skills'), join(stageRoot, 'skills'));
 
   // Artifact metadata + checksum manifest.

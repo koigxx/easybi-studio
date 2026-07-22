@@ -517,17 +517,19 @@ export interface ArtifactPrecheck {
 export const publishApi = {
   plan: (id: string, level: string) =>
     call<{ precheck: ArtifactPrecheck }>('POST', `/api/easybi/projects/${id}/publish/plan`, { level }),
-  build: (id: string, version: string) =>
+  build: (id: string, version: string, reportVersions?: Record<string, string>) =>
     call<{ artifact: { file: string; sha256: string; sizeBytes: number; developmentOnly: boolean } }>(
       'POST',
       `/api/easybi/projects/${id}/publish/build`,
-      { level: 'development', version },
+      { level: 'development', version, ...(reportVersions ? { reportVersions } : {}) },
     ),
   artifacts: (id: string) =>
     call<{ artifacts: Array<{ file: string; sizeBytes: number }> }>(
       'GET',
       `/api/easybi/projects/${id}/artifacts`,
     ),
+  deleteArtifact: (id: string, name: string) =>
+    call<{ deleted: string }>('DELETE', `/api/easybi/projects/${id}/artifacts/${name}`),
 };
 
 // ── AI 对话（经 AgentBridge，Provider 可切：本机 Claude → Innos）──────────────

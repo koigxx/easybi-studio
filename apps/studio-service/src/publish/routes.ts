@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { stat, readdir } from 'node:fs/promises';
+import { stat, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { ok, fail, type ArtifactLevel } from '@easybi-studio/contracts';
@@ -73,6 +73,27 @@ export function registerPublishRoutes(app: FastifyInstance, service: ProjectServ
         artifacts.push({ file: `outputs/artifacts/${f}`, sizeBytes: s.size });
       }
       return ok(request.requestId, { artifacts });
+    },
+  );
+
+  // Delete an artifact by filename (kept within outputs/artifacts).
+  app.delete<{ Params: { projectId: string; name: string } }>(
+    '/api/easybi/projects/:projectId/artifacts/:name',
+    async (request, reply) => {
+      const p = service.get(request.params.projectId);
+      if (!p) return reply.code(404).send(fail(request.requestId, 'NOT_FOUND', '项目不存在'));
+      const name = request.params.name;
+      if (name.includes('/') || name.includes('..') || !name.endsWith('.tar.gz')) {
+        return reply.code(400).send(fail(request.requestId, 'PATH_NOT_ALLOWED', '非法文件名'));
+      }
+      const abs = join(p.workspaceRoot, 'outputs', 'artifacts', name);
+      try {
+        await stat(abs);
+      } catch {
+        return reply.code(404).send(fail(request.requestId, 'NOT_FOUND', '制品不存在'));
+      }
+      await rm(abs, { force: true });
+      return ok(request.requestId, { deleted: name });
     },
   );
 
