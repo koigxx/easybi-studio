@@ -314,6 +314,145 @@ return wt / 10000;              // 50.6155, not 50.615500000000004
 // ❌ never: for (const r of rows) sum += Number(r.raw_weight ?? 0)
 ```
 
+### Worked example: group-by + conditional counts (copy this shape)
+
+The most common statistics report is "**one row per group (客户/日期/…), with counts
+split by status**" — e.g. 每个客户的订单总数、已完成数、待处理数. Because the SQL guard
+bans quote literals and comparison operators inside a trusted `sql_expression`
+(so `SUM(status = 'done')` is **not** allowed), every status-conditional count
+must be a `computed` (`mode: group`) field whose logic lives in the group
+transform. Copy the shape below rather than re-deriving the runtime contract.
+
+**How the transform receives data** (no need to read `runtime-core.ts`):
+
+- The runtime buffers raw rows per group (`custom_logic.group_keys`) and calls the
+  transform **once per group** with those rows.
+- Each computed field's `dependencies` are selected into the row as `raw_<id>`
+  aliases (`{ id: "raw_status", alias: "t0", field: "order_status" }` → `r.raw_status`).
+- Your `source.expression` is a self-contained JS expression that returns the
+  field's value for the group. `rows` is the group's buffered rows in scope.
+
+`configure-plan` snippet — group by customer, count total + by-status:
+
+```json
+{
+  "custom_logic": { "group_keys": ["customer_id"], "max_group_rows": 100000 },
+  "aggregation": { "group_by": ["t0.`customer_id`"], "having": [] },
+  "fields": [
+    {
+      "id": "order_total",
+      "label": "订单总数",
+      "output_type": "number",
+      "source": {
+        "kind": "computed", "mode": "group",
+        "dependencies": [{ "id": "raw_oid", "alias": "t0", "field": "order_no" }],
+        "expression": "rows.length"
+      }
+    },
+    {
+      "id": "order_done",
+      "label": "已完成数",
+      "output_type": "number",
+      "source": {
+        "kind": "computed", "mode": "group",
+        "dependencies": [{ "id": "raw_status", "alias": "t0", "field": "order_status" }],
+        "expression": "rows.filter(r => String(r.raw_status) === '2').length"
+      }
+    }
+  ]
+}
+```
+
+The status literal (`'2'`) lives **inside the JS transform expression**, which is
+allowed — the guard only bans quotes/comparisons in `sql_expression`, not in a
+`computed` expression. Notes:
+
+- **Counts are integers** — use `rows.length` / `.filter(...).length` / `+= 1`.
+  Do NOT scale or divide (that rule is only for decimal *sums*, see above).
+- Compare the status as a **string** (`String(r.raw_status) === '2'`) so numeric
+  and text status columns both work; match the code to the knowledge enum.
+- One output row per group is produced automatically; you return one **value per
+  field**, not a row. Different metrics are separate `computed` fields.
+- Counting distinct values in a one-to-many join: `new Set(rows.map(r =>
+  r.raw_x)).size`. Summing a decimal metric: follow the integer-accumulation rule.
+
+### Multi-entity grouped statistics: `group_queries` (count SEPARATE tables per group)
+
+Use this when one report groups by a shared dimension (e.g. 客户/日期) and counts
+**several INDEPENDENT entities** that live in different base tables — e.g. "每个客户
+的订单数、运单数、派车单数，各自再分状态统计". Do **NOT** model this as one big JOIN:
+joining 订单→运单→派车单 is one-to-many-to-many, so a single `COUNT` fan-out-inflates
+(one order with 3 waybills is counted as 3). It is also NOT enrichment (that is a
+main→lookup column attach, and is banned on grouped reports).
+
+Instead declare **one primary grouped query + N sibling grouped queries**, each over
+ONE base table, all grouped by the same key. The runtime executes each independently
+and **full-outer-merges them on `merge_keys`** — a group present in some queries but
+not others gets 0 for the missing numeric metrics. Because each query touches a single
+table, every `COUNT`/conditional count is clean (no fan-out) and you only reason about
+one table at a time.
+
+Configure via `configuration.group_queries`:
+
+```json
+{
+  "aggregation": { "group_by": ["t0.customer_name"], "having": [] },
+  "fields": [
+    { "id": "customer_name", "label": "客户名称", "output_type": "string",
+      "source": { "kind": "column", "field": "customer_name" } },
+    { "id": "order_total", "label": "合计订单数量", "output_type": "number",
+      "source": { "kind": "sql_expression", "expression": "COUNT(t0.`order_no`)",
+                  "dependencies": [{ "alias": "t0", "field": "order_no" }] } },
+    { "id": "order_done", "label": "已完成的订单数量", "output_type": "number",
+      "source": { "kind": "sql_expression",
+                  "expression": "SUM(CASE WHEN t0.`order_status` = 2 THEN 1 ELSE 0 END)",
+                  "dependencies": [{ "alias": "t0", "field": "order_status" }] } }
+  ],
+  "group_queries": {
+    "merge_keys": ["customer_name"],
+    "period_param": "create_time",
+    "queries": [
+      {
+        "id": "waybill",
+        "table": { "database": "otms", "table": "oms_waybill" },
+        "alias": "t0",
+        "group_by": ["t0.customer_name"],
+        "period_field": "create_time",
+        "fields": [
+          { "id": "customer_name", "label": "客户名称", "output_type": "string",
+            "source": { "kind": "column", "field": "customer_name" } },
+          { "id": "waybill_total", "label": "运单数量合计", "output_type": "number",
+            "source": { "kind": "sql_expression", "expression": "COUNT(t0.`waybill_code`)",
+                        "dependencies": [{ "alias": "t0", "field": "waybill_code" }] } }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Rules (all enforced by `configure-plan`/`validate`):
+
+- **`merge_keys`** are the output dimension(s) EVERY query must produce (as a `column`
+  field with the same `id`) and group by. The runtime aligns rows on these values.
+- **`group_by` uses unquoted `alias.field`** (e.g. `t0.customer_name`, NOT
+  `` t0.`customer_name` ``) — the same rule as the main aggregation.
+- **Per-query counts are plain SQL** (`COUNT`, `SUM(CASE WHEN col = code THEN 1 END)`).
+  Because each query is single-table there is no fan-out, so SQL aggregation is correct
+  and you do NOT need a group transform here. (The `sql_expression` guard still bans
+  quotes/`;`; a status literal like `= 2` is a bare number and is allowed. For a
+  non-numeric status code, prefer a boolean/enum column comparison the guard permits, or
+  fall back to the single-table group-transform pattern above.)
+- **Shared time filter**: set `group_queries.period_param` to a required date/datetime
+  range parameter, and give each sibling a `period_field` (its own time column). The one
+  range the user picks is broadcast to every query's own column — "用户筛一天" filters
+  all tables consistently.
+- **Mutually exclusive** with an in-memory group transform (`custom_logic.mode=group`),
+  enrichment, and comparison (环比/同比). Combining them is a hard error, not a silent
+  degrade — pick one model per report.
+- Filters that only apply to one entity (e.g. 运单 "未拆分"/"已复核") go in that
+  sibling's own `system_conditions` or as a fixed predicate on its query, not globally.
+
 ### Comparison reports (环比 / 同比) — same logic, wider window
 
 A comparison metric compares the selected month range against an earlier window:

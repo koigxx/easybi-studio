@@ -44,6 +44,31 @@ interface ClaudeTaskState {
   canceled: boolean;
   waiting: boolean;
   sawResult: boolean;
+  /** Last few stderr lines of the current spawn, for diagnosing silent failures. */
+  stderrTail: string[];
+}
+
+/** Keep at most this many recent stderr lines for failure diagnostics. */
+const STDERR_TAIL_MAX = 8;
+
+/**
+ * Turn a headless `result` event's `subtype` into a human hint. `claude -p`
+ * reports why a turn ended here (e.g. hitting the token/turn ceiling) even when
+ * the `result` text is empty — surfacing it is the difference between a bare
+ * 「任务失败」and an actionable message.
+ */
+function describeResultSubtype(subtype: string | undefined): string | undefined {
+  switch (subtype) {
+    case 'error_max_tokens':
+      return '达到模型上下文/输出上限（无头模式不会自动压缩，建议拆小任务或精简上下文后重试）';
+    case 'error_max_turns':
+      return '达到最大回合数上限';
+    case 'error_during_execution':
+      return '执行过程中出错';
+    default:
+      // Unknown but non-success subtype: pass it through verbatim as a hint.
+      return subtype && subtype !== 'success' ? `失败类型：${subtype}` : undefined;
+  }
 }
 
 const SAFETY_SUFFIX = [
@@ -104,6 +129,8 @@ export class ClaudeCodeBridge implements AgentBridge {
       env: this.opts.env ?? process.env,
     });
     state.child = child;
+    // Fresh stderr buffer for THIS spawn (a resume reuses the same state).
+    state.stderrTail = [];
     // Bind the queue for THIS spawn so a later resume's fresh queue is never
     // ended by this process's late close handler.
     const queue = state.queue;
@@ -112,17 +139,30 @@ export class ClaudeCodeBridge implements AgentBridge {
     rl.on('line', (line) => this.handleLine(state, queue, line));
     child.stderr.on('data', (d) => {
       const text = redactSecrets(String(d)).trim();
-      if (text) queue.push({ type: 'message_delta', taskId: state.task.taskId, text: `[stderr] ${text}` });
+      if (text) {
+        // Keep a rolling tail for failure diagnostics (bounded).
+        state.stderrTail.push(text);
+        if (state.stderrTail.length > STDERR_TAIL_MAX) state.stderrTail.shift();
+        queue.push({ type: 'message_delta', taskId: state.task.taskId, text: `[stderr] ${text}` });
+      }
     });
     child.on('error', (err) => {
       state.task.status = 'FAILED';
       queue.push({ type: 'failed', taskId: state.task.taskId, error: redactSecrets(String(err.message)) });
       queue.end();
     });
-    child.on('close', () => {
+    child.on('close', (code, signal) => {
       if (!state.sawResult && !state.waiting && state.task.status === 'RUNNING') {
         state.task.status = 'FAILED';
-        queue.push({ type: 'failed', taskId: state.task.taskId, error: 'Claude 进程异常退出' });
+        queue.push({
+          type: 'failed',
+          taskId: state.task.taskId,
+          error: this.buildFailureMessage('Claude 进程异常退出', {
+            code,
+            signal,
+            stderrTail: state.stderrTail,
+          }),
+        });
         queue.end();
       } else if (!state.waiting) {
         queue.end();
@@ -132,6 +172,32 @@ export class ClaudeCodeBridge implements AgentBridge {
     // Prompt via stdin.
     child.stdin.write(prompt);
     child.stdin.end();
+  }
+
+  /**
+   * Compose an actionable failure message from whatever diagnostics we have:
+   * the base reason, the headless `result` subtype (why the turn ended), the
+   * exit code/signal, and the tail of stderr. Keeps 「任务失败」from being the
+   * only thing the user ever sees.
+   */
+  private buildFailureMessage(
+    base: string,
+    diag: {
+      subtype?: string;
+      code?: number | null;
+      signal?: NodeJS.Signals | null;
+      stderrTail?: string[];
+    },
+  ): string {
+    const parts = [base];
+    const hint = describeResultSubtype(diag.subtype);
+    if (hint) parts.push(hint);
+    if (diag.signal) parts.push(`信号 ${diag.signal}`);
+    else if (typeof diag.code === 'number' && diag.code !== 0) parts.push(`退出码 ${diag.code}`);
+    const tail = (diag.stderrTail ?? []).join(' | ').trim();
+    if (tail) parts.push(`stderr: ${tail}`);
+    // De-dup (e.g. base already equals the stderr line) and join.
+    return [...new Set(parts)].join('；');
   }
 
   private handleLine(state: ClaudeTaskState, queue: AsyncEventQueue<AgentEvent>, line: string): void {
@@ -185,11 +251,21 @@ export class ClaudeCodeBridge implements AgentBridge {
 
     if (type === 'result') {
       state.sawResult = true;
-      const isError = obj.is_error === true;
-      const resultText = typeof obj.result === 'string' ? redactSecrets(obj.result) : undefined;
+      const subtype = typeof obj.subtype === 'string' ? obj.subtype : undefined;
+      // `claude -p` marks failure via is_error OR a non-success subtype; the
+      // result text is often empty on failure, so we don't rely on it alone.
+      const isError = obj.is_error === true || (subtype !== undefined && subtype !== 'success');
+      const resultText = typeof obj.result === 'string' ? redactSecrets(obj.result.trim()) : undefined;
       if (isError) {
         state.task.status = 'FAILED';
-        queue.push({ type: 'failed', taskId, error: resultText ?? '任务失败' });
+        queue.push({
+          type: 'failed',
+          taskId,
+          error: this.buildFailureMessage(resultText || '任务失败', {
+            subtype,
+            stderrTail: state.stderrTail,
+          }),
+        });
       } else {
         state.task.status = 'SUCCEEDED';
         queue.push({ type: 'completed', taskId, ...(resultText ? { summary: resultText } : {}) });
@@ -214,6 +290,7 @@ export class ClaudeCodeBridge implements AgentBridge {
       canceled: false,
       waiting: false,
       sawResult: false,
+      stderrTail: [],
     };
     this.tasks.set(taskId, state);
     this.spawnClaude(state, input.prompt);
@@ -241,6 +318,7 @@ export class ClaudeCodeBridge implements AgentBridge {
       canceled: false,
       waiting: false,
       sawResult: true,
+      stderrTail: [],
     });
   }
 

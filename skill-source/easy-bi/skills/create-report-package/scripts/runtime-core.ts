@@ -1377,6 +1377,8 @@ async function prepareSyncQuery(
   transform: TransformPipeline | ((row: JsonRecord) => JsonRecord);
   postFilter: (outputRow: JsonRecord) => boolean;
   enrichments: EnrichmentBinding[];
+  /** Compiled sibling grouped queries (group_queries), merged on merge_keys. */
+  groupQueries: { mergeKeys: string[]; compiled: Array<{ id: string; sql: string; values: unknown[] }> } | null;
 }> {
   const { workspace, config } = await loadRuntimeContext(workspaceValue);
   const report = await loadReportPackage(workspace, request.reportId, request.reportVersion);
@@ -1421,6 +1423,36 @@ async function prepareSyncQuery(
     context,
     dialect,
   );
+  // Multi-entity grouped queries: compile each sibling's SQL with the SAME filters
+  // (the shared time range binds to each sibling's own time column) + context, so
+  // the runtime can execute them and full-outer-merge on merge_keys. Mutually
+  // exclusive with a group transform / enrichment (rejected at generation time; we
+  // re-guard below for defense in depth).
+  let groupQueries:
+    | { mergeKeys: string[]; compiled: Array<{ id: string; sql: string; values: unknown[] }> }
+    | null = null;
+  const gqManifest = report.manifest.group_queries as JsonRecord | undefined;
+  if (gqManifest?.queries?.length) {
+    if (report.manifest.custom_logic?.mode === "group" || enrichments.length) {
+      throw new RuntimeError(
+        "GROUP_QUERIES_UNSUPPORTED",
+        "group_queries 与内存分组 transform / enrichment 互斥",
+      );
+    }
+    const compiledSiblings: Array<{ id: string; sql: string; values: unknown[] }> = [];
+    for (const gq of gqManifest.queries as JsonRecord[]) {
+      const siblingSql = await readFile(join(report.root, String(gq.sql)), "utf8");
+      const siblingBindings = await readJson(join(report.root, String(gq.bindings)));
+      compiledSiblings.push({
+        id: String(gq.id),
+        ...compileSql(siblingSql, siblingBindings, filters, context, dialect),
+      });
+    }
+    groupQueries = {
+      mergeKeys: (gqManifest.merge_keys ?? []).map(String),
+      compiled: compiledSiblings,
+    };
+  }
   const transform = await resolveTransform(report);
   // Post-transform numeric-range filter (件数总和 …). Built from the SAME (widened)
   // filter values; enforces required post_transform filters. Applied in memory to
@@ -1438,7 +1470,76 @@ async function prepareSyncQuery(
     transform,
     postFilter,
     enrichments,
+    groupQueries,
   };
+}
+
+/**
+ * Execute the main query + every sibling group query, then FULL-OUTER-merge their
+ * result sets on `mergeKeys` into one row per distinct key tuple. Each query is a
+ * standalone grouped SELECT (one row per key); a key present in some queries but
+ * not others gets that query's metric columns left undefined (numeric counts read
+ * as 0 downstream via the output mapping). Runs all queries on the SAME read-only
+ * adapter/transaction. Returns rows in first-seen key order (main query first).
+ *
+ * This is the group_queries execution model: N independent grouped queries merged
+ * by key — NOT a JOIN (avoids one-to-many fan-out) and NOT enrichment (which is a
+ * main→lookup column attach). Output columns come from the package's merged
+ * fields.json, so unfilled metrics simply render empty/0.
+ */
+/** Identity transform for group_queries output (merge already produced final rows). */
+const identityTransform: TransformPipeline = { mode: "identity" };
+
+/** Adapt an in-memory row array to the AsyncIterable the collector/writer expect. */
+async function* arrayToAsyncIterable(rows: JsonRecord[]): AsyncIterable<JsonRecord> {
+  for (const row of rows) yield row;
+}
+
+export async function runGroupQueriesMerged(
+  adapter: Pick<QueryAdapter, "queryAll">,
+  main: { sql: string; values: unknown[] },
+  groupQueries: { mergeKeys: string[]; compiled: Array<{ id: string; sql: string; values: unknown[] }> },
+  queryTimeoutMs: number,
+  numericFieldIds: Set<string>,
+): Promise<JsonRecord[]> {
+  const { mergeKeys } = groupQueries;
+  const keyOf = (row: JsonRecord): string =>
+    JSON.stringify(mergeKeys.map((k) => row[k] ?? null));
+  const merged = new Map<string, JsonRecord>();
+  const order: string[] = [];
+  const mergeRows = (rows: JsonRecord[]): void => {
+    for (const row of rows) {
+      const key = keyOf(row);
+      let target = merged.get(key);
+      if (!target) {
+        target = {};
+        // Seed the merge-key columns so every merged row carries the dimension.
+        for (const k of mergeKeys) target[k] = row[k] ?? null;
+        merged.set(key, target);
+        order.push(key);
+      }
+      // Copy every non-key column; later queries never overwrite the shared key.
+      for (const [col, value] of Object.entries(row)) {
+        if (mergeKeys.includes(col)) continue;
+        target[col] = value;
+      }
+    }
+  };
+  // Main query first (defines the primary key order), then siblings.
+  mergeRows(await adapter.queryAll(main.sql, main.values, queryTimeoutMs));
+  for (const sibling of groupQueries.compiled) {
+    mergeRows(await adapter.queryAll(sibling.sql, sibling.values, queryTimeoutMs));
+  }
+  // Full-outer semantics: a key missing from some query has no value for that
+  // query's metrics. Default numeric metrics to 0 so a customer with no waybills
+  // shows 0, not blank. Non-numeric missing columns stay null.
+  const result = order.map((key) => merged.get(key)!);
+  for (const row of result) {
+    for (const id of numericFieldIds) {
+      if (row[id] == null) row[id] = 0;
+    }
+  }
+  return result;
 }
 
 /**
@@ -1636,7 +1737,7 @@ export async function querySync(
 ): Promise<JsonRecord> {
   const startedAt = Date.now();
   const prepared = await prepareSyncQuery(workspaceValue, request, options);
-  const { report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments } =
+  const { report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments, groupQueries } =
     prepared;
   const warnings: string[] = [];
   // Preview cap: request.limit (bounded by the policy) or the policy default.
@@ -1649,8 +1750,11 @@ export async function querySync(
   // groups) and no post_transform filter is dropping output rows after the query.
   // Fetch maxRows+1 so `truncated` still reflects that more rows exist.
   const isGroupTransform = typeof transform !== "function" && transform.mode === "group";
+  // A LIMIT push is unsafe for group_queries too: the sibling merge needs every
+  // group's full result to align on merge_keys, and a raw-row LIMIT would cut it.
   const canPushLimit =
     !isGroupTransform &&
+    !groupQueries &&
     !hasActivePostTransformFilter(report.bindings, request.filters ?? {});
   if (canPushLimit) {
     compiled.sql = appendPreviewLimit(compiled.sql, maxRows + 1);
@@ -1662,13 +1766,32 @@ export async function querySync(
     await adapter.beginReadOnly();
     queryStartedAt = Date.now();
     const queryTimeoutMs = Number(policy.query_timeout_seconds ?? 600) * 1000;
-    const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
-    // Attach enrichment columns (batch secondary-query + in-memory merge) before
-    // the collector. Batch size follows the preview cap so one IN(…) covers it.
-    const rowStream = enrichments.length
-      ? enrichBatched(rawStream, enrichments, adapter, queryTimeoutMs, maxRows + 1, warnings)
-      : rawStream;
-    const collected = await collectRows(report, rowStream, transform, {
+    // group_queries: execute main + siblings, full-outer-merge on merge_keys, then
+    // feed the merged rows through the collector with an identity transform.
+    let rowStream: AsyncIterable<JsonRecord>;
+    if (groupQueries) {
+      const numericFieldIds = new Set<string>(
+        (report.fields.fields ?? [])
+          .filter((f: JsonRecord) => f.value_type === "number")
+          .map((f: JsonRecord) => String(f.id)),
+      );
+      const mergedRows = await runGroupQueriesMerged(
+        adapter,
+        compiled,
+        groupQueries,
+        queryTimeoutMs,
+        numericFieldIds,
+      );
+      rowStream = arrayToAsyncIterable(mergedRows);
+    } else {
+      const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
+      // Attach enrichment columns (batch secondary-query + in-memory merge) before
+      // the collector. Batch size follows the preview cap so one IN(…) covers it.
+      rowStream = enrichments.length
+        ? enrichBatched(rawStream, enrichments, adapter, queryTimeoutMs, maxRows + 1, warnings)
+        : rawStream;
+    }
+    const collected = await collectRows(report, rowStream, groupQueries ? identityTransform : transform, {
       maxRows,
       startedAt,
       totalTimeoutSeconds: Number(policy.total_timeout_seconds ?? 900),
@@ -1709,7 +1832,7 @@ export async function exportSync(
 ): Promise<JsonRecord> {
   const startedAt = Date.now();
   const prepared = await prepareSyncQuery(workspaceValue, request, options);
-  const { workspace, config, report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments } =
+  const { workspace, config, report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments, groupQueries } =
     prepared;
   const enrichWarnings: string[] = [];
   const outputDirectory = relativeToWorkspace(
@@ -1729,25 +1852,44 @@ export async function exportSync(
     await adapter.beginReadOnly();
     queryStartedAt = Date.now();
     const queryTimeoutMs = Number(policy.query_timeout_seconds ?? 600) * 1000;
-    const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
-    // Enrichment: batch by a fixed export batch size (each batch = one IN(…) query
-    // per enrichment). Main row count is unchanged, so sheet/row caps stay correct.
-    const rowStream = enrichments.length
-      ? enrichBatched(
-          rawStream,
-          enrichments,
-          adapter,
-          queryTimeoutMs,
-          Number(policy.enrichment_batch_size ?? 1000),
-          enrichWarnings,
-        )
-      : rawStream;
+    // group_queries: execute main + siblings, full-outer-merge on merge_keys, then
+    // write the merged rows with an identity transform.
+    let rowStream: AsyncIterable<JsonRecord>;
+    if (groupQueries) {
+      const numericFieldIds = new Set<string>(
+        (report.fields.fields ?? [])
+          .filter((f: JsonRecord) => f.value_type === "number")
+          .map((f: JsonRecord) => String(f.id)),
+      );
+      const mergedRows = await runGroupQueriesMerged(
+        adapter,
+        compiled,
+        groupQueries,
+        queryTimeoutMs,
+        numericFieldIds,
+      );
+      rowStream = arrayToAsyncIterable(mergedRows);
+    } else {
+      const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
+      // Enrichment: batch by a fixed export batch size (each batch = one IN(…) query
+      // per enrichment). Main row count is unchanged, so sheet/row caps stay correct.
+      rowStream = enrichments.length
+        ? enrichBatched(
+            rawStream,
+            enrichments,
+            adapter,
+            queryTimeoutMs,
+            Number(policy.enrichment_batch_size ?? 1000),
+            enrichWarnings,
+          )
+        : rawStream;
+    }
     const written = await writeWorkbookRows(
       report,
       rowStream,
       output,
       policy,
-      transform,
+      groupQueries ? identityTransform : transform,
       startedAt,
       postFilter,
     );

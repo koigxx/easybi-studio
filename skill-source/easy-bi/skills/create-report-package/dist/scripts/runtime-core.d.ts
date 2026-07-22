@@ -171,6 +171,17 @@ export declare function writeWorkbookRows(report: Pick<LoadedReport, "manifest" 
     sheetCount: number;
     fileBytes: number;
 }>;
+export declare function runGroupQueriesMerged(adapter: Pick<QueryAdapter, "queryAll">, main: {
+    sql: string;
+    values: unknown[];
+}, groupQueries: {
+    mergeKeys: string[];
+    compiled: Array<{
+        id: string;
+        sql: string;
+        values: unknown[];
+    }>;
+}, queryTimeoutMs: number, numericFieldIds: Set<string>): Promise<JsonRecord[]>;
 /**
  * Wrap a main-query row stream so each row comes out with its enrichment columns
  * attached. Rows are processed in batches of `batchSize`: for each batch we run

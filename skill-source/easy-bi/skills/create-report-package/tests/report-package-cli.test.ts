@@ -1683,3 +1683,183 @@ test("boolean_flag rejects an unknown comparison operator", async () => {
   );
   await assert.rejects(() => configurePlan(fixture.plan, configurationPath), /比较符/);
 });
+
+// ── group_queries: multi-entity grouped statistics (按客户分组，分别统计多张表) ──
+
+/**
+ * Write ONLY a driver_product table into knowledge (with a create_time column),
+ * WITHOUT adding its columns to the main report's required_fields — a sibling
+ * group query resolves its own table from knowledge, so the main query must stay
+ * single-table (no forced JOIN).
+ */
+async function addProductKnowledgeOnly(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+): Promise<void> {
+  const dir = join(fixture.knowledge, "databases", "mysql-main", "transport", "hot", "tables");
+  const field = (name: string, dataType: string, primaryKey = false) => ({
+    physical: { name, data_type: dataType, native_type: dataType, primary_key: primaryKey, comment: name },
+    semantic: { name, status: "inferred", report_ids: ["driver-detail"], enum_ref: null },
+    filter: { enabled: true, role: "text", default_operator: "eq", operators: ["eq", "in"], input_type: "text", visibility: "user", required: false },
+  });
+  await writeFile(
+    join(dir, "driver_product.json"),
+    JSON.stringify({
+      table_id: "mysql-main_transport_driver_product",
+      tier: "hot",
+      schema_fingerprint: "product-schema-hash",
+      physical: { profile_id: "mysql-main", database: "transport", table: "driver_product" },
+      physical_fields: [
+        field("id", "bigint", true),
+        field("driver_id", "bigint"),
+        field("product_name", "varchar"),
+        field("create_time", "datetime"),
+        field("is_delete", "tinyint"),
+      ],
+      system_conditions: [{ field: "is_delete", operator: "eq", value: 0 }],
+      security: {},
+    }),
+  );
+}
+
+/**
+ * Configure a group_queries report: main query on `driver` grouped by code with a
+ * conditional count, plus a sibling grouped query on `driver_product` counting per
+ * driver. Both share a create-time range filter bound to each table's own column.
+ */
+async function configureGroupQueries(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+  extra: Record<string, unknown> = {},
+): Promise<any> {
+  const configurationPath = join(fixture.workspace, "reports", "plans", "gq.json");
+  await writeFile(
+    configurationPath,
+    JSON.stringify({
+      // Main query: group drivers by code, count total drivers.
+      aggregation: { group_by: ["t0.code"], having: [] },
+      fields: [
+        {
+          id: "order_total",
+          label: "司机总数",
+          output_type: "number",
+          source: { kind: "sql_expression", expression: "COUNT(t0.`id`)", dependencies: [{ alias: "t0", field: "id" }] },
+        },
+      ],
+      group_queries: {
+        merge_keys: ["code"],
+        period_param: "create_time",
+        queries: [
+          {
+            id: "product",
+            table: { database: "transport", table: "driver_product" },
+            alias: "t0",
+            group_by: ["t0.driver_id"],
+            period_field: "create_time",
+            fields: [
+              // Merge-key dimension column (aligns with the main query's `code`).
+              { id: "code", label: "司机编码", output_type: "string", source: { kind: "column", field: "driver_id" } },
+              {
+                id: "product_total",
+                label: "货品数量",
+                output_type: "number",
+                source: { kind: "sql_expression", expression: "COUNT(t0.`id`)", dependencies: [{ alias: "t0", field: "id" }] },
+              },
+            ],
+          },
+        ],
+      },
+      ...extra,
+    }),
+  );
+  return configurePlan(fixture.plan, configurationPath);
+}
+
+test("group_queries: configure resolves sibling table + fields into plan.group_queries", async () => {
+  const fixture = await createFixture();
+  await addProductKnowledgeOnly(fixture);
+  await inspectDriver(fixture);
+  const plan = await configureGroupQueries(fixture);
+  assert.ok(plan.group_queries, "plan.group_queries should exist");
+  assert.deepEqual(plan.group_queries.merge_keys, ["code"]);
+  assert.equal(plan.group_queries.period_param, "create_time");
+  assert.equal(plan.group_queries.queries.length, 1);
+  const sib = plan.group_queries.queries[0];
+  assert.equal(sib.id, "product");
+  assert.equal(sib.source.primary_table.table, "driver_product");
+  assert.equal(sib.period_field, "create_time");
+  assert.deepEqual(sib.aggregation.group_by, ["t0.driver_id"]);
+});
+
+test("group_queries: generate writes sibling SQL + bindings, merged fields, manifest", async () => {
+  const fixture = await createFixture();
+  await addProductKnowledgeOnly(fixture);
+  await inspectDriver(fixture);
+  await configureGroupQueries(fixture);
+  await approvePlan(fixture.plan, "gq-reviewer");
+  const packageRoot = await generatePackage({ workspace: fixture.workspace, plan: fixture.plan });
+
+  // Sibling SQL + bindings written.
+  const siblingSql = await readFile(join(packageRoot, "queries", "group-product.sql"), "utf8");
+  assert.match(siblingSql, /FROM `transport`\.`driver_product`/);
+  assert.match(siblingSql, /GROUP BY/);
+  // The filter marker is present so the runtime can inject the shared time range.
+  assert.match(siblingSql, /EASYBI_FILTERS/);
+  // The knowledge logical-delete system condition is compiled into the WHERE.
+  assert.match(siblingSql, /`is_delete`/);
+  const siblingBindings = JSON.parse(await readFile(join(packageRoot, "queries", "group-product.bindings.json"), "utf8"));
+  // The shared period filter is re-bound to the sibling's own create_time column.
+  const period = siblingBindings.parameters.find((p: any) => p.id === "create_time");
+  assert.ok(period, "sibling should carry the period param");
+  assert.match(period.expression, /`create_time`/);
+
+  // Merged fields.json carries main + sibling metrics (deduped on the merge key).
+  const fields = JSON.parse(await readFile(join(packageRoot, "fields.json"), "utf8"));
+  const ids = fields.fields.map((f: any) => f.id);
+  assert.ok(ids.includes("order_total"), "main metric present");
+  assert.ok(ids.includes("product_total"), "sibling metric present");
+  assert.equal(ids.filter((id: string) => id === "code").length, 1, "merge key not duplicated");
+
+  // Manifest records the sibling query.
+  const manifest = JSON.parse(await readFile(join(packageRoot, "report.manifest.json"), "utf8"));
+  assert.equal(manifest.group_queries.queries.length, 1);
+  assert.equal(manifest.group_queries.queries[0].sql, "queries/group-product.sql");
+  const validation = await validatePackage(packageRoot);
+  assert.equal(validation.valid, true, validation.errors.join("\n"));
+});
+
+test("group_queries: rejected together with a group transform (mutual exclusivity)", async () => {
+  const fixture = await createFixture();
+  await addProductKnowledgeOnly(fixture);
+  await inspectDriver(fixture);
+  const configurationPath = join(fixture.workspace, "reports", "plans", "gq-bad.json");
+  await writeFile(
+    configurationPath,
+    JSON.stringify({
+      aggregation: { group_by: ["t0.code"], having: [] },
+      // A computed/group field forces custom_logic.mode=group → must conflict.
+      fields: [
+        {
+          id: "grp",
+          label: "计算",
+          output_type: "number",
+          source: { kind: "computed", mode: "group", dependencies: [{ id: "raw_id", alias: "t0", field: "id" }], expression: "rows.length" },
+        },
+      ],
+      group_queries: {
+        merge_keys: ["code"],
+        queries: [
+          {
+            id: "product",
+            table: { database: "transport", table: "driver_product" },
+            alias: "t0",
+            group_by: ["t0.driver_id"],
+            fields: [
+              { id: "code", label: "编码", output_type: "string", source: { kind: "column", field: "driver_id" } },
+              { id: "product_total", label: "货品数量", output_type: "number", source: { kind: "sql_expression", expression: "COUNT(t0.`id`)", dependencies: [{ alias: "t0", field: "id" }] } },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+  await assert.rejects(() => configurePlan(fixture.plan, configurationPath), /group_queries 与内存分组/);
+});

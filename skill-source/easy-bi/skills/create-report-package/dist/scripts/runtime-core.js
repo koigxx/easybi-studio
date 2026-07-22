@@ -1077,6 +1077,31 @@ async function prepareSyncQuery(workspaceValue, request, options = {}) {
     // fall back to the resolved profile's connector_id when the manifest omits it.
     const dialect = runtimeDialect(report.manifest.sql_dialect ?? profile.connector_id ?? "mysql");
     const compiled = compileSql(report.sql, report.bindings, filters, context, dialect);
+    // Multi-entity grouped queries: compile each sibling's SQL with the SAME filters
+    // (the shared time range binds to each sibling's own time column) + context, so
+    // the runtime can execute them and full-outer-merge on merge_keys. Mutually
+    // exclusive with a group transform / enrichment (rejected at generation time; we
+    // re-guard below for defense in depth).
+    let groupQueries = null;
+    const gqManifest = report.manifest.group_queries;
+    if (gqManifest?.queries?.length) {
+        if (report.manifest.custom_logic?.mode === "group" || enrichments.length) {
+            throw new RuntimeError("GROUP_QUERIES_UNSUPPORTED", "group_queries 与内存分组 transform / enrichment 互斥");
+        }
+        const compiledSiblings = [];
+        for (const gq of gqManifest.queries) {
+            const siblingSql = await readFile(join(report.root, String(gq.sql)), "utf8");
+            const siblingBindings = await readJson(join(report.root, String(gq.bindings)));
+            compiledSiblings.push({
+                id: String(gq.id),
+                ...compileSql(siblingSql, siblingBindings, filters, context, dialect),
+            });
+        }
+        groupQueries = {
+            mergeKeys: (gqManifest.merge_keys ?? []).map(String),
+            compiled: compiledSiblings,
+        };
+    }
     const transform = await resolveTransform(report);
     // Post-transform numeric-range filter (件数总和 …). Built from the SAME (widened)
     // filter values; enforces required post_transform filters. Applied in memory to
@@ -1094,7 +1119,70 @@ async function prepareSyncQuery(workspaceValue, request, options = {}) {
         transform,
         postFilter,
         enrichments,
+        groupQueries,
     };
+}
+/**
+ * Execute the main query + every sibling group query, then FULL-OUTER-merge their
+ * result sets on `mergeKeys` into one row per distinct key tuple. Each query is a
+ * standalone grouped SELECT (one row per key); a key present in some queries but
+ * not others gets that query's metric columns left undefined (numeric counts read
+ * as 0 downstream via the output mapping). Runs all queries on the SAME read-only
+ * adapter/transaction. Returns rows in first-seen key order (main query first).
+ *
+ * This is the group_queries execution model: N independent grouped queries merged
+ * by key — NOT a JOIN (avoids one-to-many fan-out) and NOT enrichment (which is a
+ * main→lookup column attach). Output columns come from the package's merged
+ * fields.json, so unfilled metrics simply render empty/0.
+ */
+/** Identity transform for group_queries output (merge already produced final rows). */
+const identityTransform = { mode: "identity" };
+/** Adapt an in-memory row array to the AsyncIterable the collector/writer expect. */
+async function* arrayToAsyncIterable(rows) {
+    for (const row of rows)
+        yield row;
+}
+export async function runGroupQueriesMerged(adapter, main, groupQueries, queryTimeoutMs, numericFieldIds) {
+    const { mergeKeys } = groupQueries;
+    const keyOf = (row) => JSON.stringify(mergeKeys.map((k) => row[k] ?? null));
+    const merged = new Map();
+    const order = [];
+    const mergeRows = (rows) => {
+        for (const row of rows) {
+            const key = keyOf(row);
+            let target = merged.get(key);
+            if (!target) {
+                target = {};
+                // Seed the merge-key columns so every merged row carries the dimension.
+                for (const k of mergeKeys)
+                    target[k] = row[k] ?? null;
+                merged.set(key, target);
+                order.push(key);
+            }
+            // Copy every non-key column; later queries never overwrite the shared key.
+            for (const [col, value] of Object.entries(row)) {
+                if (mergeKeys.includes(col))
+                    continue;
+                target[col] = value;
+            }
+        }
+    };
+    // Main query first (defines the primary key order), then siblings.
+    mergeRows(await adapter.queryAll(main.sql, main.values, queryTimeoutMs));
+    for (const sibling of groupQueries.compiled) {
+        mergeRows(await adapter.queryAll(sibling.sql, sibling.values, queryTimeoutMs));
+    }
+    // Full-outer semantics: a key missing from some query has no value for that
+    // query's metrics. Default numeric metrics to 0 so a customer with no waybills
+    // shows 0, not blank. Non-numeric missing columns stay null.
+    const result = order.map((key) => merged.get(key));
+    for (const row of result) {
+        for (const id of numericFieldIds) {
+            if (row[id] == null)
+                row[id] = 0;
+        }
+    }
+    return result;
 }
 /**
  * Wrap a main-query row stream so each row comes out with its enrichment columns
@@ -1256,7 +1344,7 @@ export async function collectRows(report, rows, transform, options) {
 export async function querySync(workspaceValue, request, options = {}) {
     const startedAt = Date.now();
     const prepared = await prepareSyncQuery(workspaceValue, request, options);
-    const { report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments } = prepared;
+    const { report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments, groupQueries } = prepared;
     const warnings = [];
     // Preview cap: request.limit (bounded by the policy) or the policy default.
     const policyMax = Number(policy.preview_max_rows ?? 1000);
@@ -1268,7 +1356,10 @@ export async function querySync(workspaceValue, request, options = {}) {
     // groups) and no post_transform filter is dropping output rows after the query.
     // Fetch maxRows+1 so `truncated` still reflects that more rows exist.
     const isGroupTransform = typeof transform !== "function" && transform.mode === "group";
+    // A LIMIT push is unsafe for group_queries too: the sibling merge needs every
+    // group's full result to align on merge_keys, and a raw-row LIMIT would cut it.
     const canPushLimit = !isGroupTransform &&
+        !groupQueries &&
         !hasActivePostTransformFilter(report.bindings, request.filters ?? {});
     if (canPushLimit) {
         compiled.sql = appendPreviewLimit(compiled.sql, maxRows + 1);
@@ -1280,13 +1371,25 @@ export async function querySync(workspaceValue, request, options = {}) {
         await adapter.beginReadOnly();
         queryStartedAt = Date.now();
         const queryTimeoutMs = Number(policy.query_timeout_seconds ?? 600) * 1000;
-        const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
-        // Attach enrichment columns (batch secondary-query + in-memory merge) before
-        // the collector. Batch size follows the preview cap so one IN(…) covers it.
-        const rowStream = enrichments.length
-            ? enrichBatched(rawStream, enrichments, adapter, queryTimeoutMs, maxRows + 1, warnings)
-            : rawStream;
-        const collected = await collectRows(report, rowStream, transform, {
+        // group_queries: execute main + siblings, full-outer-merge on merge_keys, then
+        // feed the merged rows through the collector with an identity transform.
+        let rowStream;
+        if (groupQueries) {
+            const numericFieldIds = new Set((report.fields.fields ?? [])
+                .filter((f) => f.value_type === "number")
+                .map((f) => String(f.id)));
+            const mergedRows = await runGroupQueriesMerged(adapter, compiled, groupQueries, queryTimeoutMs, numericFieldIds);
+            rowStream = arrayToAsyncIterable(mergedRows);
+        }
+        else {
+            const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
+            // Attach enrichment columns (batch secondary-query + in-memory merge) before
+            // the collector. Batch size follows the preview cap so one IN(…) covers it.
+            rowStream = enrichments.length
+                ? enrichBatched(rawStream, enrichments, adapter, queryTimeoutMs, maxRows + 1, warnings)
+                : rawStream;
+        }
+        const collected = await collectRows(report, rowStream, groupQueries ? identityTransform : transform, {
             maxRows,
             startedAt,
             totalTimeoutSeconds: Number(policy.total_timeout_seconds ?? 900),
@@ -1326,7 +1429,7 @@ export async function querySync(workspaceValue, request, options = {}) {
 export async function exportSync(workspaceValue, request, options = {}) {
     const startedAt = Date.now();
     const prepared = await prepareSyncQuery(workspaceValue, request, options);
-    const { workspace, config, report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments } = prepared;
+    const { workspace, config, report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments, groupQueries } = prepared;
     const enrichWarnings = [];
     const outputDirectory = relativeToWorkspace(workspace, config.storage?.local_output_directory ?? "outputs/files");
     await mkdir(outputDirectory, { recursive: true });
@@ -1340,13 +1443,25 @@ export async function exportSync(workspaceValue, request, options = {}) {
         await adapter.beginReadOnly();
         queryStartedAt = Date.now();
         const queryTimeoutMs = Number(policy.query_timeout_seconds ?? 600) * 1000;
-        const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
-        // Enrichment: batch by a fixed export batch size (each batch = one IN(…) query
-        // per enrichment). Main row count is unchanged, so sheet/row caps stay correct.
-        const rowStream = enrichments.length
-            ? enrichBatched(rawStream, enrichments, adapter, queryTimeoutMs, Number(policy.enrichment_batch_size ?? 1000), enrichWarnings)
-            : rawStream;
-        const written = await writeWorkbookRows(report, rowStream, output, policy, transform, startedAt, postFilter);
+        // group_queries: execute main + siblings, full-outer-merge on merge_keys, then
+        // write the merged rows with an identity transform.
+        let rowStream;
+        if (groupQueries) {
+            const numericFieldIds = new Set((report.fields.fields ?? [])
+                .filter((f) => f.value_type === "number")
+                .map((f) => String(f.id)));
+            const mergedRows = await runGroupQueriesMerged(adapter, compiled, groupQueries, queryTimeoutMs, numericFieldIds);
+            rowStream = arrayToAsyncIterable(mergedRows);
+        }
+        else {
+            const rawStream = await adapter.rows(compiled.sql, compiled.values, queryTimeoutMs);
+            // Enrichment: batch by a fixed export batch size (each batch = one IN(…) query
+            // per enrichment). Main row count is unchanged, so sheet/row caps stay correct.
+            rowStream = enrichments.length
+                ? enrichBatched(rawStream, enrichments, adapter, queryTimeoutMs, Number(policy.enrichment_batch_size ?? 1000), enrichWarnings)
+                : rawStream;
+        }
+        const written = await writeWorkbookRows(report, rowStream, output, policy, groupQueries ? identityTransform : transform, startedAt, postFilter);
         await adapter.rollback();
         return {
             reportId: report.manifest.id,

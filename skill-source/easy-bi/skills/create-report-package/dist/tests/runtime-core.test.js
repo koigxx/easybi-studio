@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import ExcelJS from "exceljs";
-import { aggregateMany, applyEnrichmentToBatch, buildEnrichmentValueMap, buildFlagPredicate, buildPostTransformFilter, coerceFlagValue, collectBatchKeys, collectRows, compileSql, enrichBatched, createRuntimeServer, listReports, loadReportPackage, outputColumns, runControlQuery, RuntimeError, topoSortEnrichments, widenComparisonFilters, writeWorkbookRows, } from "../scripts/runtime-core.js";
+import { aggregateMany, applyEnrichmentToBatch, buildEnrichmentValueMap, buildFlagPredicate, buildPostTransformFilter, coerceFlagValue, collectBatchKeys, collectRows, compileSql, enrichBatched, createRuntimeServer, listReports, loadReportPackage, outputColumns, runControlQuery, runGroupQueriesMerged, RuntimeError, topoSortEnrichments, widenComparisonFilters, writeWorkbookRows, } from "../scripts/runtime-core.js";
 async function writeJson(path, value) {
     await mkdir(join(path, ".."), { recursive: true });
     await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
@@ -904,5 +904,33 @@ test("compileSql boolean-flag rejects a non-where clause", () => {
         ],
     };
     assert.throws(() => compileSql("SELECT 1 /* EASYBI_FILTERS */", bindings, { flag: { operator: "eq", value: "true" } }, {}, { id: "mysql", quoteChar: "`" }), /where clause/);
+});
+test("runGroupQueriesMerged: full-outer merge on merge_keys, numeric metrics default 0", async () => {
+    // Fake adapter returns a scripted result set per SQL string.
+    const results = {
+        MAIN: [
+            { code: "C1", order_total: 3 },
+            { code: "C2", order_total: 5 },
+        ],
+        PRODUCT: [
+            { code: "C1", product_total: 2 },
+            // C3 exists only in the sibling → full-outer row; its order_total defaults 0.
+            { code: "C3", product_total: 7 },
+        ],
+    };
+    const adapter = {
+        async queryAll(sql) {
+            return results[sql] ?? [];
+        },
+    };
+    const merged = await runGroupQueriesMerged(adapter, { sql: "MAIN", values: [] }, { mergeKeys: ["code"], compiled: [{ id: "product", sql: "PRODUCT", values: [] }] }, 1000, new Set(["order_total", "product_total"]));
+    // Main-query key order first (C1, C2), then sibling-only key (C3).
+    assert.deepEqual(merged.map((r) => r.code), ["C1", "C2", "C3"]);
+    // C1 has both metrics.
+    assert.deepEqual(merged[0], { code: "C1", order_total: 3, product_total: 2 });
+    // C2 present only in main → product_total defaults 0.
+    assert.deepEqual(merged[1], { code: "C2", order_total: 5, product_total: 0 });
+    // C3 present only in sibling → order_total defaults 0.
+    assert.deepEqual(merged[2], { code: "C3", order_total: 0, product_total: 7 });
 });
 //# sourceMappingURL=runtime-core.test.js.map

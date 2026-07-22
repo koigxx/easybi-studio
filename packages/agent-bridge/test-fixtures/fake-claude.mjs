@@ -28,6 +28,14 @@ const rl = createInterface({ input: process.stdin });
 rl.on('line', (l) => (prompt += l));
 rl.on('close', () => {
   emit({ type: 'system', subtype: 'init', session_id: sessionId });
+
+  // Failure simulation: when the prompt asks to fail, emit a headless error
+  // result with an empty text + a non-success subtype, and a stderr line.
+  if (prompt.includes('__FAIL__')) {
+    process.stderr.write('boom: something went wrong\n');
+    emit({ type: 'result', subtype: 'error_max_tokens', is_error: true, result: '', session_id: sessionId });
+    return;
+  }
   emit({
     type: 'stream_event',
     session_id: sessionId,

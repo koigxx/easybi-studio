@@ -51,6 +51,24 @@ describe('ClaudeCodeBridge against a fake Claude CLI (process protocol)', () => 
     expect(joined).toContain('password="***"');
   });
 
+  it('enriches a headless failure with subtype + stderr instead of a bare 任务失败', async () => {
+    const bridge = new ClaudeCodeBridge({ claudePath: FAKE_CLI });
+    const task = await bridge.start({
+      projectId: 'p',
+      workspaceRoot: process.cwd(),
+      action: 'create-report',
+      prompt: '构建报表 __FAIL__',
+    });
+    const events = await drain(bridge.events(task.taskId));
+    const failed = events.find((e) => e.type === 'failed');
+    expect(failed).toBeDefined();
+    const msg = failed && 'error' in failed ? failed.error : '';
+    // Carries the token-limit hint (from error_max_tokens) and the stderr tail.
+    expect(msg).toContain('上下文');
+    expect(msg).toContain('boom: something went wrong');
+    expect(task.status).toBe('FAILED');
+  });
+
   it('resumes a saved session with --resume and completes', async () => {
     const bridge = new ClaudeCodeBridge({ claudePath: FAKE_CLI });
     const task = await bridge.start({

@@ -1494,6 +1494,57 @@ function validatePlanV2(plan: JsonRecord): string[] {
         errors.push("enrichment 依赖存在环");
       }
     }
+
+    // Multi-entity grouped queries: validate each sibling as a standalone plan and
+    // enforce the mutual-exclusivity rules. group_queries do their own SQL GROUP BY
+    // per sibling; combining them with an in-memory group transform, enrichment, or
+    // comparison would cross incompatible merge grains — reject rather than degrade.
+    if (plan.group_queries?.queries?.length) {
+      const gqRoot = plan.group_queries as JsonRecord;
+      const mergeKeys = (gqRoot.merge_keys ?? []).map(String);
+      if (!mergeKeys.length) errors.push("group_queries.merge_keys 不能为空");
+      if (plan.custom_logic?.mode === "group") {
+        errors.push("group_queries 与内存分组 transform（custom_logic.mode=group）互斥");
+      }
+      if (Array.isArray(plan.enrichments) && plan.enrichments.length) {
+        errors.push("group_queries 与 enrichment 二次查询互斥");
+      }
+      if (plan.comparison?.enabled) {
+        errors.push("group_queries 与环比/同比（comparison）暂不支持同时使用");
+      }
+      // The shared period_param (if any) must be a required date/datetime range.
+      const periodParamId = gqRoot.period_param ? String(gqRoot.period_param) : null;
+      if (periodParamId) {
+        const p = (plan.parameters ?? []).find((x: JsonRecord) => x.id === periodParamId);
+        if (!p) errors.push(`group_queries.period_param 指向不存在的参数：${periodParamId}`);
+        else if (!["date_range", "datetime_range"].includes(String(p.value_type))) {
+          errors.push(`group_queries.period_param「${periodParamId}」必须是日期/时间范围筛选`);
+        }
+      }
+      const seenGqIds = new Set<string>();
+      for (const gq of gqRoot.queries as JsonRecord[]) {
+        const gid = String(gq.id ?? "");
+        if (!gid) errors.push("group_queries 查询缺少 id");
+        if (seenGqIds.has(gid)) errors.push(`group_queries 查询 id 重复：${gid}`);
+        seenGqIds.add(gid);
+        // Validate the sibling by reusing the full plan validator on its mini-plan.
+        const sibling = groupQueryToPlan(plan, gq);
+        for (const err of validatePlanV2(sibling)) {
+          errors.push(`group_queries ${gid}：${err}`);
+        }
+        // Every merge key must be produced by this sibling AND be in its GROUP BY.
+        const gqFieldIds = new Set((gq.fields ?? []).map((f: JsonRecord) => String(f.id)));
+        for (const key of mergeKeys) {
+          if (!gqFieldIds.has(key)) {
+            errors.push(`group_queries ${gid}：缺少合并键输出列 ${key}`);
+          }
+        }
+        const groupBy = (gq.aggregation?.group_by ?? []).map(String);
+        if (!groupBy.length) {
+          errors.push(`group_queries ${gid}：缺少 aggregation.group_by（分组统计必须分组）`);
+        }
+      }
+    }
   } catch (error) {
     errors.push(error instanceof Error ? error.message : String(error));
   }
@@ -1746,6 +1797,214 @@ async function applyEnrichments(
   plan.enrichments = enrichments;
 }
 
+/**
+ * Resolve the sibling grouped queries of a multi-entity statistics report
+ * (group_queries, §group-queries design) from knowledge into `plan.group_queries`.
+ *
+ * Shape of `config` (from configure-plan's `configuration.group_queries`):
+ *   {
+ *     merge_keys: ["<field id>"],          // output dimension(s) every query groups by
+ *     queries: [
+ *       {
+ *         id: "waybill",                    // stable id, used for the generated SQL file
+ *         table: { profile_id?, database, table },  // ONE base table (resolved from knowledge)
+ *         alias: "t0",                      // optional; defaults to t0
+ *         group_by: ["t0.`customer_name`"], // MUST cover every merge_key's bound column
+ *         period_field: "create_time",      // the table's own time column the shared filter binds to
+ *         fields: [ … sql_expression / column count fields … ],  // one row per group
+ *         system_conditions?: [ … ]         // extra fixed WHERE (logical delete etc.); auto-filled from knowledge
+ *       }, …
+ *     ]
+ *   }
+ *
+ * Each sibling is stored as a self-contained mini-plan object so the SAME
+ * `buildSql`/`compileSql` can consume it. This function trusts knowledge for the
+ * table + its columns; the count expressions the AI authors are still guarded by
+ * `assertSafeSqlExpression` at generation time (never here).
+ */
+async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<void> {
+  const knowledgeRoot = plan.knowledge?.source_dir
+    ? resolve(String(plan.knowledge.source_dir))
+    : null;
+  if (!knowledgeRoot) {
+    throw new Error("group_queries 需要知识库来源（plan.knowledge.source_dir 缺失）");
+  }
+  const mergeKeys = (config.merge_keys ?? []).map(String);
+  if (!mergeKeys.length) throw new Error("group_queries.merge_keys 不能为空");
+  if (!Array.isArray(config.queries) || config.queries.length === 0) {
+    throw new Error("group_queries.queries 不能为空");
+  }
+  // The shared time filter: a main-query parameter (date/datetime range) whose
+  // value the runtime broadcasts to EACH sibling's own time column. Optional —
+  // omit it for a report with no time filter. When set, it must reference an
+  // existing required range parameter and every sibling must name a period_field.
+  const periodParam = config.period_param ? String(config.period_param) : null;
+  if (periodParam) {
+    const param = (plan.parameters ?? []).find((p: JsonRecord) => p.id === periodParam);
+    if (!param) {
+      throw new Error(`group_queries.period_param 指向不存在的筛选参数：${periodParam}`);
+    }
+    if (!["date_range", "datetime_range"].includes(String(param.value_type))) {
+      throw new Error(
+        `group_queries.period_param「${periodParam}」必须是按日期/时间范围筛选（date_range/datetime_range）`,
+      );
+    }
+  }
+  const knowledgeTables = await loadKnowledgeTables(knowledgeRoot);
+  const primaryProfile = plan.source?.primary_table?.profile_id;
+  const dialect = dialectForPlan(plan);
+
+  const seenIds = new Set<string>();
+  const queries: JsonRecord[] = [];
+  for (const raw of config.queries as JsonRecord[]) {
+    const id = String(raw.id ?? "").trim();
+    if (!id) throw new Error("group_queries.queries[] 缺少 id");
+    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(id)) {
+      throw new Error(`group_queries 查询 id 非法（仅字母数字/-/_）：${id}`);
+    }
+    if (seenIds.has(id)) throw new Error(`group_queries 查询 id 重复：${id}`);
+    seenIds.add(id);
+
+    const tableCfg = raw.table ?? {};
+    const doc = knowledgeTables.find(
+      (t) =>
+        t.physical?.database === tableCfg.database &&
+        t.physical?.table === tableCfg.table &&
+        (!tableCfg.profile_id || t.physical?.profile_id === tableCfg.profile_id),
+    );
+    if (!doc) {
+      throw new Error(
+        `group_queries ${id}：知识库中找不到表 ${tableCfg.database}.${tableCfg.table}`,
+      );
+    }
+    if (primaryProfile && doc.physical.profile_id !== primaryProfile) {
+      throw new Error(
+        `group_queries ${id}：来源表与主表不在同一连接 profile（不支持跨 profile 合并）`,
+      );
+    }
+    const alias = String(raw.alias ?? "t0");
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(alias)) {
+      throw new Error(`group_queries ${id}：非法表别名 ${alias}`);
+    }
+    const availableFields = (doc.physical_fields ?? []).map((f: JsonRecord) =>
+      String(f.physical?.name),
+    );
+    const availableSet = new Set(availableFields);
+
+    // Build a self-contained mini-source so buildSql can consume this query as-is.
+    const source = {
+      primary_table: {
+        profile_id: doc.physical.profile_id,
+        database: doc.physical.database,
+        table: doc.physical.table,
+        alias,
+        table_id: doc.table_id,
+        schema_fingerprint: doc.schema_fingerprint,
+        available_fields: availableFields,
+        system_conditions: doc.system_conditions ?? [],
+      },
+      tables: [
+        {
+          profile_id: doc.physical.profile_id,
+          database: doc.physical.database,
+          table: doc.physical.table,
+          alias,
+          table_id: doc.table_id,
+          schema_fingerprint: doc.schema_fingerprint,
+          available_fields: availableFields,
+          system_conditions: doc.system_conditions ?? [],
+        },
+      ],
+      joins: [],
+    };
+
+    // Fields the query outputs (merge-key dimension columns + count expressions).
+    // Trust the AI's field list; normalize kind/alias like the main query does.
+    const fields = (raw.fields ?? []).map((field: JsonRecord, index: number) => {
+      const normalized: JsonRecord = {
+        id: String(field.id),
+        label: field.label ?? String(field.id),
+        order: index + 1,
+        output_type: field.output_type ?? "number",
+        source: { ...field.source },
+        roles: Array.isArray(field.roles) ? field.roles : [],
+        ...(field.description ? { description: field.description } : {}),
+      };
+      if (normalized.source.kind === "column") {
+        normalized.source.alias = normalized.source.alias ?? alias;
+        if (!availableSet.has(String(normalized.source.field))) {
+          throw new Error(
+            `group_queries ${id}：列 ${normalized.source.field} 不在表 ${doc.physical.table} 中`,
+          );
+        }
+      }
+      return normalized;
+    });
+    if (!fields.length) throw new Error(`group_queries ${id}：fields 不能为空`);
+
+    // The shared time filter binds to THIS table's own time column.
+    const periodField = raw.period_field ? String(raw.period_field) : null;
+    if (periodField && !availableSet.has(periodField)) {
+      throw new Error(
+        `group_queries ${id}：period_field ${periodField} 不在表 ${doc.physical.table} 中`,
+      );
+    }
+    if (periodParam && !periodField) {
+      throw new Error(
+        `group_queries ${id}：已声明共享时间筛选 period_param，但本查询缺少 period_field（需指定本表的时间列）`,
+      );
+    }
+
+    // Fixed WHERE conditions for this sibling: knowledge logical-delete + any
+    // AI-declared per-entity filters (e.g. 运单「未拆分」/「已复核」). Both are declared
+    // structurally as {field, operator, value} and compiled to plan-shaped
+    // {id, expression, operator, value} so buildSql emits `col op :id` and
+    // buildBindings binds the value as a parameter (never inlined — injection-safe).
+    const ALLOWED_COND_OPS = new Set(["eq", "ne", "gt", "gte", "lt", "lte"]);
+    const rawConditions = [
+      ...(doc.system_conditions ?? []),
+      ...(raw.extra_conditions ?? []).map((c: JsonRecord) => {
+        const field = String(c.field ?? "");
+        if (!availableSet.has(field)) {
+          throw new Error(`group_queries ${id}：extra_conditions 列 ${field} 不在表 ${doc.physical.table} 中`);
+        }
+        if (!ALLOWED_COND_OPS.has(String(c.operator))) {
+          throw new Error(`group_queries ${id}：extra_conditions 不支持的操作符 ${c.operator}`);
+        }
+        return { field, operator: String(c.operator), value: c.value };
+      }),
+    ];
+    const systemConditions = rawConditions.map((c: JsonRecord, index: number) => ({
+      id: `__system_${stableId(String(c.field)).replaceAll("-", "_")}_${index + 1}`,
+      expression: `${alias}.${quoteIdentifier(String(c.field), dialect)}`,
+      operator: c.operator,
+      value: c.value,
+    }));
+
+    queries.push({
+      id,
+      source,
+      fields,
+      aggregation: {
+        group_by: (raw.group_by ?? mergeKeys).map(String),
+        having: [],
+      },
+      // custom_logic identity: siblings use SQL GROUP BY, never an in-memory group
+      // transform (that path is main-query only and mutually exclusive with this).
+      custom_logic: { required: false, mode: "identity", group_keys: [], max_group_rows: 100000 },
+      system_conditions: systemConditions,
+      ...(periodField ? { period_field: periodField, period_alias: alias } : {}),
+      sql_dialect: dialect.id,
+    });
+  }
+
+  plan.group_queries = {
+    merge_keys: mergeKeys,
+    ...(periodParam ? { period_param: periodParam } : {}),
+    queries,
+  };
+}
+
 export async function configurePlan(
   planPathValue: string,
   configurationPathValue: string,
@@ -1798,6 +2057,16 @@ export async function configurePlan(
   // field with source.kind="enrichment".
   if (Array.isArray(configuration.enrichments)) {
     await applyEnrichments(plan, configuration.enrichments);
+  }
+  // Multi-entity grouped statistics (group_queries, §group-queries design): a report
+  // that groups by a shared key (e.g. 客户) and counts SEPARATE entities (订单/运单/
+  // 派车单) is modeled as several INDEPENDENT grouped queries — one primary plus N
+  // sibling queries — merged in the runtime on the shared merge_keys. Each sibling
+  // touches ONE base table (no fan-out), shares the time-range filter (broadcast to
+  // each table's own time column), and is later executed + full-outer-merged by the
+  // runtime. Resolved from knowledge here; stored in plan.group_queries.
+  if (configuration.group_queries) {
+    await applyGroupQueries(plan, configuration.group_queries);
   }
   const overrides = new Map<string, JsonRecord>(
     (configuration.fields ?? []).map((field: JsonRecord) => [field.id, field]),
@@ -2462,6 +2731,83 @@ function buildBindings(plan: JsonRecord): JsonRecord {
   };
 }
 
+/**
+ * Turn a sibling group query into a standalone plan-shaped object so the SAME
+ * `buildSql`/`buildBindings` produce its SQL + bindings. The shared time filter
+ * (plan.group_queries.period_param) is re-bound to THIS sibling's own time column
+ * (period_field) as a `where` parameter carrying the same id — so the runtime
+ * binds one user-picked range to every sibling's respective time column.
+ */
+function groupQueryToPlan(plan: JsonRecord, gq: JsonRecord): JsonRecord {
+  const dialect = dialectForPlan(plan);
+  const parameters: JsonRecord[] = [];
+  const periodParamId = plan.group_queries?.period_param
+    ? String(plan.group_queries.period_param)
+    : null;
+  if (periodParamId && gq.period_field) {
+    const main = (plan.parameters ?? []).find(
+      (p: JsonRecord) => p.id === periodParamId,
+    );
+    if (main) {
+      parameters.push({
+        ...main,
+        sql_binding: {
+          ...main.sql_binding,
+          // Bind the shared filter to this sibling's own time column.
+          expression: columnExpression(
+            String(gq.period_alias ?? gq.source?.primary_table?.alias ?? "t0"),
+            String(gq.period_field),
+            dialect,
+          ),
+          clause: "where",
+        },
+      });
+    }
+  }
+  return {
+    plan_format_version: PLAN_FORMAT_VERSION,
+    sql_dialect: gq.sql_dialect ?? dialect.id,
+    report: plan.report,
+    knowledge: plan.knowledge,
+    source: gq.source,
+    fields: gq.fields,
+    parameters,
+    // Siblings never carry tenant/context bindings of their own; the main query
+    // owns those. Keep empty so buildBindings emits a clean, self-contained file.
+    context_bindings: [],
+    system_conditions: gq.system_conditions ?? [],
+    ordering: [],
+    custom_logic: gq.custom_logic ?? {
+      required: false,
+      mode: "identity",
+      group_keys: [],
+      max_group_rows: 100000,
+    },
+    aggregation: gq.aggregation ?? { group_by: [], having: [] },
+  };
+}
+
+/**
+ * The manifest record for multi-entity grouped queries: merge keys + one entry
+ * per sibling pointing at its generated SQL/bindings files. The runtime executes
+ * each, then full-outer-merges the result sets on merge_keys.
+ */
+function buildGroupQueriesManifest(plan: JsonRecord): JsonRecord {
+  return {
+    merge_keys: plan.group_queries.merge_keys,
+    ...(plan.group_queries.period_param
+      ? { period_param: plan.group_queries.period_param }
+      : {}),
+    queries: (plan.group_queries.queries ?? []).map((gq: JsonRecord) => ({
+      id: gq.id,
+      sql: `queries/group-${gq.id}.sql`,
+      bindings: `queries/group-${gq.id}.bindings.json`,
+      // The output field ids this sibling contributes (merge keys + its metrics).
+      field_ids: (gq.fields ?? []).map((f: JsonRecord) => String(f.id)),
+    })),
+  };
+}
+
 async function updateReportIndex(
   workspace: string,
   manifest: JsonRecord,
@@ -2794,17 +3140,35 @@ export async function generatePackage(options: {
     // these columns via a second WHERE key IN(…) query + in-memory merge instead
     // of a SQL JOIN. Old packages omit this key and take the original path.
     ...(plan.enrichments?.length ? { enrichments: plan.enrichments } : {}),
+    // Optional multi-entity grouped queries: sibling grouped queries the runtime
+    // executes independently and full-outer-merges on merge_keys. Each carries its
+    // own generated SQL file + bindings (recorded here). Old packages omit this.
+    ...(plan.group_queries?.queries?.length
+      ? { group_queries: buildGroupQueriesManifest(plan) }
+      : {}),
     signature: {
       status: "unsigned-development",
     },
   };
+  // Output columns = the main query's fields plus every sibling group query's
+  // fields (merged, deduped by id — the merge-key dimension repeats across
+  // siblings). Order follows main fields first, then each sibling's own order.
+  const outputFieldList: JsonRecord[] = [...(plan.fields ?? [])];
+  const seenFieldIds = new Set(outputFieldList.map((f: JsonRecord) => String(f.id)));
+  for (const gq of plan.group_queries?.queries ?? []) {
+    for (const f of gq.fields ?? []) {
+      if (seenFieldIds.has(String(f.id))) continue;
+      seenFieldIds.add(String(f.id));
+      outputFieldList.push(f);
+    }
+  }
   const fields = {
     schema_version: "2",
     report_id: plan.report.id,
-    fields: plan.fields.map((field: JsonRecord) => ({
+    fields: outputFieldList.map((field: JsonRecord, index: number) => ({
       id: field.id,
       label: field.label,
-      order: field.order,
+      order: field.order ?? index + 1,
       value_type: field.output_type,
       // Config-authored business description / 口径, preserved for reference.
       // Optional: omitted when empty so existing packages stay byte-identical.
@@ -2872,6 +3236,20 @@ export async function generatePackage(options: {
     join(packageRoot, "queries", "bindings.json"),
     buildBindings(plan),
   );
+  // Multi-entity grouped queries: one <id>.sql + <id>.bindings.json per sibling,
+  // each a standalone grouped SELECT the runtime executes then merges on merge_keys.
+  for (const gq of plan.group_queries?.queries ?? []) {
+    const sibling = groupQueryToPlan(plan, gq);
+    await writeFile(
+      join(packageRoot, "queries", `group-${gq.id}.sql`),
+      buildSql(sibling),
+      "utf8",
+    );
+    await writeJson(
+      join(packageRoot, "queries", `group-${gq.id}.bindings.json`),
+      buildBindings(sibling),
+    );
+  }
   await writeFile(
     join(packageRoot, "transforms", "index.ts"),
     transforms.source,
