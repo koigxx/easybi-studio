@@ -1,12 +1,21 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
   approvePlan,
+  buildKnowledgeContext,
+  buildPhaseContext,
+  initializeReportModel,
+  approveReportModel,
+  approveStagedModel,
+  finalizeStagedPackage,
+  validateStagedArtifacts,
+  validateReportModelValue,
   configurePlan,
+  explainPlan,
   generatePackage,
   inspectReport,
   resealPackage,
@@ -1273,6 +1282,52 @@ test("configure-plan rejects a brand-new column field (must go through required_
   await assert.rejects(configurePlan(fixture.plan, configurationPath), /只能新增 computed/);
 });
 
+test("configure-plan resolves a natural-language business metric blocker explicitly", async () => {
+  const fixture = await createFixture();
+  const configPath = join(fixture.workspace, "config", "easy-bi.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.knowledge.report_requirements[0].required_fields.push({
+    field: "订单量",
+    label: "订单量",
+    description: "按订单主键去重计数",
+  });
+  await writeFile(configPath, JSON.stringify(config));
+  await inspectDriver(fixture);
+
+  const inspected = JSON.parse(await readFile(fixture.plan, "utf8"));
+  const blocker = inspected.blockers.find((item: any) => item.code === "FIELD_NOT_FOUND");
+  assert.ok(blocker?.field_id, "unresolved metric should expose a deterministic field_id");
+
+  const configurationPath = join(fixture.workspace, "reports", "plans", "metric.json");
+  await writeFile(
+    configurationPath,
+    JSON.stringify({
+      fields: [
+        {
+          id: blocker.field_id,
+          label: "订单量",
+          output_type: "number",
+          source: {
+            kind: "computed",
+            mode: "row",
+            dependencies: [{ id: "raw_order_id", alias: "t0", field: "id" }],
+            expression: "1",
+          },
+        },
+      ],
+    }),
+  );
+
+  const configured = await configurePlan(fixture.plan, configurationPath);
+  assert.equal(
+    configured.blockers.some((item: any) => item.code === "FIELD_NOT_FOUND"),
+    false,
+  );
+  assert.ok(
+    configured.warnings.some((item: any) => item.code === "BUSINESS_METRICS_RESOLVED"),
+  );
+});
+
 test("configure-plan rejects comparison whose period_param is not a required month range", async () => {
   const fixture = await createFixture();
   await addProductTable(fixture);
@@ -1721,6 +1776,58 @@ async function addProductKnowledgeOnly(
   );
 }
 
+async function addDispatchManyToManyKnowledge(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+): Promise<void> {
+  const dir = join(fixture.knowledge, "databases", "mysql-main", "transport", "hot", "tables");
+  const field = (name: string, dataType: string, primaryKey = false) => ({
+    physical: { name, data_type: dataType, native_type: dataType, primary_key: primaryKey, comment: name },
+    semantic: { name, status: "inferred", report_ids: ["driver-detail"], enum_ref: null },
+    filter: { enabled: false, visibility: "system" },
+  });
+  const writeTable = async (
+    table: string,
+    fields: Array<ReturnType<typeof field>>,
+    systemConditions: any[] = [],
+  ): Promise<void> => {
+    await writeFile(
+      join(dir, `${table}.json`),
+      JSON.stringify({
+        table_id: `mysql-main_transport_${table}`,
+        tier: "hot",
+        schema_fingerprint: `${table}-schema-hash`,
+        physical: { profile_id: "mysql-main", database: "transport", table },
+        physical_fields: fields,
+        system_conditions: systemConditions,
+        security: {},
+      }),
+    );
+  };
+  await writeTable(
+    "dispatch",
+    [field("id", "bigint", true), field("create_time", "datetime"), field("is_delete", "tinyint")],
+    [{ field: "is_delete", operator: "eq", value: 0 }],
+  );
+  await writeTable("dispatch_waybill", [
+    field("id", "bigint", true),
+    field("dispatch_id", "bigint"),
+    field("waybill_id", "bigint"),
+  ]);
+  await writeTable("waybill", [
+    field("id", "bigint", true),
+    field("main_waybill_id", "bigint"),
+    field("is_delete", "tinyint"),
+  ], [{ field: "is_delete", operator: "eq", value: 0 }]);
+  await writeTable("main_waybill", [
+    field("id", "bigint", true),
+    field("order_id", "bigint"),
+  ]);
+  await writeTable("customer_order", [
+    field("id", "bigint", true),
+    field("driver_id", "bigint"),
+  ]);
+}
+
 /**
  * Configure a group_queries report: main query on `driver` grouped by code with a
  * conditional count, plus a sibling grouped query on `driver_product` counting per
@@ -1862,4 +1969,374 @@ test("group_queries: rejected together with a group transform (mutual exclusivit
     }),
   );
   await assert.rejects(() => configurePlan(fixture.plan, configurationPath), /group_queries 与内存分组/);
+});
+
+test("group_queries: order-waybill-dispatch N:N path is locked and counts distinct dispatches", async () => {
+  const fixture = await createFixture();
+  await addDispatchManyToManyKnowledge(fixture);
+  const configPath = join(fixture.workspace, "config", "easy-bi.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.knowledge.report_requirements[0].required_fields.push({
+    field: "派车单数量",
+    label: "派车单数量",
+    description: "同一派车单关联同一客户多张运单时按派车单主键去重",
+  });
+  await writeFile(configPath, JSON.stringify(config));
+  await inspectDriver(fixture);
+  const inspected = JSON.parse(await readFile(fixture.plan, "utf8"));
+  const metricBlocker = inspected.blockers.find(
+    (item: any) => item.code === "FIELD_NOT_FOUND" && item.field === "派车单数量",
+  );
+  assert.ok(metricBlocker?.field_id);
+
+  const configurationPath = join(fixture.workspace, "reports", "plans", "gq-nn.json");
+  await writeFile(
+    configurationPath,
+    JSON.stringify({
+      aggregation: { group_by: ["t0.code"], having: [] },
+      fields: [
+        {
+          id: "name",
+          source: { kind: "sql_expression", expression: "MAX(t0.`name`)", dependencies: [{ alias: "t0", field: "name" }] },
+        },
+        {
+          id: "create_time",
+          source: { kind: "sql_expression", expression: "MAX(t0.`create_time`)", dependencies: [{ alias: "t0", field: "create_time" }] },
+        },
+      ],
+      group_queries: {
+        merge_keys: ["code"],
+        period_param: "create_time",
+        queries: [
+          {
+            id: "dispatch",
+            table: { database: "transport", table: "dispatch" },
+            alias: "d",
+            period_alias: "d",
+            period_field: "create_time",
+            joins: [
+              {
+                type: "INNER",
+                table: { database: "transport", table: "dispatch_waybill" },
+                alias: "dw",
+                on: [{ left: "d.id", right: "dw.dispatch_id", operator: "eq" }],
+                grain: "派车单与运单多对多关系",
+              },
+              {
+                type: "INNER",
+                table: { database: "transport", table: "waybill" },
+                alias: "w",
+                on: [{ left: "dw.waybill_id", right: "w.id", operator: "eq" }],
+                grain: "关系记录属于一张运单",
+              },
+              {
+                type: "INNER",
+                table: { database: "transport", table: "main_waybill" },
+                alias: "mw",
+                on: [{ left: "w.main_waybill_id", right: "mw.id", operator: "eq" }],
+                grain: "拆分运单归属一个主运单",
+              },
+              {
+                type: "INNER",
+                table: { database: "transport", table: "customer_order" },
+                alias: "o",
+                on: [{ left: "mw.order_id", right: "o.id", operator: "eq" }],
+                grain: "一个主运单对应一个订单",
+              },
+              {
+                type: "INNER",
+                table: { database: "transport", table: "driver" },
+                alias: "c",
+                on: [{ left: "o.driver_id", right: "c.id", operator: "eq" }],
+                grain: "订单归属一个客户",
+              },
+            ],
+            group_by: ["c.code"],
+            fields: [
+              { id: "code", label: "客户编码", output_type: "string", source: { kind: "column", alias: "c", field: "code" } },
+              {
+                id: metricBlocker.field_id,
+                label: "派车单数量",
+                output_type: "number",
+                source: {
+                  kind: "sql_expression",
+                  expression: "COUNT(DISTINCT d.`id`)",
+                  dependencies: [{ alias: "d", field: "id" }],
+                },
+              },
+            ],
+          },
+        ],
+      },
+    }),
+  );
+
+  const configured = await configurePlan(fixture.plan, configurationPath);
+  assert.equal(configured.blockers.length, 0);
+  await approvePlan(fixture.plan, "nn-reviewer");
+  const packageRoot = await generatePackage({ workspace: fixture.workspace, plan: fixture.plan });
+  const sql = await readFile(join(packageRoot, "queries", "group-dispatch.sql"), "utf8");
+  assert.match(sql, /INNER JOIN `transport`\.`dispatch_waybill` AS dw/);
+  assert.match(sql, /INNER JOIN `transport`\.`waybill` AS w/);
+  assert.match(sql, /INNER JOIN `transport`\.`main_waybill` AS mw/);
+  assert.match(sql, /INNER JOIN `transport`\.`customer_order` AS o/);
+  assert.match(sql, /INNER JOIN `transport`\.`driver` AS c/);
+  assert.match(sql, /COUNT\(DISTINCT d\.`id`\)/);
+  const lock = JSON.parse(await readFile(join(packageRoot, "knowledge.lock.json"), "utf8"));
+  assert.equal(lock.group_query_sources[0].sources.length, 6);
+  const validation = await validatePackage(packageRoot);
+  assert.equal(validation.valid, true, validation.errors.join("\n"));
+});
+
+test("v3 script package requires a readable semantic/execution plan and locks each query", async () => {
+  const fixture = await createFixture();
+  await addProductTable(fixture);
+  await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  const configPath = join(fixture.workspace, "script-config.json");
+  await writeFile(configPath, JSON.stringify({
+    semantic_plan: {
+      result_grain: "每个司机一行",
+      metrics: [{ id: "code", label: "司机编码", definition: "司机唯一编码" }],
+      distinct_keys: { driver: "driver.id" },
+      time_semantics: [],
+      exclusions: ["排除逻辑删除记录"],
+      open_questions: [],
+    },
+    execution_plan: {
+      rationale: "主数据流式读取，姓名建立小索引，产品按司机键批量补充",
+      steps: [
+        { id: "Q1", type: "load_index", description: "加载司机姓名索引" },
+        { id: "Q2", type: "query_stream", description: "流式读取司机主数据" },
+        { id: "Q3", type: "batch_lookup", description: "按司机键批量查询产品" },
+        { id: "E1", type: "emit", description: "封装并输出报表行" },
+      ],
+    },
+    script_report: {
+      resource_budget: { max_queries: 8, max_output_rows: 1000, timeout_seconds: 30 },
+      queries: [
+        {
+          id: "drivers",
+          mode: "stream",
+          profile_id: "mysql-main",
+          database: "transport",
+          sql: "SELECT t0.`id`, t0.`code`, t0.`create_time` FROM `transport`.`driver` AS t0",
+          sources: [{ profile_id: "mysql-main", database: "transport", table: "driver", alias: "t0", fields: ["id", "code", "create_time"] }],
+        },
+        {
+          id: "driver-names",
+          mode: "index",
+          profile_id: "mysql-main",
+          database: "transport",
+          sql: "SELECT t0.`id`, t0.`name` FROM `transport`.`driver` AS t0",
+          sources: [{ profile_id: "mysql-main", database: "transport", table: "driver", alias: "t0", fields: ["id", "name"] }],
+        },
+        {
+          id: "driver-products",
+          mode: "batch",
+          profile_id: "mysql-main",
+          database: "transport",
+          sql: "SELECT t0.`driver_id`, t0.`product_name` FROM `transport`.`driver_product` AS t0 WHERE t0.`driver_id` IN (/* KEYS */)",
+          sources: [{ profile_id: "mysql-main", database: "transport", table: "driver_product", alias: "t0", fields: ["driver_id", "product_name"] }],
+        },
+      ],
+      source: [
+        "export async function run(ctx: any) {",
+        "  const names = await ctx.loadIndex('driver-names', [], ['id']);",
+        "  for await (const row of ctx.queryStream('drivers')) {",
+        "    await ctx.batchLookup('driver-products', [row.id]);",
+        "    await ctx.emit({ code: row.code, name: names.get(row.id)[0]?.name ?? null, create_time: row.create_time });",
+        "  }",
+        "}",
+      ].join("\n"),
+    },
+  }, null, 2));
+  const configured = await configurePlan(fixture.plan, configPath);
+  assert.equal(configured.execution_plan.strategy, "script");
+  assert.match(await explainPlan(fixture.plan), /主数据流式读取/);
+  await approvePlan(fixture.plan, "script-reviewer");
+  const packageRoot = await generatePackage({ workspace: fixture.workspace, plan: fixture.plan });
+  const manifest = JSON.parse(await readFile(join(packageRoot, "report.manifest.json"), "utf8"));
+  assert.equal(manifest.report_package_format_version, "3");
+  assert.equal(manifest.execution_model, "isolated_script");
+  assert.equal(manifest.queries.every((query: any) => query.sql_dialect === "mysql"), true);
+  const compiledScript = await readFile(join(packageRoot, "scripts", "report.mjs"), "utf8");
+  assert.doesNotMatch(compiledScript, /ctx:\s*any/);
+  const lock = JSON.parse(await readFile(join(packageRoot, "knowledge.lock.json"), "utf8"));
+  assert.equal(lock.script_query_sources.length, 3);
+  const validation = await validatePackage(packageRoot);
+  assert.equal(validation.valid, true, validation.errors.join("\n"));
+
+  const contextPath = join(fixture.workspace, "work", "report-context.json");
+  const context = await buildKnowledgeContext({ plan: fixture.plan, out: contextPath });
+  assert.equal(context.selected_table_count, 2);
+  assert.equal(JSON.stringify(context).includes("password"), false);
+});
+
+test("staged report model builds query/script context packs without leaking physical knowledge to script", async () => {
+  const fixture = await createFixture();
+  await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  const modelPath = join(fixture.workspace, "work", "driver-model.json");
+  const model = await initializeReportModel({ plan: fixture.plan, out: modelPath });
+  model.result_grain.keys = ["code"];
+  model.open_questions = [];
+  model.recommended_strategy = "script";
+  model.query_contracts[0].sources[0].fields.push("not-approved-field");
+  assert.match(validateReportModelValue(model).join("\n"), /模型外字段/);
+  model.query_contracts[0].sources[0].fields.pop();
+  await writeFile(modelPath, JSON.stringify(model, null, 2));
+  const approved = await approveReportModel(modelPath, "model-reviewer", fixture.plan);
+  assert.equal(validateReportModelValue(approved, true).length, 0);
+  const attachedPlan = JSON.parse(await readFile(fixture.plan, "utf8"));
+  assert.equal(attachedPlan.report_model.model_hash, approved.approval.model_hash);
+
+  const queryContext = await buildPhaseContext({
+    phase: "query",
+    plan: fixture.plan,
+    model: modelPath,
+    queryId: "main",
+    out: join(fixture.workspace, "work", "query-context.json"),
+  });
+  assert.equal(queryContext.context_manifest.fresh_session, true);
+  assert.equal(queryContext.payload.knowledge.tables.length, 1);
+  assert.equal(queryContext.payload.query_contract.id, "main");
+
+  const outputDir = join(fixture.workspace, "work", "query-outputs");
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(join(outputDir, "main.json"), JSON.stringify({
+    query_id: "main",
+    mode: "stream",
+    columns: approved.query_contracts[0].output,
+  }));
+  const scriptContext = await buildPhaseContext({
+    phase: "script",
+    plan: fixture.plan,
+    model: modelPath,
+    queryOutputs: outputDir,
+    out: join(fixture.workspace, "work", "script-context.json"),
+  });
+  const serialized = JSON.stringify(scriptContext);
+  assert.equal(serialized.includes("physical_fields"), false);
+  assert.equal(serialized.includes("schema_fingerprint"), false);
+  assert.deepEqual(scriptContext.payload.allowed_api, ["queryStream", "loadIndex", "batchLookup", "emit"]);
+  await assert.rejects(
+    buildPhaseContext({
+      phase: "unknown" as "query",
+      plan: fixture.plan,
+      out: join(fixture.workspace, "work", "invalid-context.json"),
+    }),
+    /未知阶段/,
+  );
+});
+
+test("staged artifacts are deterministically approved, assembled, generated, and validated", async () => {
+  const fixture = await createFixture();
+  await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  const root = join(fixture.workspace, "work", "report-build", "driver-detail");
+  await mkdir(join(root, "queries"), { recursive: true });
+  await mkdir(join(root, "query-outputs"), { recursive: true });
+  await mkdir(join(root, "scripts"), { recursive: true });
+  const model = await initializeReportModel({ plan: fixture.plan, out: join(root, "report-model.json") });
+  model.result_grain.keys = ["code"];
+  model.open_questions = [];
+  model.recommended_strategy = "script";
+  await writeFile(join(root, "report-model.json"), JSON.stringify(model, null, 2));
+  const initialPlan = JSON.parse(await readFile(fixture.plan, "utf8"));
+  await writeFile(join(root, "semantic-plan.json"), JSON.stringify(initialPlan.semantic_plan, null, 2));
+  await writeFile(join(root, "execution-plan.json"), JSON.stringify({
+    ...initialPlan.execution_plan,
+    strategy: "script",
+    steps: [{ id: "Q1", type: "query_stream", description: "读取主查询" }, { id: "E1", type: "emit", description: "输出行" }],
+  }, null, 2));
+  const approval = await approveStagedModel({ plan: fixture.plan, root, reviewedBy: "workflow-reviewer" });
+  assert.equal(approval.ok, true);
+
+  const contract = model.query_contracts[0];
+  const columns = contract.output.map((column: any) => ({ name: column.name, type: column.type }));
+  const select = columns.map((column: any) => `t0.\`${column.name}\` AS \`${column.name}\``).join(", ");
+  await writeFile(join(root, "queries", "main.sql"), `SELECT ${select} FROM \`transport\`.\`driver\` AS t0`);
+  await writeFile(join(root, "query-outputs", "main.json"), JSON.stringify({
+    query_id: "main",
+    mode: "stream",
+    columns: [...columns].reverse(),
+  }, null, 2));
+  const mismatched = await validateStagedArtifacts({ phase: "query", plan: fixture.plan, root });
+  assert.equal(mismatched.ok, false);
+  assert.match((mismatched.errors ?? []).join("\n"), /第 1 列应为/);
+  await writeFile(join(root, "query-outputs", "main.json"), JSON.stringify({
+    query_id: "main",
+    mode: "stream",
+    columns,
+  }, null, 2));
+  await writeFile(join(root, "queries", "main.sql"), `SELECT ${[...columns].reverse().map((column: any) => `t0.\`${column.name}\` AS \`${column.name}\``).join(", ")} FROM \`transport\`.\`driver\` AS t0`);
+  const aliasMismatch = await validateStagedArtifacts({ phase: "query", plan: fixture.plan, root });
+  assert.equal(aliasMismatch.ok, false);
+  assert.match((aliasMismatch.errors ?? []).join("\n"), /SELECT 输出别名/);
+  await writeFile(join(root, "queries", "main.sql"), `SELECT ${select} FROM \`transport\`.\`driver\` AS t0`);
+  const queryValidation = await validateStagedArtifacts({ phase: "query", plan: fixture.plan, root });
+  assert.equal(queryValidation.ok, true, JSON.stringify(queryValidation.errors));
+  await writeFile(join(root, "scripts", "report.ts"), [
+    "export async function run(ctx: any) {",
+    "  for await (const row of ctx.queryStream('main')) await ctx.emit(row);",
+    "}",
+  ].join("\n"));
+  const finalized = await finalizeStagedPackage({
+    workspace: fixture.workspace,
+    plan: fixture.plan,
+    root,
+    reviewedBy: "workflow-reviewer",
+  });
+  assert.equal(finalized.ok, true);
+  const packageValidation = await validatePackage(String(finalized.package));
+  assert.equal(packageValidation.valid, true, packageValidation.errors.join("\n"));
+});
+
+test("staged declarative strategy publishes v2 atomically and restores the plan on a collision", async () => {
+  const fixture = await createFixture();
+  await inspectReport({ workspace: fixture.workspace, knowledge: fixture.knowledge, reportId: "driver-detail", out: fixture.plan });
+  const root = join(fixture.workspace, "work", "report-build", "driver-detail", "revision-a");
+  await mkdir(root, { recursive: true });
+  const model = await initializeReportModel({ plan: fixture.plan, out: join(root, "report-model.json") });
+  model.result_grain.keys = ["code"];
+  model.open_questions = [];
+  model.recommended_strategy = "sql";
+  await writeFile(join(root, "report-model.json"), JSON.stringify(model, null, 2));
+  const initialPlan = JSON.parse(await readFile(fixture.plan, "utf8"));
+  await writeFile(join(root, "semantic-plan.json"), JSON.stringify(initialPlan.semantic_plan, null, 2));
+  await writeFile(join(root, "execution-plan.json"), JSON.stringify({ ...initialPlan.execution_plan, strategy: "sql" }, null, 2));
+  await writeFile(join(root, "declarative-configuration.json"), JSON.stringify({
+    script_report: { source: "throw new Error('must be ignored')", queries: [] },
+  }, null, 2));
+  await approveStagedModel({ plan: fixture.plan, root, reviewedBy: "workflow-reviewer" });
+
+  const planBeforeCollision = await readFile(fixture.plan, "utf8");
+  const finalRoot = join(fixture.workspace, "reports", "packages", "driver-detail", String(initialPlan.report.version));
+  await mkdir(finalRoot, { recursive: true });
+  await assert.rejects(
+    finalizeStagedPackage({ workspace: fixture.workspace, plan: fixture.plan, root, reviewedBy: "workflow-reviewer" }),
+    /禁止原地覆盖/,
+  );
+  assert.equal(await readFile(fixture.plan, "utf8"), planBeforeCollision);
+  await rm(finalRoot, { recursive: true, force: true });
+
+  const finalized = await finalizeStagedPackage({ workspace: fixture.workspace, plan: fixture.plan, root, reviewedBy: "workflow-reviewer" });
+  assert.equal(finalized.strategy, "sql");
+  const manifest = JSON.parse(await readFile(join(String(finalized.package), "report.manifest.json"), "utf8"));
+  assert.equal(manifest.report_package_format_version, "2");
+  const index = JSON.parse(await readFile(join(fixture.workspace, "reports", "index.json"), "utf8"));
+  assert.match(String(index.reports[0].path), /^packages\/driver-detail\//);
 });

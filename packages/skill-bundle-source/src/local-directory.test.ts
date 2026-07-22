@@ -3,10 +3,11 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, rm, stat, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { LocalDirectorySource } from './sources/local-directory.js';
 import { isSkillFileIncluded } from './whitelist.js';
 
-const SOURCE = '/Users/admin/innos/easy-bi-workspace/easy-bi';
+const SOURCE = fileURLToPath(new URL('../../../skill-source/easy-bi', import.meta.url));
 
 async function exists(p: string): Promise<boolean> {
   try {
@@ -53,7 +54,7 @@ describe('LocalDirectorySource against the canonical Easy BI source', () => {
     expect(health.available).toBe(true);
     const versions = await src.listVersions('easybi');
     expect(versions).toHaveLength(1);
-    expect(versions[0]?.version).toBe('1.24.0');
+    expect(versions[0]?.version).toBe('1.29.5');
   });
 
   it('fetches a whitelisted snapshot with manifest + SHA-256 and no forbidden content', async () => {
@@ -62,7 +63,7 @@ describe('LocalDirectorySource against the canonical Easy BI source', () => {
     const fetched = await src.fetch('easybi', 'current', snapshotDir);
 
     expect(fetched.bundleId).toBe('easybi');
-    expect(fetched.version).toBe('1.24.0');
+    expect(fetched.version).toBe('1.29.5');
     expect(fetched.bundleSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(fetched.manifest.files && fetched.manifest.files.length).toBeGreaterThan(0);
 

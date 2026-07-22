@@ -10,12 +10,12 @@
     {
       "id": "initialize-report-knowledge",
       "path": "initialize-report-knowledge",
-      "status": "typescript-implementation-maintained-v0.12.0"
+      "status": "typescript-implementation-maintained-v0.16.0"
     },
     {
       "id": "create-report-package",
       "path": "create-report-package",
-      "status": "typescript-v2-only-maintained-v2.2.0"
+      "status": "typescript-v2-and-v3-script-maintained-v2.26.5"
     }
   ]
 }

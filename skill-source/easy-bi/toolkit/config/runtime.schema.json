@@ -154,6 +154,42 @@
           "type": "integer",
           "minimum": 1
         },
+        "preview_max_rows": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "enrichment_batch_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_merged_groups": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "script_budget_ceiling": {
+          "type": "object",
+          "required": [
+            "max_queries",
+            "max_query_rows",
+            "max_index_rows",
+            "max_batch_keys",
+            "max_output_rows",
+            "max_memory_mb",
+            "timeout_seconds",
+            "stream_batch_rows"
+          ],
+          "properties": {
+            "max_queries": { "type": "integer", "minimum": 1 },
+            "max_query_rows": { "type": "integer", "minimum": 1 },
+            "max_index_rows": { "type": "integer", "minimum": 1 },
+            "max_batch_keys": { "type": "integer", "minimum": 1 },
+            "max_output_rows": { "type": "integer", "minimum": 1 },
+            "max_memory_mb": { "type": "integer", "minimum": 16 },
+            "timeout_seconds": { "type": "integer", "minimum": 1 },
+            "stream_batch_rows": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        },
         "sheet_overflow": {
           "enum": [
             "split",

@@ -10,6 +10,38 @@ export type JobStatus =
   | 'FAILED'
   | 'CANCELED';
 
+/** Provider-independent phases for the staged report-generation workflow. */
+export type ReportWorkflowPhase =
+  | 'DISCOVERY'
+  | 'AWAITING_DISCOVERY_CONFIRMATION'
+  | 'MODELING'
+  | 'AWAITING_MODEL_APPROVAL'
+  | 'QUERY_COMPILATION'
+  | 'SCRIPT_COMPILATION'
+  | 'VALIDATING'
+  | 'REVISION_REQUIRED'
+  | 'COMPLETED';
+
+export interface AgentRun {
+  id: string;
+  conversationId: string;
+  phase?: ReportWorkflowPhase;
+  providerTaskId: string;
+  providerSessionId?: string;
+  contextMode: 'fresh' | 'resume';
+  status: JobStatus;
+  modelRevision?: string;
+  modelHash?: string;
+  /** Query contract handled by this fresh run (one query per provider context). */
+  unitId?: string;
+  /** Immutable staged-build revision shared by all runs in one report conversation. */
+  reportRevision?: string;
+  checkpointId?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
 export interface Job {
   id: string;
   projectId: string;
@@ -19,8 +51,14 @@ export interface Job {
   agentProvider?: string;
   /** Claude session id, for resume. */
   sessionId?: string;
-  /** Current phase label. */
-  phase?: string;
+  /** Current report-workflow phase; absent for ordinary conversations/actions. */
+  phase?: ReportWorkflowPhase;
+  /** Report requirement id that owns a staged report workflow. */
+  reportId?: string;
+  /** Isolates staged artifacts under work/report-build/<reportId>/<revision>. */
+  reportRevision?: string;
+  /** Current provider run while one logical conversation spans fresh sessions. */
+  currentRunId?: string;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
@@ -40,6 +78,9 @@ export interface Job {
 /** SSE event names emitted on the job event stream (plan §12.7). */
 export const JobEventTypes = {
   JOB_STARTED: 'job_started',
+  RUN_STARTED: 'run_started',
+  RUN_COMPLETED: 'run_completed',
+  USER_MESSAGE: 'user_message',
   PHASE_CHANGED: 'phase_changed',
   MESSAGE_DELTA: 'message_delta',
   TOOL_STARTED: 'tool_started',

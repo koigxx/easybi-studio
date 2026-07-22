@@ -75,9 +75,10 @@ Innos 将 Studio Service 作为本地 sidecar 托管：
 
 ## 5. 本地反代路径与认证上下文
 
-- Innos 前端将 `/api/easybi/*` 反代到本地 sidecar；Runtime 代理路径 `/api/easybi/projects/{id}/runtime/api/v1/*` 保留原始响应（状态、Content-Type、Content-Disposition、X-EasyBI-*、Excel 二进制流、HTTP-200 JSON 错误）。
+- Innos 前端将 `/api/easybi/*` 反代到本地 sidecar；Runtime 代理路径 `/api/easybi/projects/{id}/runtime/api/v1/*` 保留原始响应（状态、Content-Type、Content-Disposition、X-EasyBI-*、Excel 二进制流、HTTP-200 JSON 错误）。同一路径透传 `POST .../queries`、`POST .../exports` 以及 `DELETE .../executions/{requestId}`、`DELETE .../tasks/{runtimeTaskId}`；取消不引入任何 Provider 专用协议。
 - 认证上下文：Innos 在反代层完成登录/租户鉴权后，以头部（如 `X-EasyBI-Tenant`、`X-EasyBI-User`）向 sidecar 传递上下文；**客户数据库连接与工作区文件不经过 cloud-gateway**，始终留在本地。
 - API Key/Secret：Studio 不读取、不保存、不展示；Claude/Innos 凭据由各自登录态或受控环境文件提供。
+- 报表阶段编排属于 Studio 的 Provider 无关契约：Innos 仍只看到一个逻辑 task 和一条 SSE；基础建模、确定建模、逐查询编译及可选脚本编译在后端映射为多个全新 `AgentRun`。每个任务携带稳定 `reportId + reportRevision`，每个查询 run 可携带 `unitId`；阶段产物是否合格由 Studio 本地 Skill CLI 门禁判断，不依赖 Provider 自报成功。InnosAgentBridge 只需实现既有 `start/events/continue/cancel`，无需让前端理解或保存 Provider session。
 
 ## 6. 迁移清单（接入时）
 

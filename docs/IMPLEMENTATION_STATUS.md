@@ -1,6 +1,6 @@
 # Easy BI Studio 实施状态
 
-最后更新时间：2026-07-21
+最后更新时间：2026-07-23
 
 > 本文档分三区：**① 当前状态快照**（现在是什么样）→ **② 变更历史**（倒序增量）→ **③ 历史阶段记录**（各阶段任务/测试归档）。
 > 架构见 [ARCHITECTURE.md](./ARCHITECTURE.md)；开发规范见 [AI_CONTRIBUTING.md](./AI_CONTRIBUTING.md)。
@@ -29,9 +29,9 @@
 
 ### 当前版本
 
-- Bundle `1.24.0`、知识库 Skill `0.16.0`、报表 Skill `2.21.0`（开发版）。
+- Bundle `1.29.5`、知识库 Skill `0.16.0`、报表 Skill `2.26.5`（开发版）。
 - 数据库支持：MySQL（默认）与 PostgreSQL，经方言层分派；连接类型在配置页可选。
-- 每个 Skill 含面向开发者/管理员的 `使用说明.md`；报表计划与报表包为格式 v2（v1 不读取、不迁移、不执行）；Runtime HTTP API 仍为 v1。
+- 每个 Skill 含面向开发者/管理员的 `使用说明.md`；报表计划为 v2，报表包支持 v2 声明式和 v3 隔离脚本（v1 不读取、不迁移、不执行）；Runtime HTTP API 仍为 v1。
 - 每次同步生成新的不可变版本缓存与 `vendor/easybi-bundle` 快照，不覆盖旧缓存。
 
 ### 仍待外部输入（非阻塞，阶段门禁允许）
@@ -45,6 +45,59 @@
 ---
 
 ## ② 变更历史（倒序）
+
+### 策略分流、逐查询 Agent 与原子发布（bundle 1.29.5）（2026-07-23）
+
+- **策略正确分流**：模型批准结果返回 `strategy/query_ids`。`sql/enrichment/group_queries` 只用 fresh Agent 复核 `declarative-configuration.json`，随后确定性生成 v2；仅 `script` 进入 v3 查询和脚本编译，简单报表不再被强制脚本化。
+- **一个查询一个上下文**：v3 每个 query contract 分配独立 `AgentRun.unitId` 和全新 Provider session；当前 run 只携带一个契约及精确知识切片，全部查询逐个通过后才启动脚本 Agent。一个逻辑 Job、SSE 和前端对话保持不变。
+- **构建隔离与审计**：任务创建时生成不可变 `reportRevision`，阶段目录改为 `work/report-build/<report-id>/<revision>`；Job/AgentRun 经 migration `0006` 持久化 revision 与 unit。批准人来自 `X-EasyBI-User`（本地回退 `local-user`），不再硬编码；首个 Agent 启动前检查工作区 bundle 是否具备 staged CLI，旧工作区明确提示显式升级且不静默升级。
+- **契约和发布门禁**：查询 SQL 的外层 SELECT 必须逐列显式 `AS` 且名称/顺序与批准契约完全一致；`validate-stage --query-id` 可只校验本次查询。`finalize-staged` 先在 revision 内生成候选包并静态校验，再移动到最终版本目录、最后更新索引；碰撞或失败恢复原计划/索引并清理候选，禁止半成品进入报表列表。
+- **前端失败恢复**：确认模型、批准模型和新对话请求失败时，AI 抽屉恢复原阶段、等待问题和输入文本，不再永久停在伪 `RUNNING` 状态。
+- **改动文件**：Contracts、migration/JobStore、JobManager、Service 路由/提示词/staged runner、AgentDrawer；报表 Skill CLI/测试/SKILL/提示词/编译制品；Bundle manifest/index、架构与 Innos 文档。
+- **测试与分发**：报表 Skill 85/85、JobManager 15/15、Studio Web 91/91、Staged Workflow runner 3/3、Bundle Source 6 通过（5 个可选源跳过）、Workspace Bootstrapper 6/6；全仓 build/typecheck、变更产品文件定向 ESLint 通过。migration `0001–0006` 用 Node 内置 SQLite 验证两次执行幂等，并验证 `reportRevision/unitId` 持久化。Bundle 1.29.5 已同步到不可变缓存与 vendor（SHA-256 `fbc68eef…`），vendor `doctor` 验证 staged workflow v2 能力。Studio Service 全套 Vitest 仍受当前 Windows 的既有 `better-sqlite3` 原生绑定缺失和部分测试旧绝对源路径影响。
+- **已知问题与下一步**：静态阶段已把 SQL 输出名称/顺序绑定到批准契约，但真实数据库返回类型与业务数据正确性仍需连接真实库做 preview/Excel 验收；结构化模型差异视图和 `failure.json` 自动定向回退仍可继续增强。
+
+### 分阶段产物门禁与确定性装配闭环（bundle 1.28.0）（2026-07-22）
+
+- **修复 SSE 游标错位**：前端补齐 `run_started/run_completed/user_message` 监听，消费事件数现在与后端持久化序号严格一致；阶段确认后重订阅不会再重放旧 `job_completed` 并提前断流。
+- **稳定任务范围**：创建/修改报表必须携带 `reportId`，写入 Job 与 SQLite（migration `0005`），新 Agent 提示词包含固定 `work/report-build/<report-id>` 根目录；修改报表同样要求先选中目标，避免全新会话丢失报表身份。
+- **产物门禁**：JobManager 新增阶段 prepare/complete hooks。Provider `completed` 后先运行本地 Skill CLI；失败时当前 AgentRun 标记失败、阶段保持不变并显示“产物需修复”，不会进入确认边界或自动启动脚本 Agent。查询阶段前由 Studio 执行模型批准，脚本阶段成功后才标记整个流程完成。
+- **确定性装配**：报表 CLI 新增 `validate-stage/approve-staged-model/finalize-staged`。模型、语义/执行计划、逐查询 SQL/output contract 和 `report.ts` 使用固定目录；查询输出逐列校验名称、顺序和类型。`finalize-staged` 唯一负责构造 `configuration.script_report`、configure/approve/generate/validate，Agent 禁止手改最终 plan。
+- **回归**：新增真实无数据库端到端 fixture，覆盖模型批准、错误列顺序阻断、SQL/脚本装配、v3 包生成及静态校验；新增 Studio CLI runner 与非法 reportId 路径测试、JobManager 门禁失败测试、前端完整 SSE 事件集合测试。
+- **测试与分发**：报表 Skill 84/84、JobManager 14/14、Studio Web 91/91、Staged Workflow runner 2/2、Bundle Source 6 通过（5 个可选源跳过）、Workspace Bootstrapper 6/6；全仓 build/typecheck 与本次产品代码定向 lint 通过；0001–0005 migration 用 Node 内置 SQLite 验证幂等。Bundle 1.28.0 已同步到全新不可变缓存与 vendor（SHA-256 `f22396bd…`），vendor doctor 和三个新命令可发现性验证通过。
+- **下一步**：使用真实“客户单量统计”表结构和数据验证多查询 SQL 结果、脚本合并、预览/Excel、预算与取消；现阶段静态生成链路已闭环，但真实业务口径和数据正确性仍需数据库验收。
+
+### 分阶段报表建模、Provider 新会话与 Context Pack（bundle 1.27.0）（2026-07-22）
+
+- **一个用户对话、多个底层运行**：报表任务新增 `DISCOVERY → AWAITING_DISCOVERY_CONFIRMATION → MODELING → AWAITING_MODEL_APPROVAL → QUERY_COMPILATION → SCRIPT_COMPILATION → COMPLETED` 阶段；前端仍保持一个抽屉、一个逻辑 Job 和一条持久化事件流。跨阶段统一调用 `AgentBridge.start` 创建全新 Provider 会话，普通阶段内追问才 resume，前端不感知 Provider task/session。
+- **持久化与恢复**：新增 `agent_runs`，保存阶段、Provider task/session、fresh/resume、模型 revision/hash、检查点和终态；Job/Event 增加当前 run 与阶段关联。Studio 重启时已消失的活跃 run 标记失败，逻辑对话按既有策略可恢复；删除对话显式清理事件与运行记录。
+- **用户确认门**：基础建模结束后前端显示“确认并确定建模”，确定模型结束后显示“批准并开始编译”；确认消息作为可见用户事件写入同一对话。查询编译完成后自动切到全新的脚本编译 Agent，阶段切换显示上下文已重置，但不暴露底层会话。
+- **结构化模型与最小上下文**：报表 CLI 新增 `init-model/validate-model/approve-model/build-phase-context`。批准模型固定结果粒度、表/字段白名单、关系基数、指标去重键、时间/排除口径和逐查询契约，并以 hash 防止批准后漂移。查询 Context Pack 默认最多 3 表/40 字段；脚本 Context Pack 只带批准计划与实际 query-output contracts，明确排除物理知识库和探索历史。表或字段越界在批准/生成前失败。
+- **定向修复**：`repair` Context Pack 根据 `MODEL_* / QUERY_* / SCRIPT_* / Runtime` 错误只返回对应阶段，不再携带整库知识与全部历史反复尝试。Skill 主提示词改为 discovery-only，创建和修改报表均禁止首轮直接写 SQL/脚本/报表包。
+- **改动文件**：Contracts、SQLite migration/JobStore、JobManager、Studio Service 路由与阶段提示词、Agent Drawer/API/reducer；报表 Skill CLI/测试/编译制品/SKILL/提示词/使用说明/技术规范；Bundle 版本断言、总体架构、Innos 集成和本状态文档。
+- **测试**：报表 Skill 83/83；JobManager 13/13；Studio Web 90/90；Bundle Source 6 通过（5 个可选源跳过）；Workspace Bootstrapper 6/6；全仓 `build`、`typecheck` 与本次产品代码定向 lint 通过；0001–0004 migration 另用 Node 内置 SQLite 验证两次执行幂等及 `agent_runs/current_run_id/event run+phase` 结构；Bundle 1.27.0 首次同步（SHA-256 `7c195ef5…`），vendor `doctor` 确认支持包格式 2/3。Studio Service Vitest 在当前 Windows 环境仍受既有 `better-sqlite3` 原生绑定缺失与部分测试旧绝对路径影响，新增路由/restart 断言未由该套件执行；全仓 lint 仍有既存规则问题。
+- **已知边界与下一步**：当前模型批准 hash 可由 API 记录，但 UI 尚未展示结构化模型差异；查询→脚本为自动阶段切换，结构化 `failure.json` 的自动回退 UI 尚未接通。下一步用真实“客户单量统计”跑一次基础建模确认、订单/运单/派车单独立查询、脚本合并、预算与取消验收，再补模型差异视图和 failure 自动定向回退。
+
+### 语义/执行计划、v3 隔离脚本与按需上下文（bundle 1.26.1）（2026-07-22）
+
+- **先计划后代码**：`inspect/configure-plan` 生成 `semantic_plan` 与 `execution_plan`，`explain-plan` 输出确定性审阅文本，二者明确结果粒度、指标去重键、时间/排除口径以及逐步查询、合并和输出流程；未审批不得生成包。
+- **v3 最小闭环**：新增格式 3 脚本包和 `queryStream/loadIndex/batchLookup/emit` 上下文；每条查询独立锁定知识来源、Profile、数据库和 SQL 方言，TypeScript 源自动生成 `.mjs`。父 Runtime 持有只读数据库连接，报表代码在 Node 权限隔离子进程执行，支持预览与 Excel。
+- **资源与取消**：包级查询数、查询/索引/输出行、批次键、内存、超时和流批次预算受 Runtime 全局 ceiling 二次约束；预算越界明确失败。断连、`DELETE /api/v1/executions/{requestId}` 和 `DELETE /api/v1/tasks/{runtimeTaskId}` 会中断活动查询并终止脚本；同时修复任务数据库打开时误把全部 RUNNING 重置为 QUEUED 的问题。
+- **上下文收敛**：新增 `build-context`，默认只选择计划来源、关系、索引、字段、系统条件与安全信息，缺表时显式 `--include`，不携带样本、扫描、连接配置、秘密或历史。主 `SKILL.md` 从 800 余行压缩为约 260 行核心工作流，策略细节按选中的 SQL/enrichment/group_queries/v3 路由到技术参考，避免“整库+整份规范”反复重试。
+- **编辑与分发**：Studio 报表编辑器允许 `queries/*.sql` 和 `scripts/report.ts`，保存 TS 时同步生成 `.mjs`；Bundle 升级到 1.26.1、报表 Skill 2.23.0，并同步到全新不可变缓存和 vendor 快照。
+- **改动文件**：报表 Skill 的生成器、隔离 runner/runtime、共享 Runtime、测试、编译制品、SKILL/提示词/规范/说明；Runtime 配置 Schema；workspace-sdk 报表编辑器；Bundle manifest/index 与版本测试；架构、接口、Innos、决策和本状态文档。
+- **测试**：报表 Skill 82/82；workspace-sdk 报表状态 10/10；Bundle Source 6/6（另 5 项可选源跳过）；Workspace Bootstrapper 6/6；全仓 `build`、`typecheck` 均通过；同步后 vendor `doctor` 确认支持格式 2/3。未使用真实数据库执行 v3 客户单量报表，真实关系字段、业务排除状态和时间口径仍需业务方提供后联调。
+- **下一步**：用实际客户单量数据跑“订单流 + 运单索引/批查 + 派车单 n:n 批查”的预览、同步 Excel、取消和预算越界验收；再根据真实基数调优包级预算。
+
+### 复杂多实体/n:n 报表规划与执行加固（bundle 1.25.0）（2026-07-22）
+
+- **规划门禁**：报表 Skill 不再用“表数量”机械决定方案，改为先确认结果粒度、实体去重键、时间归属、排除规则和 n:n 统计口径；明确 n:1 JOIN、单条 1:n enrichment、多指标实体/n:n `group_queries` 三种路径。自然语言业务指标产生的 `FIELD_NOT_FOUND` 现在带稳定 `field_id`，在 `configure-plan` 中被显式计算字段或分组查询字段实现后可解除；真实物理字段缺失仍保持阻塞。
+- **生成与锁定**：`group_queries` 的每个指标查询可声明同 profile 的短 JOIN 链，逐跳校验表、字段、别名、连接方向和逻辑删除条件；列与时间字段可来自链上任意别名。每个查询单独写入 `knowledge.lock.json.group_query_sources`，校验器要求 SQL 只引用其独立锁定来源，并阻止“锁了表但没有 JOIN”的伪引用。扇出链路由配置显式选择 `COUNT(DISTINCT ...)` 等聚合口径。
+- **运行时容量**：独立查询仍分别执行并按结果键合并；新增 `sync.max_merged_groups`（默认 100000），超过上限以 `GROUP_QUERY_LIMIT_EXCEEDED` 明确失败，避免复杂报表无界占用内存。
+- **真实关系测试**：新增客户单量同构用例：派车单 → 派车单/运单桥表 → 运单 → 主运单 → 订单 → 客户，验证 n:n 链路 SQL、六张来源表独立锁定、`COUNT(DISTINCT 派车单ID)` 和业务指标阻塞解除；另增合并容量越界测试。
+- **改动文件**：报表 Skill 的 `SKILL.md`、提示词、技术规范、使用说明、生成器、Runtime、Schema、测试与编译制品；Bundle manifest/index；Bundle Source/Workspace Bootstrapper 的版本断言和跨平台源目录测试；本架构与维护状态文档。
+- **测试**：报表 Skill 77/77 通过；Bundle Source 6 通过（5 跳过可选源）、Workspace Bootstrapper 6/6 通过；全仓 `build`、`typecheck` 通过。全仓 `lint` 仍有既存 161 项规则问题；全仓测试仍受 Windows 基线问题影响（workspace-sdk 的 POSIX 路径断言、agent-bridge fake CLI `spawn EFTYPE`），与本增量无关。尚未使用真实数据库执行客户单量报表与 Excel 导出。
+- **下一步**：用业务方确认的真实表名、主键/外键、作废状态与时间口径跑一次端到端导出；后续再评估 v3 跨 profile/脚本查询，本版本不允许跨 profile `group_queries`。
 
 ### 清理 0.1.x 报表包死代码兼容（bundle 1.24.0）（2026-07-20）
 

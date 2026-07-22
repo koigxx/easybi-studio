@@ -71,7 +71,7 @@ describe('agent-action job routes (FakeAgentBridge)', () => {
     const first = await studio.app.inject({
       method: 'POST',
       url: '/api/easybi/projects/jobws/agent-actions',
-      payload: { action: 'create-report', prompt: 'a' },
+      payload: { action: 'create-report', prompt: 'a', reportId: 'report-a' },
     });
     expect(first.statusCode).toBe(201);
     await waitForStatus(first.json().data.job.id, 'WAITING_FOR_USER');
@@ -79,7 +79,7 @@ describe('agent-action job routes (FakeAgentBridge)', () => {
     const second = await studio.app.inject({
       method: 'POST',
       url: '/api/easybi/projects/jobws/agent-actions',
-      payload: { action: 'modify-report', prompt: 'b' },
+      payload: { action: 'modify-report', prompt: 'b', reportId: 'report-b' },
     });
     expect(second.statusCode).toBe(409);
     expect(second.json().error.code).toBe('WRITE_TASK_CONFLICT');
@@ -216,6 +216,13 @@ describe('restart reconciliation', () => {
                 ('j2','p','agent','WAITING_FOR_USER','sess-9','t')`,
       )
       .run();
+    db.raw
+      .prepare(
+        `INSERT INTO agent_runs
+          (id, conversation_id, provider_task_id, context_mode, status, created_at)
+         VALUES ('r2','j2','provider-2','fresh','RUNNING','t')`,
+      )
+      .run();
     const store = new JobStore(db.raw);
     const changed = store.reconcileOnStartup();
     expect(changed).toBe(2);
@@ -223,6 +230,7 @@ describe('restart reconciliation', () => {
     // No session → FAILED (interrupted); has session → SUCCEEDED (reopen + resume).
     expect(byId.get('j1')).toBe('FAILED');
     expect(byId.get('j2')).toBe('SUCCEEDED');
+    expect(store.listRuns('j2')[0]?.status).toBe('FAILED');
     db.close();
   });
 });

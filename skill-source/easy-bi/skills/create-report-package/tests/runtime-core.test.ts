@@ -15,10 +15,12 @@ import {
   collectRows,
   compileSql,
   enrichBatched,
+  exportSync,
   createRuntimeServer,
   listReports,
   loadReportPackage,
   outputColumns,
+  querySync,
   runControlQuery,
   runGroupQueriesMerged,
   RuntimeError,
@@ -26,8 +28,146 @@ import {
   widenComparisonFilters,
   writeWorkbookRows,
 } from "../scripts/runtime-core.js";
+import { runScriptIsolated, ScriptExecutionError } from "../scripts/script-runtime.js";
 
 type AnyRec = Record<string, unknown>;
+
+test("isolated v3 script uses queryStream/loadIndex/batchLookup/emit through bounded IPC", async () => {
+  const root = await mkdtemp(join(tmpdir(), "easybi-script-"));
+  const script = join(root, "report.mjs");
+  await writeFile(script, [
+    "export async function run(ctx) {",
+    "  const names = await ctx.loadIndex('names', [], ['id']);",
+    "  for await (const row of ctx.queryStream('main')) {",
+    "    const children = await ctx.batchLookup('children', [row.id]);",
+    "    await ctx.emit({ id: row.id, name: names.get(row.id)[0]?.name, childCount: children.length });",
+    "  }",
+    "}",
+  ].join("\n"));
+  const emitted: AnyRec[] = [];
+  const stats = await runScriptIsolated({
+    scriptPath: script,
+    budget: { max_queries: 10, max_query_rows: 20, max_index_rows: 10, max_batch_keys: 5, max_output_rows: 5, max_memory_mb: 64, timeout_seconds: 10, stream_batch_rows: 1 },
+    handlers: {
+      async queryStream() { return (async function* () { yield { id: 1 }; yield { id: 2 }; })(); },
+      async loadIndex() { return [{ id: 1, name: "A" }, { id: 2, name: "B" }]; },
+      async batchLookup(_id, keys) { return keys.map((key) => ({ parent_id: key })); },
+    },
+    onEmit(row) { emitted.push(row); },
+  });
+  assert.deepEqual(emitted, [
+    { id: 1, name: "A", childCount: 1 },
+    { id: 2, name: "B", childCount: 1 },
+  ]);
+  assert.equal(stats.queryCount, 4);
+  assert.equal(stats.outputRows, 2);
+});
+
+test("isolated v3 script is canceled through AbortSignal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "easybi-script-cancel-"));
+  const script = join(root, "report.mjs");
+  await writeFile(script, "export async function run(ctx) { for await (const row of ctx.queryStream('main')) await ctx.emit(row); }");
+  const controller = new AbortController();
+  const running = runScriptIsolated({
+    scriptPath: script,
+    signal: controller.signal,
+    handlers: {
+      async queryStream() { return (async function* () { await new Promise(() => undefined); yield {}; })(); },
+      async loadIndex() { return []; },
+      async batchLookup() { return []; },
+    },
+    onEmit() {},
+  });
+  setTimeout(() => controller.abort(), 25);
+  await assert.rejects(running, (error: unknown) =>
+    error instanceof ScriptExecutionError && error.code === "SCRIPT_CANCELED");
+});
+
+test("isolated v3 script fails explicitly when the query budget is exceeded", async () => {
+  const root = await mkdtemp(join(tmpdir(), "easybi-script-budget-"));
+  const script = join(root, "report.mjs");
+  await writeFile(script, [
+    "export async function run(ctx) {",
+    "  await ctx.loadIndex('small', [], ['id']);",
+    "  await ctx.loadIndex('small', [], ['id']);",
+    "}",
+  ].join("\n"));
+  await assert.rejects(
+    runScriptIsolated({
+      scriptPath: script,
+      budget: { max_queries: 1 },
+      handlers: {
+        async queryStream() { return (async function* () {})(); },
+        async loadIndex() { return []; },
+        async batchLookup() { return []; },
+      },
+      onEmit() {},
+    }),
+    (error: unknown) => error instanceof ScriptExecutionError && error.code === "QUERY_BUDGET_EXCEEDED",
+  );
+});
+
+test("Runtime preview and Excel export execute a v3 package in the isolated runner", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "easybi-v3-runtime-"));
+  const packageRoot = join(workspace, "reports", "packages", "script-report", "0.1.0-draft");
+  await mkdir(join(workspace, "toolkit", "config"), { recursive: true });
+  await mkdir(join(workspace, "config"), { recursive: true });
+  await mkdir(join(workspace, "reports"), { recursive: true });
+  await mkdir(join(packageRoot, "scripts"), { recursive: true });
+  await writeJson(join(workspace, "toolkit", "config", "runtime.json"), {
+    execution_strategy: {
+      sync: {
+        enabled: true,
+        preview_max_rows: 100,
+        query_timeout_seconds: 5,
+        total_timeout_seconds: 10,
+        max_rows_per_sheet: 1000,
+        max_sheets_per_workbook: 2,
+        max_columns: 20,
+        max_file_bytes: 10_000_000,
+        sheet_overflow: "split",
+        build_to_temp_file_before_response: true,
+        script_budget_ceiling: {
+          max_queries: 10, max_query_rows: 100, max_index_rows: 100,
+          max_batch_keys: 100, max_output_rows: 100, max_memory_mb: 128,
+          timeout_seconds: 10, stream_batch_rows: 16,
+        },
+      },
+    },
+    storage: { local_output_directory: "outputs/files" },
+  });
+  await writeJson(join(workspace, "config", "easy-bi.json"), { connections: { database_profiles: [] } });
+  await writeJson(join(workspace, "reports", "index.json"), {
+    reports: [{ id: "script-report", name: "脚本报表", version: "0.1.0-draft", path: "packages/script-report/0.1.0-draft" }],
+  });
+  await writeJson(join(packageRoot, "report.manifest.json"), {
+    report_package_format_version: "3",
+    id: "script-report",
+    name: "脚本报表",
+    version: "0.1.0-draft",
+    entrypoints: { script: "scripts/report.mjs", fields: "fields.json", parameters: "parameters.schema.json", knowledge_lock: "knowledge.lock.json" },
+    resource_budget: { max_queries: 2, max_query_rows: 10, max_index_rows: 10, max_batch_keys: 10, max_output_rows: 10, max_memory_mb: 64, timeout_seconds: 5, stream_batch_rows: 2 },
+    queries: [],
+  });
+  await writeJson(join(packageRoot, "fields.json"), {
+    schema_version: "2",
+    fields: [{ id: "name", label: "名称", value_type: "string", source: { kind: "script" } }],
+  });
+  await writeJson(join(packageRoot, "parameters.schema.json"), { schema_version: "1", parameters: [] });
+  await writeJson(join(packageRoot, "knowledge.lock.json"), { lock_format_version: "2", sources: [] });
+  await writeFile(join(packageRoot, "scripts", "report.mjs"), [
+    "export async function run(ctx) {",
+    "  await ctx.emit({ name: '甲' });",
+    "  await ctx.emit({ name: '乙' });",
+    "}",
+  ].join("\n"));
+  const preview = await querySync(workspace, { reportId: "script-report" });
+  assert.deepEqual(preview.rows, [{ name: "甲" }, { name: "乙" }]);
+  assert.equal(preview.executionModel, "isolated_script");
+  const exported = await exportSync(workspace, { reportId: "script-report" });
+  assert.equal(exported.rowCount, 2);
+  assert.equal(exported.executionModel, "isolated_script");
+});
 
 async function writeJson(path: string, value: unknown): Promise<void> {
   await mkdir(join(path, ".."), { recursive: true });
@@ -1104,4 +1244,24 @@ test("runGroupQueriesMerged: full-outer merge on merge_keys, numeric metrics def
   assert.deepEqual(merged[1], { code: "C2", order_total: 5, product_total: 0 });
   // C3 present only in sibling → order_total defaults 0.
   assert.deepEqual(merged[2], { code: "C3", order_total: 0, product_total: 7 });
+});
+
+test("runGroupQueriesMerged: rejects an unbounded number of merged groups", async () => {
+  const adapter = {
+    async queryAll(): Promise<AnyRec[]> {
+      return [{ code: "C1" }, { code: "C2" }, { code: "C3" }];
+    },
+  };
+  await assert.rejects(
+    () =>
+      runGroupQueriesMerged(
+        adapter,
+        { sql: "MAIN", values: [] },
+        { mergeKeys: ["code"], compiled: [] },
+        1000,
+        new Set(),
+        2,
+      ),
+    (error: any) => error?.code === "GROUP_QUERY_LIMIT_EXCEEDED",
+  );
 });

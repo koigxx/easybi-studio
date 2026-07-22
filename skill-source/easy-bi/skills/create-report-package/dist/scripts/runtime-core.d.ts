@@ -13,6 +13,8 @@ export type LoadedReport = {
     bindings: JsonRecord;
     knowledgeLock: JsonRecord;
     sql: string;
+    script?: string | null;
+    scriptQueries?: JsonRecord[];
     /** Optional per-field enum code→中文 map; absent in older packages. */
     enums?: JsonRecord | null;
 };
@@ -181,7 +183,7 @@ export declare function runGroupQueriesMerged(adapter: Pick<QueryAdapter, "query
         sql: string;
         values: unknown[];
     }>;
-}, queryTimeoutMs: number, numericFieldIds: Set<string>): Promise<JsonRecord[]>;
+}, queryTimeoutMs: number, numericFieldIds: Set<string>, maxMergedGroups?: number): Promise<JsonRecord[]>;
 /**
  * Wrap a main-query row stream so each row comes out with its enrichment columns
  * attached. Rows are processed in batches of `batchSize`: for each batch we run
@@ -227,10 +229,12 @@ export declare function querySync(workspaceValue: string, request: ExportRequest
     limit?: number;
 }, options?: {
     policy?: JsonRecord;
+    signal?: AbortSignal;
 }): Promise<JsonRecord>;
 export declare function exportSync(workspaceValue: string, request: ExportRequest, options?: {
     output?: string;
     policy?: JsonRecord;
+    signal?: AbortSignal;
 }): Promise<JsonRecord>;
 export declare function createRuntimeServer(workspaceValue: string): Promise<{
     server: ReturnType<typeof createServer>;

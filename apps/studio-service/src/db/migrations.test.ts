@@ -29,6 +29,15 @@ describe('migrations', () => {
     expect(applied.n).toBeGreaterThanOrEqual(2);
     expect(tables).toContain('report_tests');
     expect(tables).toContain('job_events');
+    expect(tables).toContain('agent_runs');
+    const jobColumns = db.prepare("PRAGMA table_info('jobs')").all().map((row) => (row as { name: string }).name);
+    expect(jobColumns).toContain('current_run_id');
+    expect(jobColumns).toContain('report_id');
+    expect(jobColumns).toContain('report_revision');
+    const eventColumns = db.prepare("PRAGMA table_info('job_events')").all().map((row) => (row as { name: string }).name);
+    expect(eventColumns).toEqual(expect.arrayContaining(['run_id', 'phase']));
+    const runColumns = db.prepare("PRAGMA table_info('agent_runs')").all().map((row) => (row as { name: string }).name);
+    expect(runColumns).toEqual(expect.arrayContaining(['unit_id', 'report_revision']));
     db.close();
   });
 });

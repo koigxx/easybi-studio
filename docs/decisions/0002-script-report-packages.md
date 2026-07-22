@@ -1,7 +1,7 @@
 # 决策 0002（提案）：脚本驱动的报表包（多库 / 多查询 / 同比环比 sheet）
 
 - 日期：2026-07-20
-- 状态：**提案（待评审）** — 本文为实现计划，不含代码；评审确认后再开工。
+- 状态：**已接受，阶段 B 最小版本已实现（2026-07-22）** — v2 与 v3 并存；多 Sheet/同比环比仍留待阶段 C。
 
 ## 背景与真实需求
 
@@ -83,7 +83,7 @@ export async function run(ctx: ReportContext): Promise<void> {
   1. 知识库**多 database 扫描并发布**：配置侧 `database_profiles[].settings.databases` 已是数组，Studio ConnectionsEditor 支持"添加多个 database"，扫描侧 `dialect.tables/columns/indexes/foreignKeys` 用 `WHERE TABLE_SCHEMA IN (…)` 全量扫，`discover` 遍历所有库。→ **只需用户在配置里列出多个库并重扫**。
   2. **同一连接跨 database 的 JOIN 已支持**：报表校验器只禁"跨 *profile*"（`profiles.size>1`），不禁跨 database；生成的 SQL 每张表都用自身 `库.表` 限定（`FROM \`transport\`.\`driver\`` JOIN `\`settlement\`.\`driver_fee\``）；Runtime 连主表所在库为默认 schema，同连接可引用兄弟库。已加测试锁定（`cross-database JOIN within one profile…`）。
   - 结论：**能靠 JOIN 表达的单连接多库报表现在就能做**。阶段 A 实际只剩：①补 SKILL/文档说明跨库用法；②用户配置多库并重扫初始化知识库。为 B 打好"多库知识 + 跨库引用"地基。
-- **阶段 B（核心）**：v3 脚本包 —— 包格式、`ctx` 契约、Runtime v3 执行器、dbKey→profile 路由、`loadIndex`、沙箱、内存/行数上限、生成期+运行期校验。页面编辑器 / reseal 复用（AI 生成 `report.ts`、人工修）。
+- **阶段 B（核心）**：✅ 已完成最小版本。v3 包包含批准后的语义计划/执行计划、逐查询 SQL 与知识锁；提供 `queryStream/loadIndex/batchLookup/emit`；父 Runtime 持有只读数据库连接，脚本由 Node Permission Model 子进程隔离执行；包预算与 Runtime ceiling 共同限制查询、行数、索引、批次、输出、内存和超时；支持 HTTP 断连、同步 requestId 和异步 runtimeTaskId 取消。跨 profile 路由沿查询自身 `profile_id` 解析。页面编辑器支持 `queries/*.sql` 与 `scripts/report.ts`，保存后自动生成 `report.mjs`。
 - **阶段 C（对比 sheet）**：`comparison` 配置 + 多语义 sheet 输出 + 按月区间推导（相邻期/去年同期）+ `summarize` 范式。
 - **阶段 D（多机，按需）**：dbKey→不同 profile/连接，脚本与 `ctx` 不变。仅当出现多机时做。
 

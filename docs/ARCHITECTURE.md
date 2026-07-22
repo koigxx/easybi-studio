@@ -106,9 +106,11 @@ easybi-studio/                        # 产品仓库 = 应用代码 + 技能包�
 - **创建工作区**：`POST /api/easybi/projects/create` → `workspace-bootstrapper`：建目录 → 从缓存独立安装技能包 → 写 lock → bootstrap init → 登记进 SQLite。既有工作区**不自动升级**。
 - **知识库**：AI 在工作区跑知识库 Skill → 产物默认落 `knowledge/drafts/`（草稿）。Studio 提供草稿可视化编辑与发布；发布生成 `knowledge/versions/<semver>/`（不可变），草稿保留供后续迭代。
 - **枚举中文映射**：知识库 `build` 自动做非阻断枚举初始化（真实 distinct 探测带 LIMIT + 短超时 + 只读事务，绝不覆盖人工 label）。Studio 枚举页经 Skill 适配器读写，字段绑定 ↔ 枚举字典，JSON/Excel 双通道。
-- **报表**：报表配置写入 `config/easy-bi.json`；AI 跑报表 Skill 生成报表包（格式 v2）到 `reports/packages/`。development-only 包可在页面删除；已发布包受保护。
+- **报表**：报表配置写入 `config/easy-bi.json`；AI 先运行 `inspect + build-context` 获取按需知识切片，审阅语义计划与执行计划，再生成 v2 声明式或 v3 隔离脚本包到 `reports/packages/`。n:1 可直接 JOIN，单条 1:n 附属链可用 enrichment，多指标实体或 n:n 链路用 `group_queries`；多阶段/跨 Profile 编排用 v3 的 `queryStream/loadIndex/batchLookup/emit`。development-only 包可在页面删除；已发布包受保护。
 - **同步导出**：测试页命中 `runtime-supervisor` 代理的 `easybi-runtime`，Excel 二进制触发下载；未配 DB/OSS 时返回 HTTP-200 JSON 友好错误，**静态校验绝不记为成功导出**。
 - **AI 对话**：前端全局对话抽屉（`AgentDrawerProvider`）→ `POST /agent-actions`（带 action + 可选自由文本）→ `JobManager` 起写/读任务（写任务先建检查点）→ `AgentBridge` Provider（本机 `ClaudeCodeBridge`）执行 → 事件经 `normalizeAgentEvent` 归一为 `JobEvent` → `GET /jobs/:id/events`(SSE) 流式回前端 → `panels/agent-chat.ts` 折叠成对话视图，`ChatMarkdown.tsx` 渲染 Markdown。**多轮**经 `/agent-tasks/:id/messages`：真实 Claude 每轮以 `completed` 收尾（不发 `waiting_for_user`），回复时 `replyToJob` 从 SUCCEEDED 续轮（`--resume <session>` + 重新 pump 新事件流，`JOB_TRANSITIONS` 允许 `SUCCEEDED→RUNNING`）。回复后前端重新订阅 SSE 时带 `?since=<已消费事件数>` 游标，`subscribe(jobId, since)` 只重放未看过的事件、并按任务真实状态（而非最后缓冲事件）决定关流，避免重放上一轮 `job_completed` 导致新一轮无响应。前端把连续 tool 行折叠成可展开分组（`groupRows`），`job_completed.summary` 与末尾 assistant 行同文时不重复渲染。**终止**经 `POST /agent-tasks/:id/interrupt`（`AgentBridge.interrupt?`）：停当前轮但保留 session，任务落 SUCCEEDED 可继续对话，区别于 `POST /cancel`（终态 CANCELED）。删除历史经 `DELETE /agent-tasks/:id`（级联 job_events；活跃任务 409）。**普通对话**：`action='free-chat'`（只读、不占写锁）发用户原文，不套模板。**可配置预置提示词**：各 skill 的 `prompts.json`（manifest `agent_prompts` 引用）→ 首次回退默认；`GET/PUT /projects/:id/agent-prompts` 存到 config 可选 `agent_prompts` 块（`buildActionPrompt` 的 `fullPrompt` 覆盖内置模板）。**对话持久化**：每个 `JobEvent` 落 SQLite `job_events` 表（`0003`），重启后 `POST /agent-tasks/:id/reopen` 从库重建会话供查看，并可用保存的 `session_id`（`AgentBridge.rehydrate` + `--resume`）继续追问——像 Claude Code 一样关闭后仍能找回。**Provider 切换是后端环境变量（`EASYBI_AGENT_PROVIDER`），前端零改动**；前端不直连任何 AI 厂商 API。
+
+  报表生成在同一逻辑 Job/SSE/抽屉内采用多次 `AgentRun`：`DISCOVERY → 用户确认 → MODELING → 用户批准 → QUERY_COMPILATION`，仅 `script` 策略继续进入 `SCRIPT_COMPILATION`；声明式 `sql/enrichment/group_queries` 直接确定性生成 v2。阶段切换调用 `AgentBridge.start` 创建全新 Provider 会话，不使用上一阶段 session；v3 的每个查询契约也各占一个 fresh run，只通过带 hash 的报表模型、语义/执行计划、单查询输出契约和阶段 Context Pack 交接。任务创建时生成不可变 revision，所有产物落 `work/report-build/<report-id>/<revision>`。Provider 的 `completed` 不等于阶段成功：Studio 通过 Skill CLI 的 `validate-stage/approve-staged-model/finalize-staged` 做确定性门禁，校验 SQL 外层 SELECT 别名与输出契约；最终包先在 revision 内生成候选并校验，再原子移动并更新索引，失败恢复计划和索引。前端只显示阶段边界与确认按钮，不暴露 Provider task/session id。普通追问仍可在当前阶段内 resume。`jobs/agent_runs` 保存 revision、查询 unit、阶段、上下文模式、模型版本/hash、检查点和终态；重启时已消失的活跃运行标记为失败，但逻辑对话可按原有 session 策略恢复。
 
 ## 6. Studio 与技能包的联动（Skill Interop）
 
@@ -152,7 +154,7 @@ skill-source/easy-bi/          scripts/sync         ~/.easybi-studio/skill-cache
 1. **AI 编排（生成）**：`AgentBridge` spawn Claude Code CLI，`cwd=工作区`，让 AI **阅读 `SKILL.md` 按其审批门禁**运行技能包 CLI 来生成知识库/报表包。产物落工作区 `knowledge/drafts`、`reports/packages`。事件经 Job/SSE 回前端（详见 §5 AI 对话）。
 2. **确定性 CLI（执行/校验）**：Studio 后端**直接** spawn manifest 里声明的编译 CLI（`shell:false` + 数组参数 + `cwd=工作区`）做确定性操作——如报表包 `validate`、知识库 catalog 操作。不经 AI，结果可复现。
 
-其中**报表运行时（easybi-runtime）**是特例：`runtime-supervisor` 以动态端口托管技能包内 bundled 的 runtime 进程，Studio 测试页经它透明代理三接口（list/parameters/export|query）。Runtime **每次请求都重新读工作区里的报表包**，改报表包无需重启进程；只有改了 runtime 的 dist 代码才需重启。
+其中**报表运行时（easybi-runtime）**是特例：`runtime-supervisor` 以动态端口托管技能包内 bundled 的 runtime 进程，Studio 测试页透明代理 list/parameters/query/export/cancel。Runtime **每次请求都重新读工作区里的报表包**；v3 数据库连接与资源预算由父 Runtime 持有，报表脚本在权限隔离子进程执行，断连或取消会中止查询和脚本。改报表包无需重启进程；只有改了 runtime 的 dist 代码才需重启。
 
 ### 6.4 版本演进（改技能包的完整回路）
 

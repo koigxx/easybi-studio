@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { ok, type AgentBridge } from '@easybi-studio/contracts';
@@ -11,6 +10,8 @@ import { registerConfigRoutes } from './config/routes.js';
 import type { MysqlAdapter } from '@easybi-studio/config-sdk';
 import { registerJobRoutes } from './jobs/routes.js';
 import { registerAgentPromptRoutes } from './agent/prompt-routes.js';
+import { buildReportPhasePrompt } from './agent/prompts.js';
+import { StagedReportWorkflow } from './reports/staged-workflow.js';
 import { JobStore } from './jobs/store.js';
 import { JobManager, type CheckpointHook } from '@easybi-studio/job-manager';
 import { FakeAgentBridge, ClaudeCodeBridge, InnosAgentBridge } from '@easybi-studio/agent-bridge';
@@ -113,6 +114,7 @@ export function buildApp(options: BuildAppOptions): StudioApp {
 
   // Job system: persist to SQLite and reconcile interrupted jobs on startup.
   const jobStore = new JobStore(db.raw);
+  const stagedReportWorkflow = new StagedReportWorkflow();
   jobStore.reconcileOnStartup();
 
   // Provider selection (all providers share the frozen AgentBridge contract, so
@@ -143,6 +145,17 @@ export function buildApp(options: BuildAppOptions): StudioApp {
     onJobChange: (job) => jobStore.upsert(job),
     checkpoint: checkpointHook,
     events: jobStore,
+    buildReportPhasePrompt: (phase, context) => buildReportPhasePrompt(
+      phase,
+      context.userConfirmation,
+      context.reportId,
+      context.reportRevision,
+      context.unitId,
+      context.strategy,
+    ),
+    prepareInitialReport: (input) => stagedReportWorkflow.ensureCapabilities(input),
+    prepareReportPhase: (input) => stagedReportWorkflow.prepare(input),
+    completeReportPhase: (input) => stagedReportWorkflow.complete(input),
   });
 
   app.decorateRequest('requestId', '');

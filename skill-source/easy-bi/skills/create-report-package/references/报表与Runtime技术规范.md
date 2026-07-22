@@ -219,6 +219,30 @@ JOIN**（不撑行、走索引），只把这张一对多表改为 enrichment—
 
 **不支持（校验期报错，不静默降级）**：分组(group)报表 + enrichment、跨 profile、依赖成环。
 
+### 8.2 Group queries：多实体独立聚合后按稳定维度合并
+
+当一张分组报表同时统计多个独立实体，或关系路径包含 n:n / 多个独立 1:n
+分支时，禁止把所有事实实体放进一条 SQL 后直接 COUNT。使用 `group_queries`：
+主查询和每个 sibling 查询分别把一个实体聚合到同一维度粒度，Runtime 再按
+`merge_keys` 做 full-outer merge，缺失数值指标补 0。
+
+- `merge_keys` 必须是每个查询都输出的稳定业务 ID；名称仅作为展示列。
+- 每个 sibling 以 `table`/`alias` 声明指标实体，可选 `joins[]` 只用于沿最短
+  路径到达分组维度。JOIN 表、字段、逻辑删除条件和 schema fingerprint 均从
+  知识库解析并写入 `knowledge.lock.group_query_sources`。
+- `joins[]` 只允许 `LEFT|INNER` 等值关联；请求不能提供表名、JOIN 或表达式。
+- 路径含 1:n/n:n 时，实体计数必须使用 `COUNT(DISTINCT entity.id)`，去重键由
+  报表计划明确记录并在批准前让用户确认业务口径。
+- `period_param` 可把一个必填日期范围广播到各查询自己的
+  `period_alias.period_field`；不同实体的时间字段必须明确，不能默认它们语义相同。
+- 每个 sibling 生成独立 SQL、bindings 和知识锁；静态校验逐个检查 SQL 仅引用
+  自己锁定的别名和列。
+- Runtime 在同一只读事务内顺序执行查询，按 `max_merged_groups`（默认 100000）
+  限制内存合并的分组数，超限返回 `GROUP_QUERY_LIMIT_EXCEEDED`，不输出部分文件。
+
+`group_queries` 与 group transform、enrichment、comparison 互斥。跨 profile 或
+无法由有限声明式查询表达的逻辑不静默降级；脚本驱动 v3 在实现前仍视为不支持。
+
 ## 9. 聚合与计算
 
 可以用 SQL 表达的计算优先放 SQL：
@@ -414,6 +438,7 @@ JSON 错误：
 - 总超时 900 秒；
 - 查询和 Excel 必须流式；
 - Group Transform 只缓冲一个组；
+- Group queries 合并最多 100,000 个维度组（可由 `max_merged_groups` 调整）；
 - 异步队列限制由 Runtime 配置控制。
 
 超过第三个 Sheet、文件大小、组大小或时间限制时明确失败，不返回不完整文件。
@@ -443,12 +468,50 @@ JSON 错误：
 
 静态生成或断开数据库的尝试不能声明为真实导出成功。
 
-## 16. v2-only
+## 16. 支持的报表包格式
 
-格式 v1 计划和报表包不读取、不迁移、不执行。工作区所有者明确删除旧索引、计划和包，再基于现有知识库与报表需求重新生成 v2。
+格式 v1 计划和报表包不读取、不迁移、不执行。工作区所有者明确删除旧索引、计划和包，再基于现有知识库与报表需求重新生成。声明式报表生成 v2；隔离脚本报表生成 v3。两者并存且不相互迁移。
 
 不要删除或改名 `/api/v1/*`：它是 Runtime HTTP API 版本。
 
 ## 17. 跨工作区维护
 
-Runtime 和 CLI 从 Bundle Manifest 与工作区根目录解析路径。具体报表包不包含工作区绝对路径。切换工作区后，只发现该工作区 `reports/index.json` 注册的 v2 包。
+Runtime 和 CLI 从 Bundle Manifest 与工作区根目录解析路径。具体报表包不包含工作区绝对路径。切换工作区后，只发现该工作区 `reports/index.json` 注册的 v2 或 v3 包。
+
+## 18. v3 隔离脚本报表包
+
+v2 继续承载单 SQL、JOIN、enrichment 和 `group_queries`；v3 只用于必须多阶段查询、索引、批量补充或脚本封装的复杂报表。计划格式仍为 v2 兼容扩展，但批准前必须同时存在：
+
+- `semantic_plan`：结果粒度、维度、指标口径、实体去重键、时间语义、排除规则与待确认问题；
+- `execution_plan`：策略、选择理由，以及按顺序排列的查询/索引/批量查询/计算/输出步骤。
+
+`explain-plan` 输出人类可读审阅文本。未经批准不得生成包。v3 包固定包含 `semantic-plan.json`、`execution-plan.json`、`plan-review.md`、`queries/<id>.sql`、`scripts/report.{ts,mjs}` 和逐查询知识锁。
+
+脚本唯一入口为 `export async function run(ctx)`，仅允许：
+
+- `ctx.queryStream(queryId, values)`：流式读取主结果集；
+- `ctx.loadIndex(queryId, values, keyFields)`：将有界小结果建立只读索引；
+- `ctx.batchLookup(queryId, keys, values)`：把关联键绑定到唯一的 `/* KEYS */` 标记；
+- `await ctx.emit(row)`：带背压输出一行。
+
+禁止 `import/require/eval/Function/process/globalThis/fs/net/fetch` 等能力。Runtime 父进程持有数据库连接并强制只读事务；脚本在 Node Permission Model 子进程中执行，仅允许读取 runner 和自身入口文件。父子进程通过 IPC 分批交换行，脚本不能读取密码或连接对象。
+
+每个包声明 `max_queries`、`max_query_rows`、`max_index_rows`、`max_batch_keys`、`max_output_rows`、`max_memory_mb`、`timeout_seconds` 和 `stream_batch_rows`。Runtime 的 `sync.script_budget_ceiling` 再施加平台上限，最终使用两者较小值。HTTP 断连、`DELETE /api/v1/executions/{requestId}` 或 `DELETE /api/v1/tasks/{runtimeTaskId}` 会终止脚本进程、关闭查询连接并清理未完成输出。
+
+生成上下文时先运行 `build-context`。它只输出计划已选表、显式 `--include` 表、字段语义、索引、外键和系统条件，默认最多 12 张表，不包含扫描样本、历史版本、连接配置或密钥。AI 不得为“找关系”递归读取整个知识目录。
+
+## 19. 分阶段报表模型与 Context Pack
+
+Studio 对用户保持一个逻辑对话，但复杂报表在 Provider 层拆成彼此不共享聊天历史的运行：
+
+1. `discovery`：基于需求与初始按需知识切片，产出结果粒度、来源字段白名单、关系基数、指标去重键、时间/排除口径、策略建议和一个合并问题；禁止 SQL 和脚本。
+2. `modeling`：只读取 discovery model、用户确认和模型所列字段，产出 `report-model.json`、语义计划、执行计划与逐查询契约；清空待确认问题后由用户批准并写入模型 hash。
+3. `query`：每条查询只读取自己的契约、方言和精确字段/关系切片，默认最多三张表和四十个字段；只产出参数化 SQL 与查询输出契约。
+4. `script`：只读取批准计划和实际查询输出契约，不读取物理知识库；只编排 `queryStream/loadIndex/batchLookup/emit`。
+5. `repair`：根据 `MODEL_*`、`QUERY_*`、`SCRIPT_*` 或 Runtime 失败类型定向返回对应组件，不重放完整流程。
+
+`report-model.json` 的 hash 排除审批时间等元数据，批准后任何业务内容变化都会使校验失败。查询契约与最终脚本配置必须同时满足表白名单和字段白名单；缺表/缺字段必须显式回到建模阶段扩展。每个 Context Pack 包含 `fresh_session`、允许/禁止输入、表/字段/字节预算和预期产物，超过预算直接失败，不静默扩大上下文。
+
+所有阶段产物固定放在 `work/report-build/<report-id>/<revision>/`。`validate-stage` 是阶段完成门禁；Provider 的 `completed` 事件本身不代表阶段成功。用户批准模型时由 `approve-staged-model` 把语义/执行计划写回 plan 并记录模型 hash。v3 每个查询契约由独立 fresh Agent 编译，外层 SELECT 别名必须按顺序匹配输出契约；声明式策略只复核 `declarative-configuration.json`。`finalize-staged` 先在 revision 内生成并校验候选包，再发布最终目录和索引，失败时回滚；只有 script 策略构造 `configuration.script_report`。Agent 不得直接编辑 `plan.script_report`。
+
+查询输出契约必须与模型逐列匹配名称、顺序及双方都声明的类型；缺文件、额外/遗漏列、模型 hash 漂移、SQL/脚本安全失败、表字段白名单越界或最终包静态校验失败都会阻止阶段前进。Studio 的 SSE 游标计入 `run_started/run_completed/user_message` 等所有持久化事件，跨阶段重新订阅不得跳过或重放旧的 `job_completed`。

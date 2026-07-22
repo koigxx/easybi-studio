@@ -16,6 +16,7 @@ import { JobEventTypes } from '@easybi-studio/contracts';
 class MemEventStore implements EventStore {
   events = new Map<string, JobEvent[]>();
   jobs = new Map<string, Job>();
+  runs = new Map<string, import('@easybi-studio/contracts').AgentRun[]>();
   appendEvent(jobId: string, seq: number, event: JobEvent): void {
     const list = this.events.get(jobId) ?? [];
     list[seq] = event;
@@ -30,6 +31,16 @@ class MemEventStore implements EventStore {
   deleteJob(jobId: string): void {
     this.events.delete(jobId);
     this.jobs.delete(jobId);
+  }
+  upsertRun(run: import('@easybi-studio/contracts').AgentRun): void {
+    const list = this.runs.get(run.conversationId) ?? [];
+    const index = list.findIndex((item) => item.id === run.id);
+    if (index >= 0) list[index] = { ...run };
+    else list.push({ ...run });
+    this.runs.set(run.conversationId, list);
+  }
+  listRuns(conversationId: string): import('@easybi-studio/contracts').AgentRun[] {
+    return this.runs.get(conversationId) ?? [];
   }
 }
 
@@ -145,6 +156,105 @@ describe('JobManager with FakeAgentBridge', () => {
       prompt: 'third',
     });
     expect(second.id).toBeTruthy();
+  });
+
+  it('keeps one logical conversation while report phases use fresh provider runs', async () => {
+    const bridge = new TurnByTurnBridge();
+    const store = new MemEventStore();
+    const completedPhases: string[] = [];
+    const jm = new JobManager({
+      bridge,
+      events: store,
+      buildReportPhasePrompt: (phase, context) => `fresh ${phase} ${context.reportId}`,
+      prepareReportPhase: async ({ phase }) => phase === 'QUERY_COMPILATION'
+        ? { ok: true, details: { strategy: 'script', query_ids: ['orders', 'waybills'] } }
+        : { ok: true },
+      completeReportPhase: async ({ phase }) => {
+        completedPhases.push(phase);
+        return { ok: true };
+      },
+      onJobChange: (job) => store.jobs.set(job.id, { ...job }),
+    });
+    const job = await jm.startAgentJob({
+      projectId: 'p1',
+      workspaceRoot: '/tmp/ws-phases',
+      action: 'create-report',
+      prompt: 'discover',
+      reportId: 'customer-volume',
+    });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_DISCOVERY_CONFIRMATION');
+    await jm.startFreshPhase({ jobId: job.id, phase: 'MODELING', userMessage: '确认关系' });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_MODEL_APPROVAL');
+    await jm.startFreshPhase({ jobId: job.id, phase: 'QUERY_COMPILATION', userMessage: '批准模型' });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'COMPLETED');
+
+    const runs = store.listRuns(job.id);
+    expect(runs.map((run) => run.phase)).toEqual([
+      'DISCOVERY',
+      'MODELING',
+      'QUERY_COMPILATION',
+      'QUERY_COMPILATION',
+      'SCRIPT_COMPILATION',
+    ]);
+    expect(runs.filter((run) => run.phase === 'QUERY_COMPILATION').map((run) => run.unitId)).toEqual(['orders', 'waybills']);
+    expect(new Set(runs.map((run) => run.providerTaskId)).size).toBe(5);
+    expect(completedPhases).toEqual(['DISCOVERY', 'MODELING', 'QUERY_COMPILATION', 'QUERY_COMPILATION', 'SCRIPT_COMPILATION']);
+    expect(jm.getEvents(job.id).filter((event) => event.type === JobEventTypes.JOB_STARTED)).toHaveLength(1);
+    expect(
+      jm.getEvents(job.id).some(
+        (event) => event.type === JobEventTypes.PHASE_CHANGED && event.payload?.contextReset === true,
+      ),
+    ).toBe(true);
+  });
+
+  it('does not advance a report phase when deterministic artifact validation fails', async () => {
+    const bridge = new TurnByTurnBridge();
+    const store = new MemEventStore();
+    const jm = new JobManager({
+      bridge,
+      events: store,
+      completeReportPhase: async () => ({ ok: false, error: '缺少 discovery-model.json' }),
+      onJobChange: (job) => store.jobs.set(job.id, { ...job }),
+    });
+    const job = await jm.startAgentJob({
+      projectId: 'p1',
+      workspaceRoot: '/tmp/ws-gate',
+      action: 'create-report',
+      prompt: 'discover',
+      reportId: 'customer-volume',
+    });
+    await waitFor(() => jm.getJob(job.id)?.status === 'SUCCEEDED');
+    expect(jm.getJob(job.id)?.phase).toBe('DISCOVERY');
+    expect(store.listRuns(job.id)[0]?.status).toBe('FAILED');
+    expect(jm.getEvents(job.id)).toContainEqual(expect.objectContaining({
+      type: JobEventTypes.PHASE_CHANGED,
+      payload: expect.objectContaining({ validationFailed: true }),
+    }));
+  });
+
+  it('finishes a declarative report after configuration compilation without a script run', async () => {
+    const bridge = new TurnByTurnBridge();
+    const store = new MemEventStore();
+    const jm = new JobManager({
+      bridge,
+      events: store,
+      buildReportPhasePrompt: (phase, context) => `${phase}:${context.unitId ?? ''}:${context.strategy ?? ''}`,
+      prepareReportPhase: async ({ phase }) => phase === 'QUERY_COMPILATION'
+        ? { ok: true, details: { strategy: 'group_queries', query_ids: ['declarative'] } }
+        : { ok: true },
+      completeReportPhase: async ({ phase }) => phase === 'QUERY_COMPILATION'
+        ? { ok: true, details: { workflow_complete: true } }
+        : { ok: true },
+      onJobChange: (job) => store.jobs.set(job.id, { ...job }),
+    });
+    const job = await jm.startAgentJob({ projectId: 'p1', workspaceRoot: '/tmp/ws-v2', action: 'create-report', prompt: 'discover', reportId: 'v2-report' });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_DISCOVERY_CONFIRMATION');
+    await jm.startFreshPhase({ jobId: job.id, phase: 'MODELING', userMessage: '确认' });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_MODEL_APPROVAL');
+    await jm.startFreshPhase({ jobId: job.id, phase: 'QUERY_COMPILATION', userMessage: '批准' });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'COMPLETED');
+    expect(store.listRuns(job.id).map((run) => run.phase)).toEqual(['DISCOVERY', 'MODELING', 'QUERY_COMPILATION']);
+    expect(store.listRuns(job.id)[2]?.unitId).toBe('declarative');
   });
 
   it('re-subscribe after a finished turn streams the resumed turn, not the old completion (since cursor)', async () => {

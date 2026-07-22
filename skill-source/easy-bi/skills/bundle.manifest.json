@@ -1,7 +1,7 @@
 {
   "bundle_format_version": "1",
   "bundle_id": "easybi",
-  "bundle_version": "1.24.0",
+  "bundle_version": "1.29.5",
   "display_name": "Easy BI 技能包",
   "compatibility": {
     "workspace_formats": [
@@ -17,7 +17,8 @@
       "2"
     ],
     "report_package_formats": [
-      "2"
+      "2",
+      "3"
     ],
     "runtime_config_formats": [
       "1"
@@ -42,7 +43,7 @@
     },
     {
       "id": "create-report-package",
-      "version": "2.21.0",
+      "version": "2.26.5",
       "path": "create-report-package",
       "agent_entry": "create-report-package/SKILL.md",
       "agent_prompts": "create-report-package/prompts.json",

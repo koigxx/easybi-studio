@@ -5,9 +5,12 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
+import { stripTypeScriptTypes } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
@@ -21,6 +24,7 @@ import {
 type JsonRecord = Record<string, any>;
 
 const PACKAGE_FORMAT_VERSION = "2";
+const SCRIPT_PACKAGE_FORMAT_VERSION = "3";
 const PLAN_FORMAT_VERSION = "2";
 const ALLOWED_MODES = new Set(["sync", "async"]);
 const ALLOWED_OPERATORS = new Set([
@@ -31,6 +35,9 @@ const ALLOWED_OPERATORS = new Set([
   "gte",
   "lte",
 ]);
+
+const SCRIPT_FORBIDDEN_SOURCE =
+  /\b(?:import|require|eval|Function|process|globalThis|child_process|worker_threads|fetch|WebSocket)\b|(?:node:|https?:|file:)|\b(?:fs|net|tls|dgram)\s*\./;
 
 function parseArguments(values: string[]): {
   command: string;
@@ -906,13 +913,18 @@ export async function inspectReport(options: {
     matches = chooseMatch(matches, options.reportId);
     if (matches.length === 0) {
       const suggestions = suggestedFields(raw, tables);
+      const fieldId = stableId(raw).replaceAll("-", "_");
       blockers.push({
         code: "FIELD_NOT_FOUND",
         field: raw,
+        field_id: fieldId,
+        label: label ?? raw,
+        description: fieldDescription,
+        roles,
         suggestions,
         message: suggestions.length
-          ? `知识库中未找到报表字段 ${raw}；你可能想要：${suggestions.join("、")}`
-          : `知识库中未找到报表字段 ${raw}`,
+          ? `知识库中未找到物理字段 ${raw}；如果它是业务指标，请在 configure-plan 中用字段 id「${fieldId}」配置为 sql_expression/computed 或 group_queries 指标；你可能想要的物理字段：${suggestions.join("、")}`
+          : `知识库中未找到物理字段 ${raw}；如果它是业务指标，请在 configure-plan 中用字段 id「${fieldId}」配置为 sql_expression/computed 或 group_queries 指标`,
       });
       continue;
     }
@@ -1145,6 +1157,12 @@ export async function inspectReport(options: {
       // read global/enums.json for output code→中文 translation. Optional/extra
       // field: older plans without it simply skip enum embedding.
       source_dir: knowledgeRoot,
+      profile_engines: Object.fromEntries(
+        (config.connections?.database_profiles ?? []).map((profile: JsonRecord) => [
+          String(profile.id),
+          String(profile.connector_id ?? "mysql"),
+        ]),
+      ),
     },
     execution_policy: {
       supported_modes: ["sync", "async"],
@@ -1152,6 +1170,39 @@ export async function inspectReport(options: {
       request_field: "executionMode",
       allow_request_selection: true,
       runtime_policy_ref: "default",
+    },
+    semantic_plan: {
+      status: "draft",
+      result_grain: primaryTable
+        ? `每行对应 ${primaryTable.semantic?.name ?? primaryTable.physical?.table} 的一条记录`
+        : "待确认",
+      dimensions: resolvedFields
+        .filter((field: JsonRecord) => (field.roles ?? []).includes("group"))
+        .map((field: JsonRecord) => ({ id: field.id, label: field.label })),
+      metrics: [
+        ...resolvedFields
+          .filter((field: JsonRecord) => !(field.roles ?? []).includes("group"))
+          .map((field: JsonRecord) => ({ id: field.id, label: field.label, definition: field.description ?? "" })),
+        ...blockers
+          .filter((blocker: JsonRecord) => blocker.code === "FIELD_NOT_FOUND")
+          .map((blocker: JsonRecord) => ({
+            id: blocker.field_id,
+            label: blocker.label ?? blocker.field,
+            definition: blocker.description ?? "",
+          })),
+      ],
+      distinct_keys: {},
+      time_semantics: [],
+      exclusions: [],
+      open_questions: blockers.map((blocker: JsonRecord) => blocker.message),
+    },
+    execution_plan: {
+      status: "draft",
+      strategy: sourceTables.length <= 1 ? "sql" : "undecided",
+      steps: sourceTables.length <= 1 && sourceTables.length > 0
+        ? [{ id: "Q1", type: "sql", description: `查询 ${sourceTables[0]!.database}.${sourceTables[0]!.table} 并输出报表字段` }]
+        : [],
+      rationale: sourceTables.length <= 1 ? "单一事实来源，使用参数化只读 SQL" : "待完成关联与粒度确认后选择执行策略",
     },
     source: {
       primary_table: sourceTables[0] ?? null,
@@ -1301,6 +1352,9 @@ function validatePlanV2(plan: JsonRecord): string[] {
         } else if (!(enrichment.select ?? []).some((s: JsonRecord) => s.id === field.id)) {
           errors.push(`enrichment 字段 ${field.id} 不在 enrichment ${enrichment.id} 的 select 中`);
         }
+      } else if (kind === "script" && plan.script_report) {
+        // Produced by the isolated v3 report script through ctx.emit. Physical
+        // lineage, when known, is preserved under source.lineage and query locks.
       } else {
         errors.push(`字段 ${field.id} 使用未知来源种类 ${kind}`);
       }
@@ -1542,6 +1596,24 @@ function validatePlanV2(plan: JsonRecord): string[] {
         const groupBy = (gq.aggregation?.group_by ?? []).map(String);
         if (!groupBy.length) {
           errors.push(`group_queries ${gid}：缺少 aggregation.group_by（分组统计必须分组）`);
+        }
+      }
+    }
+    if (plan.script_report) {
+      if (plan.execution_plan?.strategy !== "script") {
+        errors.push("v3 脚本报表的 execution_plan.strategy 必须是 script");
+      }
+      validateScriptSource(String(plan.script_report.source ?? ""));
+      const queryIds = new Set<string>();
+      for (const query of plan.script_report.queries ?? []) {
+        const id = String(query.id ?? "");
+        if (!id || queryIds.has(id)) errors.push("v3 查询 id 缺失或重复");
+        queryIds.add(id);
+        safeScriptSql(String(query.sql ?? ""), String(query.mode ?? ""));
+      }
+      for (const [name, value] of Object.entries(plan.script_report.resource_budget ?? {})) {
+        if (!Number.isInteger(Number(value)) || Number(value) < 1) {
+          errors.push(`v3 资源预算 ${name} 必须是正整数`);
         }
       }
     }
@@ -1807,8 +1879,9 @@ async function applyEnrichments(
  *     queries: [
  *       {
  *         id: "waybill",                    // stable id, used for the generated SQL file
- *         table: { profile_id?, database, table },  // ONE base table (resolved from knowledge)
+ *         table: { profile_id?, database, table },  // primary table (resolved from knowledge)
  *         alias: "t0",                      // optional; defaults to t0
+ *         joins?: [{ type, table, alias, on, grain, extra_conditions? }],
  *         group_by: ["t0.`customer_name`"], // MUST cover every merge_key's bound column
  *         period_field: "create_time",      // the table's own time column the shared filter binds to
  *         fields: [ … sql_expression / column count fields … ],  // one row per group
@@ -1886,10 +1959,107 @@ async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<
     if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(alias)) {
       throw new Error(`group_queries ${id}：非法表别名 ${alias}`);
     }
-    const availableFields = (doc.physical_fields ?? []).map((f: JsonRecord) =>
-      String(f.physical?.name),
-    );
-    const availableSet = new Set(availableFields);
+    const tableRecord = (tableDoc: JsonRecord, tableAlias: string): JsonRecord => ({
+      profile_id: tableDoc.physical.profile_id,
+      database: tableDoc.physical.database,
+      table: tableDoc.physical.table,
+      alias: tableAlias,
+      table_id: tableDoc.table_id,
+      schema_fingerprint: tableDoc.schema_fingerprint,
+      available_fields: (tableDoc.physical_fields ?? []).map((f: JsonRecord) =>
+        String(f.physical?.name),
+      ),
+      system_conditions: tableDoc.system_conditions ?? [],
+    });
+    const primaryRecord = tableRecord(doc, alias);
+    const primaryAvailableSet = new Set((primaryRecord.available_fields ?? []).map(String));
+    const resolvedByAlias = new Map<string, JsonRecord>([[alias, doc]]);
+    const sourceTables: JsonRecord[] = [primaryRecord];
+    const sourceJoins: JsonRecord[] = [];
+
+    // A sibling metric may need a short, knowledge-locked JOIN path to reach the
+    // shared dimension (e.g. 派车单 → 关系表 → 运单 → 订单 → 客户). This remains a
+    // declarative SELECT plan: every table/column is resolved against knowledge,
+    // only equality JOINs are allowed, and request values never participate.
+    for (const rawJoin of raw.joins ?? []) {
+      const joinAlias = String(rawJoin.alias ?? "").trim();
+      if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(joinAlias)) {
+        throw new Error(`group_queries ${id}：非法 JOIN 表别名 ${joinAlias}`);
+      }
+      if (resolvedByAlias.has(joinAlias)) {
+        throw new Error(`group_queries ${id}：JOIN 表别名重复 ${joinAlias}`);
+      }
+      const joinTableCfg = rawJoin.table ?? {};
+      const joinDoc = knowledgeTables.find(
+        (t) =>
+          t.physical?.database === joinTableCfg.database &&
+          t.physical?.table === joinTableCfg.table &&
+          (!joinTableCfg.profile_id || t.physical?.profile_id === joinTableCfg.profile_id),
+      );
+      if (!joinDoc) {
+        throw new Error(
+          `group_queries ${id}：知识库中找不到 JOIN 表 ${joinTableCfg.database}.${joinTableCfg.table}`,
+        );
+      }
+      if (primaryProfile && joinDoc.physical.profile_id !== primaryProfile) {
+        throw new Error(`group_queries ${id}：JOIN 表 ${joinAlias} 与主表不在同一连接 profile`);
+      }
+      const joinFields = new Set(
+        (joinDoc.physical_fields ?? []).map((f: JsonRecord) => String(f.physical?.name)),
+      );
+      const on = (rawJoin.on ?? []).map((condition: JsonRecord) => {
+        const left = String(condition.left ?? "");
+        const right = String(condition.right ?? "");
+        const leftMatch = left.match(/^([A-Za-z][A-Za-z0-9_]*)\.([A-Za-z][A-Za-z0-9_]*)$/);
+        const rightMatch = right.match(/^([A-Za-z][A-Za-z0-9_]*)\.([A-Za-z][A-Za-z0-9_]*)$/);
+        if (!leftMatch || !rightMatch || String(condition.operator ?? "eq") !== "eq") {
+          throw new Error(`group_queries ${id}：JOIN ${joinAlias} 只支持 alias.field 等值关联`);
+        }
+        const knownSide = leftMatch[1] === joinAlias ? rightMatch : leftMatch;
+        const joinedSide = leftMatch[1] === joinAlias ? leftMatch : rightMatch;
+        if (!resolvedByAlias.has(knownSide[1]!)) {
+          throw new Error(
+            `group_queries ${id}：JOIN ${joinAlias} 必须关联到已加入的表，未知别名 ${knownSide[1]}`,
+          );
+        }
+        const knownDoc = resolvedByAlias.get(knownSide[1]!)!;
+        const knownFields = new Set(
+          (knownDoc.physical_fields ?? []).map((f: JsonRecord) => String(f.physical?.name)),
+        );
+        if (!knownFields.has(knownSide[2]!) || !joinFields.has(joinedSide[2]!)) {
+          throw new Error(`group_queries ${id}：JOIN ${joinAlias} 的 ON 字段不在知识库中`);
+        }
+        return { left, right, operator: "eq" };
+      });
+      if (!on.length) throw new Error(`group_queries ${id}：JOIN ${joinAlias} 缺少 ON 条件`);
+      const joinExtraConditions = (rawJoin.extra_conditions ?? []).map((condition: JsonRecord) => {
+        const field = String(condition.field ?? "");
+        if (!joinFields.has(field)) {
+          throw new Error(`group_queries ${id}：JOIN ${joinAlias} 条件列 ${field} 不存在`);
+        }
+        if (!new Set(["eq", "ne", "gt", "gte", "lt", "lte"]).has(String(condition.operator))) {
+          throw new Error(`group_queries ${id}：JOIN ${joinAlias} 条件操作符不受支持`);
+        }
+        return { alias: joinAlias, field, operator: condition.operator, value: condition.value };
+      });
+      sourceTables.push(tableRecord(joinDoc, joinAlias));
+      sourceJoins.push({
+        type: String(rawJoin.type ?? "LEFT").toUpperCase(),
+        alias: joinAlias,
+        on,
+        conditions: [
+          ...(joinDoc.system_conditions ?? []).map((condition: JsonRecord) => ({
+            alias: joinAlias,
+            field: condition.field,
+            operator: condition.operator,
+            value: condition.value,
+          })),
+          ...joinExtraConditions,
+        ],
+        grain: String(rawJoin.grain ?? ""),
+      });
+      resolvedByAlias.set(joinAlias, joinDoc);
+    }
 
     // Build a self-contained mini-source so buildSql can consume this query as-is.
     const source = {
@@ -1900,22 +2070,11 @@ async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<
         alias,
         table_id: doc.table_id,
         schema_fingerprint: doc.schema_fingerprint,
-        available_fields: availableFields,
+        available_fields: primaryRecord.available_fields,
         system_conditions: doc.system_conditions ?? [],
       },
-      tables: [
-        {
-          profile_id: doc.physical.profile_id,
-          database: doc.physical.database,
-          table: doc.physical.table,
-          alias,
-          table_id: doc.table_id,
-          schema_fingerprint: doc.schema_fingerprint,
-          available_fields: availableFields,
-          system_conditions: doc.system_conditions ?? [],
-        },
-      ],
-      joins: [],
+      tables: sourceTables,
+      joins: sourceJoins,
     };
 
     // Fields the query outputs (merge-key dimension columns + count expressions).
@@ -1932,9 +2091,14 @@ async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<
       };
       if (normalized.source.kind === "column") {
         normalized.source.alias = normalized.source.alias ?? alias;
-        if (!availableSet.has(String(normalized.source.field))) {
+        const fieldAlias = String(normalized.source.alias);
+        const fieldDoc = resolvedByAlias.get(fieldAlias);
+        const fieldSet = new Set(
+          (fieldDoc?.physical_fields ?? []).map((f: JsonRecord) => String(f.physical?.name)),
+        );
+        if (!fieldDoc || !fieldSet.has(String(normalized.source.field))) {
           throw new Error(
-            `group_queries ${id}：列 ${normalized.source.field} 不在表 ${doc.physical.table} 中`,
+            `group_queries ${id}：列 ${fieldAlias}.${normalized.source.field} 不在查询来源中`,
           );
         }
       }
@@ -1944,9 +2108,14 @@ async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<
 
     // The shared time filter binds to THIS table's own time column.
     const periodField = raw.period_field ? String(raw.period_field) : null;
-    if (periodField && !availableSet.has(periodField)) {
+    const periodAlias = String(raw.period_alias ?? alias);
+    const periodDoc = resolvedByAlias.get(periodAlias);
+    const periodFields = new Set(
+      (periodDoc?.physical_fields ?? []).map((f: JsonRecord) => String(f.physical?.name)),
+    );
+    if (periodField && (!periodDoc || !periodFields.has(periodField))) {
       throw new Error(
-        `group_queries ${id}：period_field ${periodField} 不在表 ${doc.physical.table} 中`,
+        `group_queries ${id}：period_field ${periodAlias}.${periodField} 不在查询来源中`,
       );
     }
     if (periodParam && !periodField) {
@@ -1965,7 +2134,7 @@ async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<
       ...(doc.system_conditions ?? []),
       ...(raw.extra_conditions ?? []).map((c: JsonRecord) => {
         const field = String(c.field ?? "");
-        if (!availableSet.has(field)) {
+        if (!primaryAvailableSet.has(field)) {
           throw new Error(`group_queries ${id}：extra_conditions 列 ${field} 不在表 ${doc.physical.table} 中`);
         }
         if (!ALLOWED_COND_OPS.has(String(c.operator))) {
@@ -1993,7 +2162,7 @@ async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<
       // transform (that path is main-query only and mutually exclusive with this).
       custom_logic: { required: false, mode: "identity", group_keys: [], max_group_rows: 100000 },
       system_conditions: systemConditions,
-      ...(periodField ? { period_field: periodField, period_alias: alias } : {}),
+      ...(periodField ? { period_field: periodField, period_alias: periodAlias } : {}),
       sql_dialect: dialect.id,
     });
   }
@@ -2003,6 +2172,968 @@ async function applyGroupQueries(plan: JsonRecord, config: JsonRecord): Promise<
     ...(periodParam ? { period_param: periodParam } : {}),
     queries,
   };
+}
+
+function validateScriptSource(source: string): void {
+  if (!source.includes("export async function run") && !source.includes("export const run")) {
+    throw new Error("v3 脚本必须导出 async function run(ctx)");
+  }
+  if (SCRIPT_FORBIDDEN_SOURCE.test(source)) {
+    throw new Error("v3 脚本只能使用 ctx API，禁止 import/require/eval/process/fs/net/fetch 等能力");
+  }
+}
+
+function safeScriptSql(sql: string, mode: string): void {
+  const withoutKeys = sql.replace(/\/\*\s*KEYS\s*\*\//g, "KEYS_MARKER");
+  if (!/^\s*(?:SELECT|WITH)\b/i.test(sql)) {
+    throw new Error("v3 查询必须以 SELECT 或 WITH 开头");
+  }
+  if (/\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|UPSERT|CREATE|ALTER|DROP|TRUNCATE|CALL|EXECUTE|GRANT|REVOKE)\b/i.test(sql)) {
+    throw new Error("v3 查询只能包含只读 SELECT/CTE，禁止 DDL、DML 和过程调用");
+  }
+  if (/;|--|#|\/\*(?!\s*KEYS\s*\*\/)/.test(withoutKeys)) {
+    throw new Error("v3 查询包含分号、注释或其它不安全结构");
+  }
+  const markerCount = (sql.match(/\/\*\s*KEYS\s*\*\//g) ?? []).length;
+  if (mode === "batch" && markerCount !== 1) {
+    throw new Error("batchLookup 查询必须且只能包含一个 /* KEYS */ 标记");
+  }
+  if (mode !== "batch" && markerCount !== 0) {
+    throw new Error("只有 batchLookup 查询可以包含 /* KEYS */ 标记");
+  }
+  if (mode === "batch") {
+    const markerAt = sql.search(/\/\*\s*KEYS\s*\*\//);
+    const fixedBindingAt = sql.indexOf("?");
+    if (fixedBindingAt >= 0 && markerAt > fixedBindingAt) {
+      throw new Error("batchLookup 的 /* KEYS */ 必须位于其它位置参数之前");
+    }
+  }
+}
+
+async function applyScriptReport(plan: JsonRecord, config: JsonRecord): Promise<void> {
+  const knowledgeRoot = plan.knowledge?.source_dir
+    ? resolve(String(plan.knowledge.source_dir))
+    : null;
+  if (!knowledgeRoot) throw new Error("v3 脚本报表缺少 plan.knowledge.source_dir");
+  const tables = await loadKnowledgeTables(knowledgeRoot);
+  const ids = new Set<string>();
+  const queries: JsonRecord[] = [];
+  for (const raw of config.queries ?? []) {
+    const id = stableId(String(raw.id ?? ""));
+    if (!id || ids.has(id)) throw new Error(`v3 查询 id 缺失或重复：${raw.id ?? ""}`);
+    ids.add(id);
+    const mode = String(raw.mode ?? "stream");
+    if (!["stream", "index", "batch"].includes(mode)) {
+      throw new Error(`v3 查询 ${id} mode 必须是 stream/index/batch`);
+    }
+    const sql = String(raw.sql ?? "").trim();
+    safeScriptSql(sql, mode);
+    const locked: JsonRecord[] = [];
+    for (const requested of raw.sources ?? []) {
+      const table = tables.find(
+        (candidate: JsonRecord) =>
+          candidate.physical?.profile_id === requested.profile_id &&
+          candidate.physical?.database === requested.database &&
+          candidate.physical?.table === requested.table,
+      );
+      if (!table) {
+        throw new Error(
+          `v3 查询 ${id} 引用了知识库之外的表：${requested.profile_id}/${requested.database}/${requested.table}`,
+        );
+      }
+      const available = new Set(
+        (table.physical_fields ?? []).map((field: JsonRecord) => String(field.physical?.name)),
+      );
+      const fields = [...new Set((requested.fields ?? []).map(String))];
+      for (const field of fields) {
+        if (!available.has(field)) throw new Error(`v3 查询 ${id} 引用了未知列：${requested.table}.${field}`);
+      }
+      locked.push({
+        profile_id: table.physical.profile_id,
+        database: table.physical.database,
+        table: table.physical.table,
+        alias: assertAlias(requested.alias),
+        table_id: table.table_id,
+        schema_fingerprint: table.schema_fingerprint,
+        fields: fields.sort(),
+      });
+    }
+    if (!locked.length) throw new Error(`v3 查询 ${id} 必须声明至少一个知识来源`);
+    const profiles = new Set(locked.map((source) => source.profile_id));
+    if (profiles.size !== 1) throw new Error(`v3 单个查询 ${id} 只能使用一个连接 Profile`);
+    const aliases = new Map(locked.map((source) => [source.alias, new Set(source.fields)]));
+    const queryDialectId = String(
+      plan.knowledge?.profile_engines?.[String(locked[0]!.profile_id)] ?? plan.sql_dialect ?? "mysql",
+    );
+    const dialect = getSqlDialect(queryDialectId);
+    for (const match of sql.matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\.([A-Za-z_$][A-Za-z0-9_$]*)\b/g)) {
+      if (aliases.has(match[1]!)) {
+        throw new Error(`v3 查询 ${id} 的列必须使用方言引号并纳入知识锁：${match[0]}`);
+      }
+    }
+    for (const match of sql.matchAll(dialect.referenceRegex())) {
+      if (!aliases.get(match[1]!)?.has(match[2]!)) {
+        throw new Error(`v3 查询 ${id} 引用了未锁定列：${match[1]}.${match[2]}`);
+      }
+    }
+    queries.push({
+      id,
+      mode,
+      profile_id: locked[0]!.profile_id,
+      database: String(raw.database ?? locked[0]!.database),
+      sql_dialect: dialect.id,
+      sql,
+      sources: locked,
+    });
+  }
+  if (!queries.some((query) => query.mode === "stream")) {
+    throw new Error("v3 脚本报表至少需要一个 stream 查询");
+  }
+  const source = String(config.source ?? "").trim();
+  validateScriptSource(source);
+  plan.script_report = {
+    queries,
+    source,
+    resource_budget: {
+      max_queries: 12,
+      max_query_rows: 1_000_000,
+      max_index_rows: 100_000,
+      max_batch_keys: 2_000,
+      max_output_rows: 500_000,
+      max_memory_mb: 512,
+      timeout_seconds: 300,
+      stream_batch_rows: 128,
+      ...(config.resource_budget ?? {}),
+    },
+  };
+  // v3 的最终输出由 report.mjs 的 ctx.emit 产生。保留原知识血缘用于审阅，
+  // 但不再要求这些字段同时出现在一条主 SQL 中。
+  for (const field of plan.fields ?? []) {
+    field.source = { kind: "script", lineage: field.source };
+  }
+}
+
+function finalizePlanningDocuments(plan: JsonRecord, configuration: JsonRecord): void {
+  const strategy = plan.script_report
+    ? "script"
+    : plan.group_queries?.queries?.length
+      ? "group_queries"
+      : plan.enrichments?.length
+        ? "enrichment"
+        : "sql";
+  const suppliedSemantic = configuration.semantic_plan ?? {};
+  plan.semantic_plan = {
+    ...(plan.semantic_plan ?? {}),
+    ...suppliedSemantic,
+    status: "ready_for_review",
+    result_grain:
+      suppliedSemantic.result_grain ??
+      configuration.result_grain ??
+      plan.source?.joins?.find((joinItem: JsonRecord) => joinItem.grain)?.grain ??
+      "主查询输出行粒度",
+    open_questions: suppliedSemantic.open_questions ?? [],
+  };
+  const suppliedExecution = configuration.execution_plan ?? {};
+  const automaticSteps = plan.script_report
+    ? plan.script_report.queries.map((query: JsonRecord, index: number) => ({
+        id: `Q${index + 1}`,
+        type: query.mode === "stream" ? "query_stream" : query.mode === "index" ? "load_index" : "batch_lookup",
+        description: `执行查询 ${query.id}（${query.mode}）`,
+        query_id: query.id,
+      }))
+    : [{ id: "Q1", type: strategy, description: `按 ${strategy} 策略生成并执行报表` }];
+  plan.execution_plan = {
+    ...(plan.execution_plan ?? {}),
+    ...suppliedExecution,
+    status: "ready_for_review",
+    strategy,
+    steps: suppliedExecution.steps?.length ? suppliedExecution.steps : automaticSteps,
+    rationale: suppliedExecution.rationale ?? `根据结果粒度和关系基数选择 ${strategy}`,
+    ...(plan.script_report ? { resource_budget: plan.script_report.resource_budget } : {}),
+  };
+}
+
+export function renderPlanReview(plan: JsonRecord): string {
+  const semantic = plan.semantic_plan ?? {};
+  const execution = plan.execution_plan ?? {};
+  const lines = [
+    `# ${plan.report?.name ?? plan.report?.id}：语义计划与执行计划`,
+    "",
+    `- 结果粒度：${semantic.result_grain ?? "待确认"}`,
+    `- 执行策略：${execution.strategy ?? "待选择"}`,
+    `- 选择理由：${execution.rationale ?? ""}`,
+    "",
+    "## 指标口径",
+    ...(semantic.metrics ?? []).map(
+      (metric: JsonRecord) => `- ${metric.label ?? metric.id}：${metric.definition || "待确认"}`,
+    ),
+    "",
+    "## 执行步骤",
+    ...(execution.steps ?? []).map(
+      (step: JsonRecord, index: number) => `${index + 1}. ${step.description ?? step.id}`,
+    ),
+  ];
+  if ((semantic.open_questions ?? []).length) {
+    lines.push("", "## 待确认问题", ...(semantic.open_questions ?? []).map((question: unknown) => `- ${String(question)}`));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+export async function explainPlan(planPath: string): Promise<string> {
+  return renderPlanReview(await readJson(resolve(planPath)));
+}
+
+export async function buildKnowledgeContext(options: {
+  plan: string;
+  out: string;
+  include?: string[];
+  maxTables?: number;
+}): Promise<JsonRecord> {
+  const plan = await readJson(resolve(options.plan));
+  const knowledgeRoot = resolve(String(plan.knowledge?.source_dir ?? ""));
+  if (!plan.knowledge?.source_dir) throw new Error("计划缺少 knowledge.source_dir");
+  const allTables = await loadKnowledgeTables(knowledgeRoot);
+  const requested = new Set<string>();
+  const addSource = (source: JsonRecord): void => {
+    if (source?.table_id) requested.add(String(source.table_id));
+    if (source?.profile_id && source?.database && source?.table) {
+      requested.add(`${source.profile_id}/${source.database}/${source.table}`);
+    }
+  };
+  for (const table of plan.source?.tables ?? []) addSource(table);
+  for (const query of plan.script_report?.queries ?? []) {
+    for (const source of query.sources ?? []) addSource(source);
+  }
+  for (const value of options.include ?? []) requested.add(String(value));
+  for (const blocker of plan.blockers ?? []) {
+    for (const suggestion of blocker.suggestions ?? []) {
+      requested.add(String(suggestion).split(".").slice(0, -1).join("."));
+    }
+  }
+  const selected = allTables.filter((table: JsonRecord) => {
+    const physical = table.physical ?? {};
+    return requested.has(String(table.table_id)) ||
+      requested.has(`${physical.profile_id}/${physical.database}/${physical.table}`) ||
+      requested.has(`${physical.database}.${physical.table}`) ||
+      requested.has(String(physical.table));
+  });
+  const maxTables = options.maxTables ?? 12;
+  if (selected.length > maxTables) {
+    throw new Error(`按需上下文命中 ${selected.length} 张表，超过上限 ${maxTables}；请缩小 --include`);
+  }
+  const context = {
+    context_format_version: "1",
+    generated_at: new Date().toISOString(),
+    report: plan.report,
+    semantic_plan: plan.semantic_plan,
+    selected_table_count: selected.length,
+    tables: selected.map((table: JsonRecord) => ({
+      table_id: table.table_id,
+      physical: table.physical,
+      semantic: table.semantic,
+      fields: (table.physical_fields ?? []).map((field: JsonRecord) => ({
+        physical: field.physical,
+        semantic: field.semantic,
+        filter: field.filter,
+      })),
+      indexes: table.indexes ?? [],
+      foreign_keys: table.foreign_keys ?? [],
+      system_conditions: table.system_conditions ?? [],
+      security: table.security ?? null,
+    })),
+    usage: {
+      instruction: "仅使用本上下文设计查询；缺表时再次用 build-context --include 精确扩展，不要读取整个 knowledge 目录。",
+      omitted: ["扫描样本", "无关表", "历史版本", "密钥与连接配置"],
+    },
+  };
+  await writeJson(resolve(options.out), context);
+  return context;
+}
+
+const REPORT_MODEL_FORMAT_VERSION = "1";
+const PHASE_CONTEXT_FORMAT_VERSION = "1";
+
+function reportModelHash(model: JsonRecord): string {
+  const copy = structuredClone(model);
+  delete copy.approval;
+  delete copy.generated_at;
+  return sha256(JSON.stringify(copy));
+}
+
+function modelSourceFields(plan: JsonRecord, table: JsonRecord): string[] {
+  const names = new Set<string>();
+  for (const field of plan.fields ?? []) {
+    if (field.source?.alias === table.alias && field.source?.field) names.add(String(field.source.field));
+    for (const dependency of field.source?.dependencies ?? []) {
+      if (dependency.alias === table.alias && dependency.field) names.add(String(dependency.field));
+    }
+  }
+  for (const joinItem of plan.source?.joins ?? []) {
+    for (const pair of joinItem.on ?? []) {
+      for (const ref of [pair.left, pair.right]) {
+        const [alias, field] = String(ref ?? "").split(".");
+        if (alias === table.alias && field) names.add(field.replaceAll(/[`\"]/g, ""));
+      }
+    }
+  }
+  for (const condition of table.system_conditions ?? []) {
+    if (condition.field) names.add(String(condition.field));
+  }
+  return [...names].sort();
+}
+
+function initialQueryContracts(plan: JsonRecord): JsonRecord[] {
+  if (plan.script_report?.queries?.length) {
+    return plan.script_report.queries.map((query: JsonRecord) => ({
+      id: query.id,
+      purpose: plan.execution_plan?.steps?.find((step: JsonRecord) => step.query_id === query.id)?.description ?? query.id,
+      mode: query.mode,
+      result_grain: plan.semantic_plan?.result_grain,
+      sources: (query.sources ?? []).map((source: JsonRecord) => ({
+        profile_id: source.profile_id,
+        database: source.database,
+        table: source.table,
+        alias: source.alias,
+        fields: source.fields ?? [],
+      })),
+      distinct_keys: plan.semantic_plan?.distinct_keys ?? {},
+      output: [],
+      status: "draft",
+    }));
+  }
+  return [{
+    id: "main",
+    purpose: plan.execution_plan?.rationale ?? "生成主查询",
+    mode: "stream",
+    result_grain: plan.semantic_plan?.result_grain,
+    sources: (plan.source?.tables ?? []).map((table: JsonRecord) => ({
+      profile_id: table.profile_id,
+      database: table.database,
+      table: table.table,
+      alias: table.alias,
+      fields: modelSourceFields(plan, table),
+    })),
+    distinct_keys: plan.semantic_plan?.distinct_keys ?? {},
+    output: (plan.fields ?? []).map((field: JsonRecord) => ({
+      name: field.id,
+      label: field.label,
+      type: field.output_type,
+    })),
+    status: "draft",
+  }];
+}
+
+export async function initializeReportModel(options: { plan: string; out: string }): Promise<JsonRecord> {
+  const plan = await readJson(resolve(options.plan));
+  const model: JsonRecord = {
+    model_format_version: REPORT_MODEL_FORMAT_VERSION,
+    generated_at: new Date().toISOString(),
+    report: plan.report,
+    result_grain: {
+      description: plan.semantic_plan?.result_grain ?? "待确认",
+      keys: (plan.semantic_plan?.dimensions ?? []).map((item: JsonRecord) => item.id),
+    },
+    sources: (plan.source?.tables ?? []).map((table: JsonRecord) => ({
+      id: table.alias,
+      profile_id: table.profile_id,
+      database: table.database,
+      table: table.table,
+      alias: table.alias,
+      purpose: "待在确定建模阶段补充",
+      fields: modelSourceFields(plan, table).map((name) => ({ name, role: "source" })),
+    })),
+    relationships: (plan.source?.joins ?? []).map((joinItem: JsonRecord) => ({
+      from: joinItem.on?.[0]?.left ?? null,
+      to: joinItem.on?.[0]?.right ?? null,
+      type: joinItem.type,
+      cardinality: joinItem.cardinality ?? "unknown",
+      grain: joinItem.grain ?? null,
+      fanout_risk: joinItem.cardinality === "1:n" || joinItem.cardinality === "n:n",
+    })),
+    metrics: (plan.semantic_plan?.metrics ?? []).map((metric: JsonRecord) => ({
+      ...metric,
+      distinct_key: plan.semantic_plan?.distinct_keys?.[metric.id] ?? null,
+    })),
+    filters: plan.parameters ?? [],
+    time_semantics: plan.semantic_plan?.time_semantics ?? [],
+    exclusions: plan.semantic_plan?.exclusions ?? [],
+    recommended_strategy: plan.execution_plan?.strategy ?? "pending",
+    query_contracts: initialQueryContracts(plan),
+    open_questions: [
+      ...(plan.semantic_plan?.open_questions ?? []),
+      ...(plan.blockers ?? []).map((blocker: JsonRecord) => blocker.message),
+    ],
+    approval: { status: "draft" },
+  };
+  await writeJson(resolve(options.out), model);
+  return model;
+}
+
+export function validateReportModelValue(model: JsonRecord, requireApproved = false): string[] {
+  const errors: string[] = [];
+  const strategy = String(model.recommended_strategy ?? "");
+  if (!["sql", "enrichment", "group_queries", "script"].includes(strategy)) {
+    errors.push("recommended_strategy 必须是 sql|enrichment|group_queries|script");
+  }
+  if (String(model.model_format_version) !== REPORT_MODEL_FORMAT_VERSION) errors.push("model_format_version 必须为 1");
+  if (!model.report?.id || !model.report?.name) errors.push("模型缺少报表 id/name");
+  if (!model.result_grain?.description || !(model.result_grain?.keys ?? []).length) errors.push("模型必须明确结果粒度和稳定键");
+  const sourceIds = new Set<string>();
+  for (const source of model.sources ?? []) {
+    if (!source.id || sourceIds.has(String(source.id))) errors.push("模型来源 id 缺失或重复");
+    sourceIds.add(String(source.id));
+    if (!source.profile_id || !source.database || !source.table || !source.alias) errors.push(`来源 ${source.id ?? "?"} 缺少物理定位`);
+    if (!(source.fields ?? []).length) errors.push(`来源 ${source.id ?? "?"} 没有字段白名单`);
+  }
+  const approvedSources = new Map<string, Set<string>>(
+    (model.sources ?? []).map((source: JsonRecord) => [
+      `${source.profile_id}/${source.database}/${source.table}`,
+      new Set((source.fields ?? []).map((field: JsonRecord | string) => String(typeof field === "string" ? field : field.name))),
+    ]),
+  );
+  const queryIds = new Set<string>();
+  for (const query of model.query_contracts ?? []) {
+    if (!query.id || queryIds.has(String(query.id))) errors.push("查询契约 id 缺失或重复");
+    queryIds.add(String(query.id));
+    if (!(query.sources ?? []).length) errors.push(`查询契约 ${query.id ?? "?"} 没有来源`);
+    if (!query.result_grain) errors.push(`查询契约 ${query.id ?? "?"} 缺少结果粒度`);
+    const outputNames = new Set<string>();
+    for (const column of query.output ?? []) {
+      const name = String(typeof column === "string" ? column : column.name ?? "").trim();
+      if (!name || outputNames.has(name)) errors.push(`查询契约 ${query.id ?? "?"} 的输出列缺失或重复`);
+      outputNames.add(name);
+    }
+    if (!outputNames.size) errors.push(`查询契约 ${query.id ?? "?"} 没有输出契约`);
+    for (const source of query.sources ?? []) {
+      const sourceKey = `${source.profile_id}/${source.database}/${source.table}`;
+      const allowedFields = approvedSources.get(sourceKey);
+      if (!allowedFields) {
+        errors.push(`查询契约 ${query.id ?? "?"} 使用了模型外来源 ${source.database}.${source.table}`);
+        continue;
+      }
+      for (const field of source.fields ?? []) {
+        if (!allowedFields.has(String(field))) {
+          errors.push(`查询契约 ${query.id ?? "?"} 使用了模型外字段 ${source.database}.${source.table}.${field}`);
+        }
+      }
+    }
+  }
+  if (!(model.query_contracts ?? []).length) errors.push("模型至少需要一个查询契约");
+  if (requireApproved) {
+    if ((model.open_questions ?? []).length) errors.push("仍有待确认问题，不能批准模型");
+    if (model.approval?.status !== "approved") errors.push("模型尚未批准");
+    if (model.approval?.model_hash !== reportModelHash(model)) errors.push("模型批准 hash 与当前内容不一致");
+  }
+  return errors;
+}
+
+export async function approveReportModel(
+  modelPath: string,
+  reviewedBy: string,
+  planPathValue?: string,
+): Promise<JsonRecord> {
+  const path = resolve(modelPath);
+  const model = await readJson(path);
+  const preErrors = validateReportModelValue(model, false);
+  if (preErrors.length) throw new Error(preErrors.join("；"));
+  if ((model.open_questions ?? []).length) throw new Error("仍有待确认问题，不能批准模型");
+  model.approval = {
+    status: "approved",
+    reviewed_by: reviewedBy,
+    approved_at: new Date().toISOString(),
+    model_hash: reportModelHash(model),
+  };
+  await writeJson(path, model);
+  if (planPathValue) {
+    const planPath = resolve(planPathValue);
+    const plan = await readJson(planPath);
+    plan.report_model = {
+      model_format_version: REPORT_MODEL_FORMAT_VERSION,
+      status: "approved",
+      model_hash: model.approval.model_hash,
+      ref: relative(dirname(planPath), path).replaceAll("\\", "/"),
+    };
+    await writeJson(planPath, plan);
+  }
+  return model;
+}
+
+async function validateAttachedReportModel(plan: JsonRecord, planPath: string): Promise<string[]> {
+  if (!plan.report_model) return [];
+  const modelPath = resolve(dirname(planPath), String(plan.report_model.ref ?? ""));
+  let model: JsonRecord;
+  try {
+    model = await readJson(modelPath);
+  } catch (error) {
+    return [`无法读取已批准报表模型：${error instanceof Error ? error.message : String(error)}`];
+  }
+  const errors = validateReportModelValue(model, true);
+  if (model.approval?.model_hash !== plan.report_model.model_hash) errors.push("计划引用的模型 hash 已变化");
+  if (plan.script_report?.queries?.length) {
+    const contracts = new Map((model.query_contracts ?? []).map((query: JsonRecord) => [String(query.id), query]));
+    for (const query of plan.script_report.queries) {
+      const contract = contracts.get(String(query.id)) as JsonRecord | undefined;
+      if (!contract) { errors.push(`脚本查询 ${query.id} 不在已批准模型中`); continue; }
+      const allowed = new Map<string, Set<string>>(
+        (contract.sources ?? []).map((source: JsonRecord) => [
+          `${source.profile_id}/${source.database}/${source.table}`,
+          new Set((source.fields ?? []).map((field: unknown) => String(field))),
+        ]),
+      );
+      for (const source of query.sources ?? []) {
+        const sourceKey = `${source.profile_id}/${source.database}/${source.table}`;
+        const allowedFields = allowed.get(sourceKey);
+        if (!allowedFields) {
+          errors.push(`脚本查询 ${query.id} 使用了模型外来源 ${source.database}.${source.table}`);
+          continue;
+        }
+        for (const field of source.fields ?? []) {
+          if (!allowedFields.has(String(field))) {
+            errors.push(`脚本查询 ${query.id} 使用了模型外字段 ${source.database}.${source.table}.${field}`);
+          }
+        }
+      }
+    }
+  }
+  return errors;
+}
+
+function compactModelTable(table: JsonRecord, allowedFields: Set<string>): JsonRecord {
+  return {
+    table_id: table.table_id,
+    physical: table.physical,
+    semantic: table.semantic,
+    fields: (table.physical_fields ?? [])
+      .filter((field: JsonRecord) => allowedFields.has(String(field.physical?.name)))
+      .map((field: JsonRecord) => ({ physical: field.physical, semantic: field.semantic, filter: field.filter })),
+    indexes: (table.indexes ?? []).filter((index: JsonRecord) =>
+      (index.fields ?? index.columns ?? []).some((name: unknown) => allowedFields.has(String(name))),
+    ),
+    foreign_keys: table.foreign_keys ?? [],
+    system_conditions: table.system_conditions ?? [],
+    security: table.security ?? null,
+  };
+}
+
+export async function buildPhaseContext(options: {
+  phase: "discovery" | "modeling" | "query" | "script" | "repair";
+  plan: string;
+  out: string;
+  model?: string;
+  queryId?: string;
+  failure?: string;
+  queryOutputs?: string;
+}): Promise<JsonRecord> {
+  const allowedPhases = new Set(["discovery", "modeling", "query", "script", "repair"]);
+  if (!allowedPhases.has(options.phase)) throw new Error(`未知阶段：${String(options.phase)}`);
+  const plan = await readJson(resolve(options.plan));
+  const model = options.model ? await readJson(resolve(options.model)) : null;
+  if (model && options.phase !== "discovery") {
+    const errors = validateReportModelValue(model, ["query", "script"].includes(options.phase));
+    if (errors.length) throw new Error(errors.join("；"));
+  }
+  const manifest: JsonRecord = {
+    context_format_version: PHASE_CONTEXT_FORMAT_VERSION,
+    phase: options.phase,
+    fresh_session: options.phase !== "repair",
+    generated_at: new Date().toISOString(),
+    limits: { max_tables: options.phase === "query" ? 3 : 12, max_fields: options.phase === "query" ? 40 : 120, max_reference_sections: 2, max_context_bytes: 100_000 },
+    forbidden_inputs: ["knowledge/scans", "历史聊天", "连接配置", "无关报表", "先前失败脚本"],
+  };
+  let payload: JsonRecord;
+  if (options.phase === "discovery") {
+    const tempOut = `${resolve(options.out)}.knowledge.json`;
+    const knowledge = await buildKnowledgeContext({ plan: options.plan, out: tempOut });
+    payload = { requirement: plan.report, initial_plan: plan, knowledge };
+    manifest.expected_outputs = ["discovery-model.json", "一个合并确认问题"];
+  } else if (options.phase === "modeling") {
+    if (!model) throw new Error("modeling 阶段需要 --model");
+    const knowledgeRoot = resolve(String(plan.knowledge?.source_dir ?? ""));
+    const allTables = await loadKnowledgeTables(knowledgeRoot);
+    const tables = (model.sources ?? []).map((source: JsonRecord) => {
+      const table = allTables.find((candidate: JsonRecord) =>
+        candidate.physical?.profile_id === source.profile_id && candidate.physical?.database === source.database && candidate.physical?.table === source.table,
+      );
+      if (!table) throw new Error(`模型来源不在知识库：${source.profile_id}/${source.database}/${source.table}`);
+      return compactModelTable(table, new Set((source.fields ?? []).map((field: JsonRecord) => String(field.name))));
+    });
+    payload = { discovery_model: model, knowledge: { tables }, user_confirmation_required: true };
+    manifest.expected_outputs = ["report-model.json", "semantic-plan.json", "execution-plan.json", "query-contracts/*.json"];
+  } else if (options.phase === "query") {
+    if (!model || !options.queryId) throw new Error("query 阶段需要 --model 和 --query-id");
+    const contract = (model.query_contracts ?? []).find((query: JsonRecord) => query.id === options.queryId);
+    if (!contract) throw new Error(`未知查询契约：${options.queryId}`);
+    const allTables = await loadKnowledgeTables(resolve(String(plan.knowledge?.source_dir ?? "")));
+    const tables = (contract.sources ?? []).map((source: JsonRecord) => {
+      const table = allTables.find((candidate: JsonRecord) => candidate.physical?.profile_id === source.profile_id && candidate.physical?.database === source.database && candidate.physical?.table === source.table);
+      if (!table) throw new Error(`查询来源不在知识库：${source.profile_id}/${source.database}/${source.table}`);
+      return compactModelTable(table, new Set((source.fields ?? []).map(String)));
+    });
+    if (tables.length > 3) throw new Error(`查询 ${options.queryId} 涉及 ${tables.length} 张表；请拆分查询契约或明确例外`);
+    payload = { query_contract: contract, knowledge: { tables }, sql_dialect: contract.sql_dialect ?? plan.sql_dialect };
+    manifest.expected_outputs = [`queries/${options.queryId}.sql`, `query-outputs/${options.queryId}.json`];
+  } else if (options.phase === "script") {
+    if (!model) throw new Error("script 阶段需要 --model");
+    let queryOutputs: JsonRecord[] = [];
+    if (options.queryOutputs) {
+      const outputPath = resolve(options.queryOutputs);
+      const outputStat = await stat(outputPath);
+      const files = outputStat.isDirectory()
+        ? (await readdir(outputPath)).filter((name) => name.endsWith(".json")).map((name) => join(outputPath, name))
+        : [outputPath];
+      queryOutputs = await Promise.all(files.map((file) => readJson(file)));
+      const expectedIds = new Set<string>((model.query_contracts ?? []).map((query: JsonRecord) => String(query.id)));
+      const actualIds = new Set<string>(queryOutputs.map((output) => String(output.query_id ?? output.id ?? "")));
+      for (const id of expectedIds) if (!actualIds.has(id)) throw new Error(`缺少查询输出契约：${id}`);
+      for (const output of queryOutputs) {
+        const id = String(output.query_id ?? output.id ?? "");
+        if (!expectedIds.has(id)) throw new Error(`查询输出契约不在批准模型中：${id}`);
+        if (!(output.columns ?? output.output ?? []).length) throw new Error(`查询输出契约 ${id} 没有 columns`);
+      }
+    } else {
+      queryOutputs = (model.query_contracts ?? []).map((query: JsonRecord) => ({
+        query_id: query.id,
+        mode: query.mode,
+        result_grain: query.result_grain,
+        columns: query.output,
+        source: "approved-model-fallback",
+      }));
+    }
+    payload = {
+      report: model.report,
+      result_grain: model.result_grain,
+      semantic_plan: plan.semantic_plan,
+      execution_plan: plan.execution_plan,
+      query_outputs: queryOutputs,
+      allowed_api: ["queryStream", "loadIndex", "batchLookup", "emit"],
+    };
+    manifest.forbidden_inputs.push("物理知识库", "表字段详情", "查询探索过程");
+    manifest.expected_outputs = ["scripts/report.ts"];
+  } else {
+    if (!options.failure) throw new Error("repair 阶段需要 --failure");
+    const failure = await readJson(resolve(options.failure));
+    payload = { failure, route: failure.type?.startsWith("MODEL_") ? "modeling" : failure.type?.startsWith("QUERY_") ? "query" : failure.type?.startsWith("SCRIPT_") ? "script" : "runtime" };
+    manifest.fresh_session = true;
+    manifest.expected_outputs = ["仅修复 failure.route 对应组件"];
+  }
+  const context = { context_manifest: manifest, payload };
+  const content = JSON.stringify(context, null, 2);
+  if (Buffer.byteLength(content, "utf8") > Number(manifest.limits.max_context_bytes)) throw new Error("阶段上下文超过 max_context_bytes，请缩小模型字段或拆分查询");
+  await writeFile(resolve(options.out), `${content}\n`, "utf8");
+  return context;
+}
+
+type StagedArtifactPhase = "discovery" | "modeling" | "query" | "script";
+
+interface StagedPaths {
+  root: string;
+  discoveryModel: string;
+  reportModel: string;
+  semanticPlan: string;
+  executionPlan: string;
+  declarativeConfiguration: string;
+  queries: string;
+  queryOutputs: string;
+  script: string;
+  configuration: string;
+  result: string;
+}
+
+function stagedPaths(rootValue: string): StagedPaths {
+  const root = resolve(rootValue);
+  return {
+    root,
+    discoveryModel: join(root, "discovery-model.json"),
+    reportModel: join(root, "report-model.json"),
+    semanticPlan: join(root, "semantic-plan.json"),
+    executionPlan: join(root, "execution-plan.json"),
+    declarativeConfiguration: join(root, "declarative-configuration.json"),
+    queries: join(root, "queries"),
+    queryOutputs: join(root, "query-outputs"),
+    script: join(root, "scripts", "report.ts"),
+    configuration: join(root, "assembled-configuration.json"),
+    result: join(root, "stage-result.json"),
+  };
+}
+
+function contractColumns(value: unknown): Array<{ name: string; type?: string }> {
+  if (!Array.isArray(value)) return [];
+  return value.map((column) => {
+    if (typeof column === "string") return { name: column };
+    const item = column as JsonRecord;
+    return {
+      name: String(item.name ?? item.id ?? ""),
+      ...(item.type ?? item.output_type ? { type: String(item.type ?? item.output_type) } : {}),
+    };
+  });
+}
+
+function compareQueryOutput(contract: JsonRecord, output: JsonRecord): string[] {
+  const errors: string[] = [];
+  const expected = contractColumns(contract.output);
+  const actual = contractColumns(output.columns ?? output.output);
+  if (String(output.query_id ?? output.id ?? "") !== String(contract.id)) {
+    errors.push(`查询输出文件 id 与契约不一致：${contract.id}`);
+  }
+  if (actual.length !== expected.length) {
+    errors.push(`查询 ${contract.id} 输出列数量不一致：期望 ${expected.length}，实际 ${actual.length}`);
+    return errors;
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    const expectedColumn = expected[index]!;
+    const actualColumn = actual[index]!;
+    if (actualColumn.name !== expectedColumn.name) {
+      errors.push(`查询 ${contract.id} 第 ${index + 1} 列应为 ${expectedColumn.name}，实际为 ${actualColumn.name}`);
+    }
+    if (expectedColumn.type && actualColumn.type && expectedColumn.type !== actualColumn.type) {
+      errors.push(`查询 ${contract.id}.${expectedColumn.name} 类型应为 ${expectedColumn.type}，实际为 ${actualColumn.type}`);
+    }
+  }
+  return errors;
+}
+
+function outerSelectList(sql: string): string | null {
+  let depth = 0;
+  let quote = "";
+  let selectEnd = -1;
+  const isWord = (value: string | undefined): boolean => Boolean(value && /[A-Za-z0-9_$]/.test(value));
+  for (let index = 0; index < sql.length; index += 1) {
+    const char = sql[index]!;
+    if (quote) {
+      if (char === quote && sql[index - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
+    if (char === "(") { depth += 1; continue; }
+    if (char === ")") { depth = Math.max(0, depth - 1); continue; }
+    if (depth !== 0) continue;
+    const rest = sql.slice(index);
+    const keyword = rest.match(/^(SELECT|FROM)\b/i)?.[1]?.toUpperCase();
+    if (!keyword || isWord(sql[index - 1])) continue;
+    if (keyword === "SELECT") {
+      selectEnd = index + keyword.length;
+      index += keyword.length - 1;
+    } else if (selectEnd >= 0) {
+      return sql.slice(selectEnd, index);
+    }
+  }
+  return null;
+}
+
+function extractOuterSelectAliases(sql: string): string[] {
+  const list = outerSelectList(sql);
+  if (list === null) return [];
+  const items: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let quote = "";
+  for (let index = 0; index <= list.length; index += 1) {
+    const char = list[index];
+    if (quote) {
+      if (char === quote && list[index - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
+    if (char === "(") depth += 1;
+    else if (char === ")") depth = Math.max(0, depth - 1);
+    else if ((char === "," && depth === 0) || index === list.length) {
+      items.push(list.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  return items.map((item) => {
+    const match = item.match(/\bAS\s+(?:`([^`]+)`|"([^"]+)"|([A-Za-z_][A-Za-z0-9_$]*))\s*$/i);
+    return match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
+  });
+}
+
+function compareSqlOutputAliases(contract: JsonRecord, sql: string): string[] {
+  const expected = contractColumns(contract.output).map((column) => column.name);
+  const actual = extractOuterSelectAliases(sql);
+  if (actual.length === expected.length && actual.every((name, index) => name === expected[index])) return [];
+  return [`查询 ${contract.id} SELECT 输出别名必须逐列显式 AS 且与契约一致：期望 [${expected.join(", ")}], 实际 [${actual.join(", ")}]`];
+}
+
+async function readRequiredJson(path: string, label: string): Promise<JsonRecord> {
+  try {
+    return await readJson(path);
+  } catch (error) {
+    throw new Error(`${label} 不存在或不是合法 JSON：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export async function validateStagedArtifacts(options: {
+  phase: StagedArtifactPhase;
+  plan: string;
+  root: string;
+  requireApprovedModel?: boolean;
+  queryId?: string;
+}): Promise<JsonRecord> {
+  const planPath = resolve(options.plan);
+  const plan = await readRequiredJson(planPath, "报表计划");
+  const paths = stagedPaths(options.root);
+  const errors: string[] = [];
+  let model: JsonRecord | null = null;
+  if (options.phase === "discovery") {
+    model = await readRequiredJson(paths.discoveryModel, "基础模型");
+    errors.push(...validateReportModelValue(model, false));
+  } else {
+    model = await readRequiredJson(paths.reportModel, "确定模型");
+    errors.push(...validateReportModelValue(model, options.requireApprovedModel ?? ["query", "script"].includes(options.phase)));
+    const semanticPlan = await readRequiredJson(paths.semanticPlan, "语义计划");
+    const executionPlan = await readRequiredJson(paths.executionPlan, "执行计划");
+    if (!String(semanticPlan.result_grain ?? "").trim()) errors.push("语义计划缺少 result_grain");
+    if (!(executionPlan.steps ?? []).length) errors.push("执行计划缺少 steps");
+    if (String(executionPlan.strategy ?? "") !== String(model.recommended_strategy ?? "")) {
+      errors.push("执行计划 strategy 与确定模型 recommended_strategy 不一致");
+    }
+    if (options.phase === "query" || options.phase === "script") {
+      const strategy = String(model.recommended_strategy ?? executionPlan.strategy ?? "script");
+      if (strategy !== "script") {
+        try { await readRequiredJson(paths.declarativeConfiguration, "声明式配置"); }
+        catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+      }
+      const selectedContracts = strategy === "script"
+        ? (model.query_contracts ?? []).filter((item: JsonRecord) => !options.queryId || String(item.id) === options.queryId)
+        : [];
+      for (const contract of selectedContracts) {
+        const id = String(contract.id);
+        let sql = "";
+        try {
+          sql = (await readFile(join(paths.queries, `${id}.sql`), "utf8")).trim();
+          safeScriptSql(sql, String(contract.mode ?? "stream"));
+          errors.push(...compareSqlOutputAliases(contract, sql));
+        } catch (error) {
+          errors.push(`查询 ${id} SQL 无效：${error instanceof Error ? error.message : String(error)}`);
+        }
+        const output = await readRequiredJson(join(paths.queryOutputs, `${id}.json`), `查询 ${id} 输出契约`);
+        errors.push(...compareQueryOutput(contract, output));
+      }
+      if (strategy === "script" && options.queryId && !(model.query_contracts ?? []).some((item: JsonRecord) => String(item.id) === options.queryId)) {
+        errors.push(`模型不存在查询契约：${options.queryId}`);
+      }
+    }
+    if (options.phase === "script") {
+      try {
+        const source = await readFile(paths.script, "utf8");
+        validateScriptSource(source);
+      } catch (error) {
+        errors.push(`report.ts 无效：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  if (plan.report?.id !== model?.report?.id) errors.push("阶段模型与报表计划 id 不一致");
+  const result: JsonRecord = {
+    ok: errors.length === 0,
+    phase: options.phase,
+    report_id: plan.report?.id,
+    root: paths.root,
+    errors,
+    checked_at: new Date().toISOString(),
+  };
+  await writeJson(paths.result, result);
+  return result;
+}
+
+export async function approveStagedModel(options: {
+  plan: string;
+  root: string;
+  reviewedBy: string;
+}): Promise<JsonRecord> {
+  const paths = stagedPaths(options.root);
+  const validation = await validateStagedArtifacts({ phase: "modeling", plan: options.plan, root: options.root });
+  if (!validation.ok) throw new Error((validation.errors ?? []).join("；"));
+  const planPath = resolve(options.plan);
+  const plan = await readJson(planPath);
+  plan.semantic_plan = await readJson(paths.semanticPlan);
+  plan.execution_plan = await readJson(paths.executionPlan);
+  await writeJson(planPath, plan);
+  const model = await approveReportModel(paths.reportModel, options.reviewedBy, planPath);
+  const strategy = String(model.recommended_strategy ?? plan.execution_plan?.strategy ?? "script");
+  return {
+    ok: true,
+    model_hash: model.approval?.model_hash,
+    report_id: model.report?.id,
+    strategy,
+    query_ids: strategy === "script"
+      ? (model.query_contracts ?? []).map((contract: JsonRecord) => String(contract.id))
+      : ["declarative"],
+  };
+}
+
+export async function finalizeStagedPackage(options: {
+  workspace: string;
+  plan: string;
+  root: string;
+  reviewedBy: string;
+}): Promise<JsonRecord> {
+  const paths = stagedPaths(options.root);
+  const model = await readJson(paths.reportModel);
+  const executionPlan = await readJson(paths.executionPlan);
+  const strategy = String(model.recommended_strategy ?? executionPlan.strategy ?? "script");
+  const validation = await validateStagedArtifacts({
+    phase: strategy === "script" ? "script" : "query",
+    plan: options.plan,
+    root: options.root,
+    requireApprovedModel: true,
+  });
+  if (!validation.ok) throw new Error((validation.errors ?? []).join("；"));
+  const configuration: JsonRecord = strategy === "script"
+    ? { semantic_plan: await readJson(paths.semanticPlan), execution_plan: executionPlan }
+    : {
+        ...(await readJson(paths.declarativeConfiguration)),
+        semantic_plan: await readJson(paths.semanticPlan),
+        execution_plan: executionPlan,
+      };
+  if (strategy !== "script") delete configuration.script_report;
+  if (strategy === "script") configuration.script_report = {
+    queries: await Promise.all((model.query_contracts ?? []).map(async (contract: JsonRecord) => ({
+      id: contract.id,
+      mode: contract.mode ?? "stream",
+      database: contract.sources?.[0]?.database,
+      sources: contract.sources,
+      sql: (await readFile(join(paths.queries, `${contract.id}.sql`), "utf8")).trim(),
+    }))),
+    source: await readFile(paths.script, "utf8"),
+    resource_budget: model.resource_budget ?? {},
+  };
+  await writeJson(paths.configuration, configuration);
+  const workspace = resolve(options.workspace);
+  const planPath = resolve(options.plan);
+  const originalPlan = await readFile(planPath, "utf8");
+  const indexPath = join(workspace, "reports", "index.json");
+  let originalIndex: string | null = null;
+  try { originalIndex = await readFile(indexPath, "utf8"); } catch { /* index may not exist */ }
+  const candidateRoot = join(paths.root, "candidate-package");
+  const finalRoot = join(workspace, "reports", "packages", String(model.report?.id), String(model.report?.version));
+  let published = false;
+  try {
+    await rm(candidateRoot, { recursive: true, force: true });
+    try {
+      if ((await stat(finalRoot)).isDirectory()) throw new Error(`目标报表版本已存在，禁止原地覆盖：${finalRoot}`);
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT")) throw error;
+    }
+    await configurePlan(planPath, paths.configuration);
+    await approvePlan(planPath, options.reviewedBy);
+    await generatePackage({ workspace, plan: planPath, out: candidateRoot, register: false });
+    const packageValidation = await validatePackage(candidateRoot);
+    if (!packageValidation.valid) throw new Error(`报表包静态校验失败：${packageValidation.errors.join("；")}`);
+    await mkdir(dirname(finalRoot), { recursive: true });
+    await rename(candidateRoot, finalRoot);
+    published = true;
+    await updateReportIndex(workspace, await readJson(join(finalRoot, "report.manifest.json")), finalRoot);
+    const result = { ok: true, phase: strategy === "script" ? "script" : "query", strategy, report_id: model.report?.id, package: finalRoot };
+    await writeJson(paths.result, result);
+    return result;
+  } catch (error) {
+    await writeFile(planPath, originalPlan, "utf8");
+    if (published) await rm(finalRoot, { recursive: true, force: true });
+    await rm(candidateRoot, { recursive: true, force: true });
+    if (originalIndex === null) await rm(indexPath, { force: true });
+    else await writeFile(indexPath, originalIndex, "utf8");
+    throw error;
+  }
 }
 
 export async function configurePlan(
@@ -2067,6 +3198,12 @@ export async function configurePlan(
   // runtime. Resolved from knowledge here; stored in plan.group_queries.
   if (configuration.group_queries) {
     await applyGroupQueries(plan, configuration.group_queries);
+  }
+  if (configuration.script_report) {
+    await applyScriptReport(plan, configuration.script_report);
+    plan.blockers = (plan.blockers ?? []).filter(
+      (blocker: JsonRecord) => blocker.code !== "JOIN_REQUIRED",
+    );
   }
   const overrides = new Map<string, JsonRecord>(
     (configuration.fields ?? []).map((field: JsonRecord) => [field.id, field]),
@@ -2164,7 +3301,11 @@ export async function configurePlan(
   for (const candidate of configuration.fields ?? []) {
     if (existingFieldIds.has(candidate.id)) continue;
     const kind = candidate.source?.kind;
-    if (kind !== "computed" && kind !== "sql_expression") {
+    if (
+      kind !== "computed" &&
+      kind !== "sql_expression" &&
+      !(kind === "script" && plan.script_report)
+    ) {
       throw new Error(
         `无法新增字段 ${candidate.id}：configure-plan 只能新增 computed / sql_expression 字段；` +
           `新的数据库列必须通过 report_requirements 的 required_fields 解析以锁定血缘`,
@@ -2185,6 +3326,50 @@ export async function configurePlan(
       roles: Array.isArray(candidate.roles) ? candidate.roles : [],
     });
     existingFieldIds.add(candidate.id);
+  }
+  // A report requirement may name a business metric (订单量/运单量/派车单数量)
+  // rather than a physical database column. inspect records that as FIELD_NOT_FOUND
+  // with a deterministic field_id. Once configure-plan supplies the same id as a
+  // trusted sql_expression/computed field, or as a group_queries output, the metric
+  // is resolved and must no longer block approval. Physical-field misses that were
+  // not explicitly configured remain blockers; nothing is guessed silently.
+  const configuredMetricIds = new Set<string>([
+    ...(plan.fields ?? []).map((field: JsonRecord) => String(field.id)),
+    ...(plan.group_queries?.queries ?? []).flatMap((query: JsonRecord) =>
+      (query.fields ?? []).map((field: JsonRecord) => String(field.id)),
+    ),
+  ]);
+  const resolvedBusinessMetrics = (plan.blockers ?? []).filter(
+    (blocker: JsonRecord) =>
+      blocker.code === "FIELD_NOT_FOUND" &&
+      blocker.field_id &&
+      configuredMetricIds.has(String(blocker.field_id)),
+  );
+  if (resolvedBusinessMetrics.length) {
+    const resolvedIds = new Set(
+      resolvedBusinessMetrics.map((blocker: JsonRecord) => String(blocker.field_id)),
+    );
+    plan.blockers = (plan.blockers ?? []).filter(
+      (blocker: JsonRecord) =>
+        blocker.code !== "FIELD_NOT_FOUND" ||
+        !blocker.field_id ||
+        !resolvedIds.has(String(blocker.field_id)),
+    );
+    plan.warnings = [
+      ...(plan.warnings ?? []).filter(
+        (warning: JsonRecord) => warning.code !== "BUSINESS_METRICS_RESOLVED",
+      ),
+      {
+        code: "BUSINESS_METRICS_RESOLVED",
+        fields: resolvedBusinessMetrics.map((blocker: JsonRecord) => ({
+          id: blocker.field_id,
+          label: blocker.label ?? blocker.field,
+        })),
+        message: `以下非物理业务指标已由报表计划显式解析：${resolvedBusinessMetrics
+          .map((blocker: JsonRecord) => blocker.label ?? blocker.field)
+          .join("、")}`,
+      },
+    ];
   }
   // A `computed` field is produced by the TypeScript transform (row/group) — it
   // does not exist as a queryable column or SQL expression, so it can never be a
@@ -2333,6 +3518,7 @@ export async function configurePlan(
     }
   }
   if (configuration.ordering) plan.ordering = configuration.ordering;
+  finalizePlanningDocuments(plan, configuration);
   const fieldKinds = new Set(
     (plan.fields ?? []).map((field: JsonRecord) => field.source?.kind),
   );
@@ -2410,6 +3596,14 @@ export async function approvePlan(
   if ((plan.blockers ?? []).length > 0) {
     throw new Error("报表计划仍有阻塞问题，不能批准");
   }
+  if (!String(plan.semantic_plan?.result_grain ?? "").trim()) {
+    throw new Error("语义计划尚未明确结果粒度，不能批准");
+  }
+  if (!(plan.execution_plan?.steps ?? []).length) {
+    throw new Error("执行计划没有可审阅步骤，不能批准");
+  }
+  const modelErrors = await validateAttachedReportModel(plan, resolve(planPath));
+  if (modelErrors.length) throw new Error(`报表模型校验失败：\n${modelErrors.join("\n")}`);
   const errors = validatePlanV2(plan);
   if (errors.length) {
     throw new Error(`报表计划校验失败：\n${errors.join("\n")}`);
@@ -2419,6 +3613,8 @@ export async function approvePlan(
     reviewed_by: reviewedBy,
     reviewed_at: new Date().toISOString(),
   };
+  plan.semantic_plan.status = "approved";
+  plan.execution_plan.status = "approved";
   await writeJson(resolve(planPath), plan);
   return plan;
 }
@@ -3038,13 +4234,138 @@ function lockedSources(plan: JsonRecord): JsonRecord[] {
   return [...joinedSources, ...enrichmentSources];
 }
 
+async function generateScriptPackage(
+  workspace: string,
+  plan: JsonRecord,
+  packageRoot: string,
+  register: boolean,
+): Promise<string> {
+  await mkdir(join(packageRoot, "queries"), { recursive: true });
+  await mkdir(join(packageRoot, "scripts"), { recursive: true });
+  await mkdir(join(packageRoot, "tests"), { recursive: true });
+  const enumsByField = await buildPackageEnums(workspace, plan);
+  const hasEnums = Object.keys(enumsByField).length > 0;
+  const fields = {
+    schema_version: "2",
+    report_id: plan.report.id,
+    fields: (plan.fields ?? []).map((field: JsonRecord, index: number) => ({
+      id: field.id,
+      label: field.label,
+      order: field.order ?? index + 1,
+      value_type: field.output_type,
+      ...(field.description ? { description: field.description } : {}),
+      source: field.source,
+      excel: { number_format: null },
+    })),
+  };
+  const manifest: JsonRecord = {
+    report_package_format_version: SCRIPT_PACKAGE_FORMAT_VERSION,
+    id: plan.report.id,
+    name: plan.report.name,
+    version: plan.report.version,
+    description: plan.report.description,
+    category: plan.report.category,
+    status: "draft",
+    generated_at: new Date().toISOString(),
+    sql_dialect: dialectForPlan(plan).id,
+    development_only: plan.knowledge.catalog_status !== "published",
+    execution_model: "isolated_script",
+    execution_policy: plan.execution_policy,
+    resource_budget: plan.script_report.resource_budget,
+    output: {
+      format: "xlsx",
+      file_name_pattern: `${plan.report.name}_{yyyyMMdd_HHmmss}.xlsx`,
+    },
+    entrypoints: {
+      script: "scripts/report.mjs",
+      script_source: "scripts/report.ts",
+      fields: "fields.json",
+      parameters: "parameters.schema.json",
+      knowledge_lock: "knowledge.lock.json",
+      semantic_plan: "semantic-plan.json",
+      execution_plan: "execution-plan.json",
+      ...(hasEnums ? { enums: "enums.json" } : {}),
+    },
+    queries: (plan.script_report.queries ?? []).map((query: JsonRecord) => ({
+      id: query.id,
+      mode: query.mode,
+      profile_id: query.profile_id,
+      database: query.database,
+      sql_dialect: query.sql_dialect,
+      sql: `queries/${query.id}.sql`,
+    })),
+    signature: { status: "unsigned-development" },
+  };
+  const lock = {
+    lock_format_version: "2",
+    catalog_format_version: plan.knowledge.catalog_format_version,
+    catalog_version: plan.knowledge.catalog_version,
+    catalog_status: plan.knowledge.catalog_status,
+    snapshot_hash: plan.knowledge.snapshot_hash,
+    sources: [],
+    script_query_sources: (plan.script_report.queries ?? []).map((query: JsonRecord) => ({
+      id: query.id,
+      sources: query.sources,
+    })),
+    report_requirement: {
+      id: plan.report.id,
+      name: plan.report.name,
+      fields: (plan.fields ?? []).map((field: JsonRecord) => ({
+        id: field.id,
+        label: field.label,
+        source: "script",
+      })),
+    },
+  };
+  await writeJson(join(packageRoot, "report.manifest.json"), manifest);
+  await writeJson(join(packageRoot, "fields.json"), fields);
+  await writeJson(
+    join(packageRoot, "parameters.schema.json"),
+    buildParameterSchema(plan, enumsByField),
+  );
+  await writeJson(join(packageRoot, "knowledge.lock.json"), lock);
+  await writeJson(join(packageRoot, "semantic-plan.json"), plan.semantic_plan);
+  await writeJson(join(packageRoot, "execution-plan.json"), plan.execution_plan);
+  await writeFile(join(packageRoot, "plan-review.md"), renderPlanReview(plan), "utf8");
+  await writeFile(join(packageRoot, "scripts", "report.ts"), plan.script_report.source, "utf8");
+  await writeFile(
+    join(packageRoot, "scripts", "report.mjs"),
+    stripTypeScriptTypes(plan.script_report.source, { mode: "strip" }),
+    "utf8",
+  );
+  for (const query of plan.script_report.queries ?? []) {
+    await writeFile(join(packageRoot, "queries", `${query.id}.sql`), query.sql, "utf8");
+  }
+  await writeJson(join(packageRoot, "tests", "cases.json"), {
+    schema_version: "1",
+    cases: [{
+      id: "empty-filters",
+      filters: {},
+      context: {},
+      expected_columns: (plan.fields ?? []).map((field: JsonRecord) => field.id),
+    }],
+  });
+  if (hasEnums) {
+    await writeJson(join(packageRoot, "enums.json"), {
+      schema_version: "1",
+      report_id: plan.report.id,
+      byField: enumsByField,
+    });
+  }
+  await writePackageChecksums(packageRoot);
+  if (register) await updateReportIndex(workspace, manifest, packageRoot);
+  return packageRoot;
+}
+
 export async function generatePackage(options: {
   workspace: string;
   plan: string;
   out?: string;
+  register?: boolean;
 }): Promise<string> {
   const workspace = resolve(options.workspace);
-  const plan = await readJson(resolve(options.plan));
+  const resolvedPlanPath = resolve(options.plan);
+  const plan = await readJson(resolvedPlanPath);
   if (plan.plan_format_version !== PLAN_FORMAT_VERSION) {
     throw new Error(`生成器只接受 v${PLAN_FORMAT_VERSION} 报表计划`);
   }
@@ -3080,6 +4401,11 @@ export async function generatePackage(options: {
     ) {
       throw error;
     }
+  }
+  const modelErrors = await validateAttachedReportModel(plan, resolvedPlanPath);
+  if (modelErrors.length) throw new Error(`报表模型校验失败：\n${modelErrors.join("\n")}`);
+  if (plan.script_report) {
+    return generateScriptPackage(workspace, plan, packageRoot, options.register !== false);
   }
   await mkdir(join(packageRoot, "queries"), { recursive: true });
   await mkdir(join(packageRoot, "transforms"), { recursive: true });
@@ -3191,10 +4517,18 @@ export async function generatePackage(options: {
     catalog_status: plan.knowledge.catalog_status,
     snapshot_hash: plan.knowledge.snapshot_hash,
     sources: lockedSources(plan),
+    ...(plan.group_queries?.queries?.length
+      ? {
+          group_query_sources: plan.group_queries.queries.map((gq: JsonRecord) => ({
+            id: gq.id,
+            sources: lockedSources(groupQueryToPlan(plan, gq)),
+          })),
+        }
+      : {}),
     report_requirement: {
       id: plan.report.id,
       name: plan.report.name,
-      fields: plan.fields.map((field: JsonRecord) => ({
+      fields: outputFieldList.map((field: JsonRecord) => ({
         id: field.id,
         label: field.label,
         source:
@@ -3213,7 +4547,7 @@ export async function generatePackage(options: {
         description: "允许所有可见筛选项为空，并仍执行固定系统条件",
         filters: {},
         context: {},
-        expected_columns: plan.fields.map((field: JsonRecord) => field.id),
+        expected_columns: outputFieldList.map((field: JsonRecord) => field.id),
       },
       {
         id: "optional-tenant-context",
@@ -3271,8 +4605,117 @@ export async function generatePackage(options: {
   }
 
   await writePackageChecksums(packageRoot);
-  await updateReportIndex(workspace, manifest, packageRoot);
+  if (options.register !== false) await updateReportIndex(workspace, manifest, packageRoot);
   return packageRoot;
+}
+
+async function validateScriptPackage(packageRoot: string): Promise<{
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
+}> {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const requiredFiles = [
+    "report.manifest.json",
+    "fields.json",
+    "parameters.schema.json",
+    "knowledge.lock.json",
+    "semantic-plan.json",
+    "execution-plan.json",
+    "plan-review.md",
+    "scripts/report.ts",
+    "scripts/report.mjs",
+    "tests/cases.json",
+    "checksums.sha256",
+  ];
+  for (const file of requiredFiles) {
+    try { await stat(join(packageRoot, file)); } catch { errors.push(`缺少文件：${file}`); }
+  }
+  if (errors.length) return { valid: false, errors, warnings };
+  const manifest = await readJson(join(packageRoot, "report.manifest.json"));
+  const fields = await readJson(join(packageRoot, "fields.json"));
+  const lock = await readJson(join(packageRoot, "knowledge.lock.json"));
+  const semantic = await readJson(join(packageRoot, "semantic-plan.json"));
+  const execution = await readJson(join(packageRoot, "execution-plan.json"));
+  const script = await readFile(join(packageRoot, "scripts", "report.mjs"), "utf8");
+  if (String(manifest.report_package_format_version) !== SCRIPT_PACKAGE_FORMAT_VERSION) {
+    errors.push("脚本报表包必须使用 report_package_format_version=3");
+  }
+  if (manifest.execution_model !== "isolated_script") errors.push("v3 execution_model 必须是 isolated_script");
+  if (String(fields.schema_version) !== "2") errors.push("fields.json 必须使用 schema_version=2");
+  if (!semantic.result_grain || semantic.status !== "approved") errors.push("v3 语义计划必须已批准并明确结果粒度");
+  if (execution.strategy !== "script" || execution.status !== "approved" || !(execution.steps ?? []).length) {
+    errors.push("v3 执行计划必须已批准且包含脚本步骤");
+  }
+  try { validateScriptSource(script); } catch (error) { errors.push((error as Error).message); }
+  const requiredBudgetNames = [
+    "max_queries",
+    "max_query_rows",
+    "max_index_rows",
+    "max_batch_keys",
+    "max_output_rows",
+    "max_memory_mb",
+    "timeout_seconds",
+    "stream_batch_rows",
+  ];
+  for (const name of requiredBudgetNames) {
+    if (!(name in (manifest.resource_budget ?? {}))) errors.push(`资源预算缺少 ${name}`);
+  }
+  for (const [name, value] of Object.entries(manifest.resource_budget ?? {})) {
+    if (!Number.isInteger(Number(value)) || Number(value) < 1) errors.push(`资源预算 ${name} 必须是正整数`);
+  }
+  const lockById = new Map(
+    (lock.script_query_sources ?? []).map((entry: JsonRecord) => [String(entry.id), entry]),
+  );
+  const queryIds = new Set<string>();
+  for (const query of manifest.queries ?? []) {
+    const id = String(query.id ?? "");
+    if (!id || queryIds.has(id)) { errors.push("v3 查询 id 缺失或重复"); continue; }
+    queryIds.add(id);
+    const sqlPath = String(query.sql ?? "");
+    if (!/^queries\/[a-z0-9_-]+\.sql$/.test(sqlPath)) {
+      errors.push(`v3 查询 ${id} 路径无效`);
+      continue;
+    }
+    try {
+      const sql = await readFile(join(packageRoot, sqlPath), "utf8");
+      safeScriptSql(sql, String(query.mode ?? ""));
+      const dialect = getSqlDialect(query.sql_dialect ?? manifest.sql_dialect ?? "mysql");
+      const lockEntry = lockById.get(id) as JsonRecord | undefined;
+      if (!lockEntry) { errors.push(`v3 查询 ${id} 缺少独立知识锁`); continue; }
+      const aliases = new Map<string, Set<string>>(
+        (lockEntry.sources ?? []).map((source: JsonRecord) => [
+          String(source.alias),
+          new Set((source.fields ?? []).map(String)),
+        ]),
+      );
+      for (const match of sql.matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\.([A-Za-z_$][A-Za-z0-9_$]*)\b/g)) {
+        if (aliases.has(match[1]!)) errors.push(`v3 查询 ${id} 存在未加方言引号的列：${match[0]}`);
+      }
+      for (const match of sql.matchAll(dialect.referenceRegex())) {
+        if (!aliases.get(match[1]!)?.has(match[2]!)) {
+          errors.push(`v3 查询 ${id} 引用了未锁定列：${match[1]}.${match[2]}`);
+        }
+      }
+    } catch (error) {
+      errors.push(`v3 查询 ${id} 无法读取或校验：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const expected = new Map<string, string>();
+  const checksumText = await readFile(join(packageRoot, "checksums.sha256"), "utf8");
+  for (const line of checksumText.trim().split("\n").filter(Boolean)) {
+    const match = line.match(/^([a-f0-9]{64})  (.+)$/);
+    if (!match) errors.push(`校验和格式错误：${line}`);
+    else expected.set(match[2]!, match[1]!);
+  }
+  for (const file of await listPackageFiles(packageRoot)) {
+    if (expected.get(file) !== sha256(await readFile(join(packageRoot, file)))) {
+      errors.push(`校验和不匹配：${file}`);
+    }
+  }
+  if (manifest.development_only) warnings.push("当前是开发包：知识库尚未发布或报表包尚未签名");
+  return { valid: errors.length === 0, errors, warnings };
 }
 
 export async function validatePackage(packageRootValue: string): Promise<{
@@ -3281,6 +4724,14 @@ export async function validatePackage(packageRootValue: string): Promise<{
   warnings: string[];
 }> {
   const packageRoot = resolve(packageRootValue);
+  try {
+    const initialManifest = await readJson(join(packageRoot, "report.manifest.json"));
+    if (String(initialManifest.report_package_format_version) === SCRIPT_PACKAGE_FORMAT_VERSION) {
+      return validateScriptPackage(packageRoot);
+    }
+  } catch {
+    // Continue through the v2 validator so the normal missing-file error is returned.
+  }
   const errors: string[] = [];
   const warnings: string[] = [];
   const requiredFiles = [
@@ -3310,6 +4761,68 @@ export async function validatePackage(packageRootValue: string): Promise<{
   const bindings = await readJson(join(packageRoot, "queries", "bindings.json"));
   const knowledgeLock = await readJson(join(packageRoot, "knowledge.lock.json"));
   const sql = await readFile(join(packageRoot, "queries", "main.sql"), "utf8");
+
+  // Validate every sibling grouped query as an independently locked SELECT.
+  // Its aliases are local to that SQL file, so they must be checked against the
+  // matching knowledge.lock.group_query_sources entry rather than main sources.
+  for (const query of manifest.group_queries?.queries ?? []) {
+    const queryId = String(query.id ?? "");
+    const sqlPath = String(query.sql ?? "");
+    const bindingsPath = String(query.bindings ?? "");
+    if (!queryId || !sqlPath || !bindingsPath || sqlPath.includes("..") || bindingsPath.includes("..")) {
+      errors.push(`group_queries ${queryId || "<unknown>"} 的入口路径无效`);
+      continue;
+    }
+    try {
+      const siblingSql = await readFile(join(packageRoot, sqlPath), "utf8");
+      const siblingBindings = await readJson(join(packageRoot, bindingsPath));
+      if ((siblingSql.match(/\/\* EASYBI_FILTERS \*\//g) ?? []).length !== 1) {
+        errors.push(`group_queries ${queryId} SQL 必须且只能包含一个 EASYBI_FILTERS 标记`);
+      }
+      if (String(siblingBindings.binding_format_version) !== "2") {
+        errors.push(`group_queries ${queryId} bindings 必须使用 binding_format_version=2`);
+      }
+      const lockEntry = (knowledgeLock.group_query_sources ?? []).find(
+        (entry: JsonRecord) => String(entry.id) === queryId,
+      );
+      if (!lockEntry) {
+        errors.push(`group_queries ${queryId} 缺少独立知识锁`);
+        continue;
+      }
+      const dialect = getSqlDialect(manifest.sql_dialect ?? "mysql");
+      const lockedAliases = new Map<string, Set<string>>();
+      for (const source of lockEntry.sources ?? []) {
+        if (!source.alias || lockedAliases.has(String(source.alias))) {
+          errors.push(`group_queries ${queryId} 的知识锁表别名缺失或重复：${source.alias ?? ""}`);
+          continue;
+        }
+        lockedAliases.set(String(source.alias), new Set((source.fields ?? []).map(String)));
+      }
+      for (const match of siblingSql.matchAll(dialect.referenceRegex())) {
+        const alias = match[1]!;
+        const field = match[2]!;
+        if (!lockedAliases.has(alias)) {
+          errors.push(`group_queries ${queryId} SQL 引用了未知表别名：${alias}`);
+        } else if (!lockedAliases.get(alias)?.has(field)) {
+          errors.push(`group_queries ${queryId} SQL 引用了未锁定的列：${alias}.${field}`);
+        }
+      }
+      const sqlJoinAliases = new Set(
+        [...siblingSql.matchAll(/\b(?:LEFT|INNER)\s+JOIN\s+[^ \n]+\s+AS\s+([A-Za-z][A-Za-z0-9_]*)/gi)].map(
+          (match) => match[1]!,
+        ),
+      );
+      for (const alias of [...lockedAliases.keys()].slice(1)) {
+        if (!sqlJoinAliases.has(alias)) {
+          errors.push(`group_queries ${queryId} 的来源表 ${alias} 没有对应 JOIN`);
+        }
+      }
+    } catch (error) {
+      errors.push(
+        `group_queries ${queryId} 无法读取：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 
   if (String(manifest.report_package_format_version) !== PACKAGE_FORMAT_VERSION) {
     errors.push(
@@ -3430,14 +4943,36 @@ export async function validatePackage(packageRootValue: string): Promise<{
       aliases.set(source.alias, new Set((source.fields ?? []).map(String)));
       if (source.kind !== "enrichment") joinLockAliases.push(source.alias);
     }
+    const groupQueryFieldIds = new Set(
+      (manifest.group_queries?.queries ?? []).flatMap((query: JsonRecord) =>
+        (query.field_ids ?? []).map(String),
+      ),
+    );
+    const groupQueryLocks = (knowledgeLock.group_query_sources ?? []).flatMap(
+      (entry: JsonRecord) => entry.sources ?? [],
+    );
     for (const field of fields.fields ?? []) {
       const kind = field.source?.kind;
       if (kind === "column" || kind === "boolean_flag") {
         // Both read a real DB column (boolean_flag folds it to 是/否 in the SELECT).
         if (!aliases.has(field.source?.alias)) {
-          errors.push(`字段 ${field.id} 引用了知识锁之外的表别名`);
+          const lockedByGroupQuery =
+            groupQueryFieldIds.has(String(field.id)) &&
+            groupQueryLocks.some(
+              (source: JsonRecord) =>
+                source.alias === field.source?.alias &&
+                (source.fields ?? []).map(String).includes(String(field.source?.field)),
+            );
+          if (!lockedByGroupQuery) errors.push(`字段 ${field.id} 引用了知识锁之外的表别名`);
         } else if (!aliases.get(field.source.alias)?.has(String(field.source.field))) {
-          errors.push(`字段 ${field.id} 引用了知识锁之外的列`);
+          const lockedByGroupQuery =
+            groupQueryFieldIds.has(String(field.id)) &&
+            groupQueryLocks.some(
+              (source: JsonRecord) =>
+                source.alias === field.source?.alias &&
+                (source.fields ?? []).map(String).includes(String(field.source?.field)),
+            );
+          if (!lockedByGroupQuery) errors.push(`字段 ${field.id} 引用了知识锁之外的列`);
         }
       } else if (kind === "enrichment") {
         // Must bind to a declared enrichment; its lookup column must be locked.
@@ -3597,6 +5132,15 @@ function usage(): string {
     "  doctor",
     "  inspect --workspace <dir> --knowledge <dir> --report-id <id> --out <file> [--version <version>]",
     "  configure-plan --plan <file> --configuration <file>",
+    "  explain-plan --plan <file>",
+    "  build-context --plan <file> --out <file> [--include database.table,table_id] [--max-tables 12]",
+    "  init-model --plan <file> --out <file>",
+    "  validate-model --model <file> [--require-approved true]",
+    "  approve-model --model <file> --reviewed-by <name> [--plan <file>]",
+    "  build-phase-context --phase discovery|modeling|query|script|repair --plan <file> --out <file> [--model <file>] [--query-id <id>] [--query-outputs <dir>] [--failure <file>]",
+    "  validate-stage --phase discovery|modeling|query|script --plan <file> --root <work/report-build/id/revision> [--query-id <id>] [--require-approved-model true]",
+    "  approve-staged-model --plan <file> --root <work/report-build/id/revision> --reviewed-by <name>",
+    "  finalize-staged --workspace <workspace> --plan <file> --root <work/report-build/id/revision> --reviewed-by <name>",
     "  approve-plan --plan <file> --reviewed-by <name>",
     "  generate --workspace <dir> --plan <file> [--out <dir>]",
     "  validate --package <dir>",
@@ -3606,6 +5150,10 @@ function usage(): string {
 
 async function main(): Promise<void> {
   const { command, options } = parseArguments(process.argv.slice(2));
+  if (command === "help" || command === "--help" || command === "-h") {
+    console.log(usage());
+    return;
+  }
   if (command === "doctor") {
     console.log(
       JSON.stringify(
@@ -3613,7 +5161,9 @@ async function main(): Promise<void> {
           ok: true,
           node: process.version,
           package_format_version: PACKAGE_FORMAT_VERSION,
+          supported_package_format_versions: [PACKAGE_FORMAT_VERSION, SCRIPT_PACKAGE_FORMAT_VERSION],
           plan_format_version: PLAN_FORMAT_VERSION,
+          staged_workflow_version: 2,
           runtime_dependencies: [],
         },
         null,
@@ -3660,11 +5210,108 @@ async function main(): Promise<void> {
           customLogic: plan.custom_logic,
           blockers: plan.blockers,
           warnings: plan.warnings,
+          semanticPlan: plan.semantic_plan,
+          executionPlan: plan.execution_plan,
+          review: renderPlanReview(plan),
         },
         null,
         2,
       ),
     );
+    return;
+  }
+  if (command === "explain-plan") {
+    console.log(await explainPlan(requiredOption(options, "plan")));
+    return;
+  }
+  if (command === "build-context") {
+    const context = await buildKnowledgeContext({
+      plan: requiredOption(options, "plan"),
+      out: requiredOption(options, "out"),
+      include: String(options.include ?? "").split(",").map((value) => value.trim()).filter(Boolean),
+      maxTables: options["max-tables"] ? Number(options["max-tables"]) : undefined,
+    });
+    console.log(JSON.stringify({
+      ok: true,
+      out: resolve(requiredOption(options, "out")),
+      selectedTables: context.selected_table_count,
+    }, null, 2));
+    return;
+  }
+  if (command === "init-model") {
+    const model = await initializeReportModel({
+      plan: requiredOption(options, "plan"),
+      out: requiredOption(options, "out"),
+    });
+    console.log(JSON.stringify({ ok: true, out: resolve(requiredOption(options, "out")), model }, null, 2));
+    return;
+  }
+  if (command === "validate-model") {
+    const model = await readJson(resolve(requiredOption(options, "model")));
+    const errors = validateReportModelValue(model, options["require-approved"] === "true");
+    console.log(JSON.stringify({ ok: errors.length === 0, errors, modelHash: reportModelHash(model) }, null, 2));
+    if (errors.length) process.exitCode = 1;
+    return;
+  }
+  if (command === "approve-model") {
+    const model = await approveReportModel(
+      requiredOption(options, "model"),
+      requiredOption(options, "reviewed-by"),
+      options.plan,
+    );
+    console.log(JSON.stringify({ ok: true, approval: model.approval }, null, 2));
+    return;
+  }
+  if (command === "build-phase-context") {
+    const phase = requiredOption(options, "phase");
+    if (!["discovery", "modeling", "query", "script", "repair"].includes(phase)) {
+      throw new Error(`--phase 必须是 discovery|modeling|query|script|repair，收到：${phase}`);
+    }
+    const context = await buildPhaseContext({
+      phase: phase as "discovery" | "modeling" | "query" | "script" | "repair",
+      plan: requiredOption(options, "plan"),
+      out: requiredOption(options, "out"),
+      ...(options.model ? { model: options.model } : {}),
+      ...(options["query-id"] ? { queryId: options["query-id"] } : {}),
+      ...(options.failure ? { failure: options.failure } : {}),
+      ...(options["query-outputs"] ? { queryOutputs: options["query-outputs"] } : {}),
+    });
+    console.log(JSON.stringify({ ok: true, out: resolve(requiredOption(options, "out")), manifest: context.context_manifest }, null, 2));
+    return;
+  }
+  if (command === "validate-stage") {
+    const phase = requiredOption(options, "phase");
+    if (!["discovery", "modeling", "query", "script"].includes(phase)) {
+      throw new Error(`--phase 必须是 discovery|modeling|query|script，收到：${phase}`);
+    }
+    const result = await validateStagedArtifacts({
+      phase: phase as StagedArtifactPhase,
+      plan: requiredOption(options, "plan"),
+      root: requiredOption(options, "root"),
+      requireApprovedModel: options["require-approved-model"] === "true",
+      ...(options["query-id"] ? { queryId: options["query-id"] } : {}),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.ok) process.exitCode = 1;
+    return;
+  }
+  if (command === "approve-staged-model") {
+    const result = await approveStagedModel({
+      plan: requiredOption(options, "plan"),
+      root: requiredOption(options, "root"),
+      reviewedBy: requiredOption(options, "reviewed-by"),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (command === "finalize-staged") {
+    const result = await finalizeStagedPackage({
+      workspace: requiredOption(options, "workspace"),
+      plan: requiredOption(options, "plan"),
+      root: requiredOption(options, "root"),
+      reviewedBy: requiredOption(options, "reviewed-by"),
+    });
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
   if (command === "approve-plan") {

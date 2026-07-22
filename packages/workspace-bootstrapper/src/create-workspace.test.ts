@@ -2,11 +2,12 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtemp, rm, stat, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { LocalDirectorySource } from '@easybi-studio/skill-bundle-source';
 import { SkillVersionCache } from '@easybi-studio/skill-bundle-manager';
 import { createOrOpenWorkspace } from './create-workspace.js';
 
-const SOURCE = '/Users/admin/innos/easy-bi-workspace/easy-bi';
+const SOURCE = fileURLToPath(new URL('../../../skill-source/easy-bi', import.meta.url));
 
 let base: string;
 let cacheRoot: string;
@@ -46,7 +47,7 @@ describe('create-or-open workspace (source -> cache -> install -> lock -> bootst
 
     expect(result.installed).toBe(true);
     expect(result.cacheReused).toBe(false);
-    expect(result.bundleVersion).toBe('1.24.0');
+    expect(result.bundleVersion).toBe('1.29.5');
     expect(result.bootstrap.ok).toBe(true);
 
     // Skills installed, lock + manifest present.

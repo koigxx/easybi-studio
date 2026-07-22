@@ -52,7 +52,7 @@ import { ChatMarkdown } from './panels/ChatMarkdown.js';
 
 interface AgentDrawerContextValue {
   /** Start a preset action (prompt = the configured full prompt) or free-chat. */
-  startAction: (projectId: string, action: string, prompt?: string) => void;
+  startAction: (projectId: string, action: string, prompt?: string, reportId?: string) => void;
   /** Open the drawer on a fresh blank free-chat (plain conversation). */
   newChat: () => void;
   open: () => void;
@@ -81,8 +81,11 @@ export function useAgentRefresh(): number {
   return useAgentDrawer().refreshNonce;
 }
 
-const SSE_EVENT_NAMES: JobEvent['type'][] = [
+export const SSE_EVENT_NAMES: JobEvent['type'][] = [
   'job_started',
+  'run_started',
+  'run_completed',
+  'user_message',
   'phase_changed',
   'message_delta',
   'tool_started',
@@ -176,7 +179,7 @@ export function AgentDrawerProvider({
   );
 
   const startAction = useCallback(
-    (projectId: string, action: string, prompt?: string) => {
+    (projectId: string, action: string, prompt?: string, reportId?: string) => {
       setIsOpen(true);
       setView('chat');
       setStarting(true);
@@ -185,7 +188,7 @@ export function AgentDrawerProvider({
       setActiveAction(action);
       setChat(emptyChat('QUEUED'));
       agentApi
-        .start(projectId, action as AgentActionType, prompt)
+        .start(projectId, action as AgentActionType, prompt, reportId)
         .then(({ job }) => {
           setJobId(job.id);
           setChat((m) => ({ ...m, status: job.status }));
@@ -270,8 +273,31 @@ export function AgentDrawerProvider({
   }, [loadHistory]);
 
   const sendReply = useCallback(() => {
-    if (!reply.trim()) return;
-    const text = reply.trim();
+    const intent =
+      chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
+        ? 'confirm_discovery'
+        : chat.phase === 'AWAITING_MODEL_APPROVAL'
+          ? 'approve_model'
+          : 'chat';
+    const text =
+      reply.trim() ||
+      (intent === 'confirm_discovery'
+        ? '确认基础模型，按已说明的业务口径继续确定建模。'
+        : intent === 'approve_model'
+          ? '批准确定模型，开始编译报表。'
+          : '');
+    if (!text) return;
+    if (!jobId && !currentProjectId) {
+      setBanner('请先在左侧选择一个工作区');
+      return;
+    }
+    const projectId = currentProjectId;
+    const previousChat = chat;
+    const restoreAfterFailure = (error: unknown) => {
+      setChat(previousChat);
+      setReply(text);
+      setBanner(String((error as { message?: unknown })?.message ?? error));
+    };
     setReply('');
     setBanner(null);
     // Optimistically show the user's turn.
@@ -288,26 +314,22 @@ export function AgentDrawerProvider({
       // the stream immediately and leave the reply unanswered).
       const since = eventCountRef.current;
       agentApi
-        .reply(jobId, text)
+        .reply(jobId, text, intent)
         .then(() => subscribe(jobId, since))
-        .catch((e) => setBanner(String(e?.message ?? e)));
+        .catch(restoreAfterFailure);
       return;
     }
     // New free-chat: the first message starts the job.
-    if (!currentProjectId) {
-      setBanner('请先在左侧选择一个工作区');
-      return;
-    }
     setStarting(true);
     agentApi
-      .start(currentProjectId, 'free-chat' as AgentActionType, text)
+      .start(projectId!, 'free-chat' as AgentActionType, text)
       .then(({ job }) => {
         setJobId(job.id);
         subscribe(job.id);
       })
-      .catch((e) => setBanner(String(e?.message ?? e)))
+      .catch(restoreAfterFailure)
       .finally(() => setStarting(false));
-  }, [jobId, reply, subscribe, currentProjectId]);
+  }, [jobId, reply, subscribe, currentProjectId, chat]);
 
   // "终止" stops the current turn but keeps the conversation alive: the backend
   // settles the job to SUCCEEDED (resumable) and streams a job_completed, which
@@ -423,6 +445,9 @@ function DrawerView({
   // Reply is allowed whenever the task is idle (finished a turn / waiting), and
   // for a brand-new free-chat before its first message (hasJob is still false).
   const canType = view === 'chat' && (hasJob || isFreeChat) && !busy;
+  const approvalPhase =
+    chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ||
+    chat.phase === 'AWAITING_MODEL_APPROVAL';
   const statusKind = busy
     ? 'warning'
     : chat.status === 'FAILED'
@@ -511,13 +536,25 @@ function DrawerView({
         {chat.status === 'WAITING_FOR_USER' && chat.waitingQuestion && (
           <div className="chat-waiting">{chat.waitingQuestion}</div>
         )}
+        {approvalPhase && (
+          <div className="chat-waiting">
+            {chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
+              ? '请补充或确认基础模型；确认后将使用全新上下文进行确定建模。'
+              : '请审阅确定模型；批准后将使用全新上下文编译查询和脚本。'}
+            <button className="ide-btn ide-btn-primary ide-btn-sm" onClick={onSend}>
+              {chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ? '确认并确定建模' : '批准并开始编译'}
+            </button>
+          </div>
+        )}
         <div className="chat-input-row">
           <textarea
             className="ide-input chat-input"
             rows={2}
             placeholder={
               canType
-                ? '输入你的回复，Enter 发送、Shift+Enter 换行…'
+                ? approvalPhase
+                  ? '可填写补充口径；也可直接点击确认按钮…'
+                  : '输入你的回复，Enter 发送、Shift+Enter 换行…'
                 : busy
                   ? 'AI 正在处理，稍候…'
                   : '任务启动后可在此追问'
@@ -545,7 +582,7 @@ function DrawerView({
             <button
               className="ide-btn ide-btn-primary chat-send"
               onClick={onSend}
-              disabled={!canType || !reply.trim()}
+              disabled={!canType || (!reply.trim() && !approvalPhase)}
               title="发送"
             >
               <Send className="w-4 h-4" />

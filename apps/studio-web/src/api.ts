@@ -563,6 +563,8 @@ export interface AgentJob {
   agentProvider?: string;
   sessionId?: string;
   phase?: string;
+  reportId?: string;
+  currentRunId?: string;
   error?: string;
   checkpointId?: string;
   undoable?: boolean;
@@ -575,6 +577,9 @@ export interface AgentJob {
  */
 export type JobEventType =
   | 'job_started'
+  | 'run_started'
+  | 'run_completed'
+  | 'user_message'
   | 'phase_changed'
   | 'message_delta'
   | 'tool_started'
@@ -604,15 +609,23 @@ export const agentApi = {
   health: () => call<AgentHealth>('GET', '/api/easybi/agent-health'),
 
   /** Start an action; `prompt` is optional free text appended to the Skill template. */
-  start: (projectId: string, action: AgentActionType, prompt?: string) =>
+  start: (projectId: string, action: AgentActionType, prompt?: string, reportId?: string) =>
     call<{ job: AgentJob }>('POST', `/api/easybi/projects/${projectId}/agent-actions`, {
       action,
       ...(prompt ? { prompt } : {}),
+      ...(reportId ? { reportId } : {}),
     }),
 
   /** Resume a WAITING_FOR_USER task with the user's reply. */
-  reply: (taskId: string, reply: string) =>
-    call<{ accepted: boolean }>('POST', `/api/easybi/agent-tasks/${taskId}/messages`, { reply }),
+  reply: (
+    taskId: string,
+    reply: string,
+    intent: 'chat' | 'confirm_discovery' | 'approve_model' = 'chat',
+  ) =>
+    call<{ accepted: boolean }>('POST', `/api/easybi/agent-tasks/${taskId}/messages`, {
+      reply,
+      intent,
+    }),
 
   cancel: (taskId: string) =>
     call<{ canceled: boolean }>('POST', `/api/easybi/agent-tasks/${taskId}/cancel`),

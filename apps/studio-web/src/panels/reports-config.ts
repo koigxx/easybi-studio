@@ -206,7 +206,7 @@ export function buildScopedReportPrompt(
   const id = report.id.trim();
   const name = report.name.trim();
   const label = name && name !== id ? `${id}（${name}）` : id;
-  const scope = `\n\n本次仅为报表 ${label} 生成报表计划与报表包，忽略 config 中的其它 report_requirements；一次只生成这一个报表包。`;
+  const scope = `\n\n本次仅处理报表 ${label}，忽略 config 中的其它 report_requirements；当前首轮只执行基础建模并等待用户确认，不得提前生成 SQL、脚本或报表包。`;
   return `${basePrompt}${scope}`;
 }
 

@@ -48,6 +48,8 @@ export interface ChatModel {
    * (re)subscribing to the SSE stream so a resumed turn doesn't replay prior events.
    */
   eventCount: number;
+  /** Logical report workflow phase; provider session switches stay hidden. */
+  phase?: string;
 }
 
 export function emptyChat(status: AgentTaskStatus = 'QUEUED'): ChatModel {
@@ -86,6 +88,33 @@ function foldEvent(model: ChatModel, e: JobEvent): ChatModel {
       }
       return { ...model, status: 'RUNNING', lines: [...lines, { kind: 'assistant', text }] };
     }
+    case 'user_message': {
+      const text = str(e.payload, 'text') ?? '';
+      if (!text) return model;
+      const last = lines[lines.length - 1];
+      if (last?.kind === 'user' && last.text === text) return model;
+      return { ...model, lines: [...lines, { kind: 'user', text }] };
+    }
+    case 'phase_changed': {
+      const phase = str(e.payload, 'phase');
+      const label = str(e.payload, 'label');
+      const contextReset = e.payload?.contextReset === true;
+      if (!phase) return model;
+      const text = contextReset
+        ? `进入「${label ?? phase}」：已启动干净的 Agent 上下文。`
+        : label
+          ? `当前阶段：${label}`
+          : undefined;
+      return {
+        ...model,
+        phase,
+        lines: text ? [...lines, { kind: 'notice', text }] : lines,
+      };
+    }
+    case 'run_started':
+      return { ...model, status: 'RUNNING' };
+    case 'run_completed':
+      return model;
     case 'tool_started': {
       const tool = str(e.payload, 'tool') ?? '工具';
       const line: ChatToolLine = {
@@ -163,7 +192,6 @@ function foldEvent(model: ChatModel, e: JobEvent): ChatModel {
       };
     }
     case 'job_started':
-    case 'phase_changed':
     case 'artifact_changed':
     case 'change_summary_ready':
     default:

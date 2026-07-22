@@ -7,12 +7,55 @@ export declare function inspectReport(options: {
     out: string;
     version?: string;
 }): Promise<JsonRecord>;
+export declare function renderPlanReview(plan: JsonRecord): string;
+export declare function explainPlan(planPath: string): Promise<string>;
+export declare function buildKnowledgeContext(options: {
+    plan: string;
+    out: string;
+    include?: string[];
+    maxTables?: number;
+}): Promise<JsonRecord>;
+export declare function initializeReportModel(options: {
+    plan: string;
+    out: string;
+}): Promise<JsonRecord>;
+export declare function validateReportModelValue(model: JsonRecord, requireApproved?: boolean): string[];
+export declare function approveReportModel(modelPath: string, reviewedBy: string, planPathValue?: string): Promise<JsonRecord>;
+export declare function buildPhaseContext(options: {
+    phase: "discovery" | "modeling" | "query" | "script" | "repair";
+    plan: string;
+    out: string;
+    model?: string;
+    queryId?: string;
+    failure?: string;
+    queryOutputs?: string;
+}): Promise<JsonRecord>;
+type StagedArtifactPhase = "discovery" | "modeling" | "query" | "script";
+export declare function validateStagedArtifacts(options: {
+    phase: StagedArtifactPhase;
+    plan: string;
+    root: string;
+    requireApprovedModel?: boolean;
+    queryId?: string;
+}): Promise<JsonRecord>;
+export declare function approveStagedModel(options: {
+    plan: string;
+    root: string;
+    reviewedBy: string;
+}): Promise<JsonRecord>;
+export declare function finalizeStagedPackage(options: {
+    workspace: string;
+    plan: string;
+    root: string;
+    reviewedBy: string;
+}): Promise<JsonRecord>;
 export declare function configurePlan(planPathValue: string, configurationPathValue: string): Promise<JsonRecord>;
 export declare function approvePlan(planPath: string, reviewedBy: string): Promise<JsonRecord>;
 export declare function generatePackage(options: {
     workspace: string;
     plan: string;
     out?: string;
+    register?: boolean;
 }): Promise<string>;
 export declare function validatePackage(packageRootValue: string): Promise<{
     valid: boolean;

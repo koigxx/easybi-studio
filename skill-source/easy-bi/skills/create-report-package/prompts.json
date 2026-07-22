@@ -5,9 +5,9 @@
     {
       "action": "create-report",
       "label": "构建报表",
-      "hint": "按 report_requirements 生成报表计划与报表包",
+      "hint": "分阶段建模确认，再用干净上下文编译查询与报表脚本",
       "write": true,
-      "prompt": "阅读 skills/create-report-package/SKILL.md，根据 config/easy-bi.json 里的 knowledge.report_requirements 生成报表计划；仅在有阻塞或缺失业务逻辑时提出一个合并问题，批准后生成报表包并静态校验。严格遵循 SKILL.md 的审核门禁；使用 dist/scripts 下的确定性 CLI；数据库只读、禁止 DDL/DML；不要修改 /Users/admin/innos/easy-bi-workspace/easy-bi；涉及业务判断（报表计划、发布）时先输出待确认内容并停下等待用户确认，不要自行批准；不要把静态校验当作真实导出成功。"
+      "prompt": "阅读 skills/create-report-package/SKILL.md，只执行基础建模：运行 inspect、init-model 和 build-phase-context --phase discovery，并把草案写到 Studio 指定的 work/report-build/<report-id>/<revision>/discovery-model.json。仅梳理结果粒度、所需表字段、关系基数、指标去重键、时间/排除口径和推荐策略，提出一个合并确认问题；本阶段禁止生成 SQL、脚本或报表包。用户确认后 Studio 会启动全新 modeling Agent；确定模型批准后，script 策略按一个查询契约一个全新 query Agent 编译，再自动切换到全新 script Agent；sql/enrichment/group_queries 策略只复核 declarative-configuration.json 并直接生成 v2。所有阶段只能使用本次 revision 目录，最终由 finalize-staged 以候选包校验和原子发布完成装配、批准、组包和索引更新，Agent 不得手改 plan.script_report。跨阶段不得 resume、不得递归读取 knowledge、扫描样本、历史对话或失败脚本。缺模型字段时写结构化 failure 并停在当前阶段，不得静默扩展上下文。"
     }
   ]
 }

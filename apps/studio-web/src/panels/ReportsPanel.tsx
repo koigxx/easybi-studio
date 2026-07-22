@@ -95,7 +95,7 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
               projectId={project.id}
               actions={REPORT_ACTION_VERBS}
               selectedReport={selectedReport}
-              gateActions={['create-report']}
+              gateActions={['create-report', 'modify-report']}
             />
           </>
         }

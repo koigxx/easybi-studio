@@ -545,11 +545,12 @@ describe('buildScopedReportPrompt', () => {
     const out = buildScopedReportPrompt('生成报表包。', { id: 'gp', name: '毛利明细' });
     expect(out).toContain('生成报表包。');
     expect(out).toContain('gp（毛利明细）');
-    expect(out).toContain('一次只生成这一个报表包');
+    expect(out).toContain('当前首轮只执行基础建模');
+    expect(out).toContain('不得提前生成 SQL、脚本或报表包');
   });
 
   it('uses just the id when name equals id or is empty', () => {
-    expect(buildScopedReportPrompt('x', { id: 'gp', name: 'gp' })).toContain('报表 gp ');
-    expect(buildScopedReportPrompt('x', { id: 'gp', name: '' })).toContain('报表 gp ');
+    expect(buildScopedReportPrompt('x', { id: 'gp', name: 'gp' })).toContain('报表 gp，');
+    expect(buildScopedReportPrompt('x', { id: 'gp', name: '' })).toContain('报表 gp，');
   });
 });

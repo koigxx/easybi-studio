@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import type { Job, JobEvent } from '@easybi-studio/contracts';
+import type { AgentRun, Job, JobEvent } from '@easybi-studio/contracts';
 
 /**
  * Persist Job records to Studio SQLite (registration + task state only, plan §10.7).
@@ -23,6 +23,9 @@ interface JobRow {
   exit_code: number | null;
   checkpoint_id: string | null;
   undoable: number | null;
+  current_run_id: string | null;
+  report_id: string | null;
+  report_revision: string | null;
 }
 
 export class JobStore {
@@ -31,12 +34,13 @@ export class JobStore {
   upsert(job: Job): void {
     this.db
       .prepare(
-        `INSERT INTO jobs (id, project_id, type, status, agent_provider, session_id, phase,
+        `INSERT INTO jobs (id, project_id, type, status, agent_provider, session_id, phase, current_run_id, report_id, report_revision,
            created_at, started_at, finished_at, log_file, error, exit_code, checkpoint_id, undoable)
-         VALUES (@id, @project_id, @type, @status, @agent_provider, @session_id, @phase,
+         VALUES (@id, @project_id, @type, @status, @agent_provider, @session_id, @phase, @current_run_id, @report_id, @report_revision,
            @created_at, @started_at, @finished_at, @log_file, @error, @exit_code, @checkpoint_id, @undoable)
          ON CONFLICT(id) DO UPDATE SET
            status=excluded.status, session_id=excluded.session_id, phase=excluded.phase,
+           current_run_id=excluded.current_run_id, report_id=excluded.report_id, report_revision=excluded.report_revision,
            finished_at=excluded.finished_at, error=excluded.error, exit_code=excluded.exit_code,
            checkpoint_id=excluded.checkpoint_id, undoable=excluded.undoable`,
       )
@@ -48,6 +52,9 @@ export class JobStore {
         agent_provider: job.agentProvider ?? null,
         session_id: job.sessionId ?? null,
         phase: job.phase ?? null,
+        current_run_id: job.currentRunId ?? null,
+        report_id: job.reportId ?? null,
+        report_revision: job.reportRevision ?? null,
         created_at: job.createdAt,
         started_at: job.startedAt ?? null,
         finished_at: job.finishedAt ?? null,
@@ -77,10 +84,70 @@ export class JobStore {
   appendEvent(jobId: string, seq: number, event: JobEvent): void {
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO job_events (job_id, seq, type, at, payload_json)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO job_events (job_id, seq, type, at, payload_json, run_id, phase)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(jobId, seq, event.type, event.at, event.payload ? JSON.stringify(event.payload) : null);
+      .run(
+        jobId,
+        seq,
+        event.type,
+        event.at,
+        event.payload ? JSON.stringify(event.payload) : null,
+        typeof event.payload?.runId === 'string' ? event.payload.runId : null,
+        typeof event.payload?.phase === 'string' ? event.payload.phase : null,
+      );
+  }
+
+  upsertRun(run: AgentRun): void {
+    this.db.prepare(
+      `INSERT INTO agent_runs (id, conversation_id, phase, provider_task_id, provider_session_id,
+         context_mode, status, model_revision, model_hash, unit_id, report_revision, checkpoint_id, created_at, started_at, finished_at)
+       VALUES (@id, @conversation_id, @phase, @provider_task_id, @provider_session_id,
+         @context_mode, @status, @model_revision, @model_hash, @unit_id, @report_revision, @checkpoint_id, @created_at, @started_at, @finished_at)
+       ON CONFLICT(id) DO UPDATE SET provider_session_id=excluded.provider_session_id,
+         status=excluded.status, model_revision=excluded.model_revision, model_hash=excluded.model_hash,
+         unit_id=excluded.unit_id, report_revision=excluded.report_revision,
+         checkpoint_id=excluded.checkpoint_id, finished_at=excluded.finished_at`,
+    ).run({
+      id: run.id,
+      conversation_id: run.conversationId,
+      phase: run.phase ?? null,
+      provider_task_id: run.providerTaskId,
+      provider_session_id: run.providerSessionId ?? null,
+      context_mode: run.contextMode,
+      status: run.status,
+      model_revision: run.modelRevision ?? null,
+      model_hash: run.modelHash ?? null,
+      unit_id: run.unitId ?? null,
+      report_revision: run.reportRevision ?? null,
+      checkpoint_id: run.checkpointId ?? null,
+      created_at: run.createdAt,
+      started_at: run.startedAt ?? null,
+      finished_at: run.finishedAt ?? null,
+    });
+  }
+
+  listRuns(conversationId: string): AgentRun[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM agent_runs WHERE conversation_id = ? ORDER BY created_at ASC',
+    ).all(conversationId) as Array<Record<string, string | null>>;
+    return rows.map((row) => ({
+      id: String(row.id),
+      conversationId: String(row.conversation_id),
+      ...(row.phase ? { phase: row.phase as AgentRun['phase'] } : {}),
+      providerTaskId: String(row.provider_task_id),
+      ...(row.provider_session_id ? { providerSessionId: row.provider_session_id } : {}),
+      contextMode: row.context_mode as AgentRun['contextMode'],
+      status: row.status as AgentRun['status'],
+      ...(row.model_revision ? { modelRevision: row.model_revision } : {}),
+      ...(row.model_hash ? { modelHash: row.model_hash } : {}),
+      ...(row.unit_id ? { unitId: row.unit_id } : {}),
+      ...(row.report_revision ? { reportRevision: row.report_revision } : {}),
+      ...(row.checkpoint_id ? { checkpointId: row.checkpoint_id } : {}),
+      createdAt: String(row.created_at),
+      ...(row.started_at ? { startedAt: row.started_at } : {}),
+      ...(row.finished_at ? { finishedAt: row.finished_at } : {}),
+    }));
   }
 
   /** Delete a job and its conversation event log (cascade). */
@@ -88,6 +155,7 @@ export class JobStore {
     // job_events has ON DELETE CASCADE, but delete explicitly to be robust
     // regardless of PRAGMA foreign_keys state.
     this.db.prepare('DELETE FROM job_events WHERE job_id = ?').run(jobId);
+    this.db.prepare('DELETE FROM agent_runs WHERE conversation_id = ?').run(jobId);
     this.db.prepare('DELETE FROM jobs WHERE id = ?').run(jobId);
   }
 
@@ -115,6 +183,15 @@ export class JobStore {
    */
   reconcileOnStartup(): number {
     const now = new Date().toISOString();
+    // A provider process that was active before restart no longer exists. Keep
+    // the logical conversation resumable when it has a session, but close the
+    // historical run honestly instead of leaving a permanent RUNNING record.
+    this.db
+      .prepare(
+        `UPDATE agent_runs SET status='FAILED', finished_at=COALESCE(finished_at, ?)
+         WHERE status IN ('QUEUED','RUNNING','WAITING_FOR_USER')`,
+      )
+      .run(now);
     const resumable = this.db
       .prepare(
         `UPDATE jobs SET status='SUCCEEDED', finished_at=COALESCE(finished_at, ?)
@@ -141,7 +218,10 @@ function rowToJob(r: JobRow): Job {
   };
   if (r.agent_provider) job.agentProvider = r.agent_provider;
   if (r.session_id) job.sessionId = r.session_id;
-  if (r.phase) job.phase = r.phase;
+  if (r.phase) job.phase = r.phase as Job['phase'];
+  if (r.current_run_id) job.currentRunId = r.current_run_id;
+  if (r.report_id) job.reportId = r.report_id;
+  if (r.report_revision) job.reportRevision = r.report_revision;
   if (r.started_at) job.startedAt = r.started_at;
   if (r.finished_at) job.finishedAt = r.finished_at;
   if (r.error) job.error = r.error;

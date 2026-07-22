@@ -1,12 +1,12 @@
 {
   "name": "@easybi/create-report-package",
-  "version": "2.2.0",
+  "version": "2.26.5",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "@easybi/create-report-package",
-      "version": "2.2.0",
+      "version": "2.26.5",
       "bin": {
         "easybi-report-package": "dist/scripts/report-package-cli.js",
         "easybi-runtime": "dist/scripts/runtime-cli.js"

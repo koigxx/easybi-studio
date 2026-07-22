@@ -98,7 +98,7 @@ export function AgentQuickStart({
                       needsSelection && selectedReport
                         ? buildScopedReportPrompt(a.prompt, selectedReport)
                         : a.prompt;
-                    startAction(projectId, a.action, prompt);
+                    startAction(projectId, a.action, prompt, selectedReport?.id);
                   }}
                 >
                   <span className="aqi-title">

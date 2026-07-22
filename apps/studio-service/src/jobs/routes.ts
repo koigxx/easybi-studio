@@ -8,10 +8,14 @@ import { buildActionPrompt } from '../agent/prompts.js';
 interface AgentActionBody {
   action?: AgentActionType;
   prompt?: string;
+  reportId?: string;
 }
 
 interface ReplyBody {
   reply?: string;
+  intent?: 'chat' | 'confirm_discovery' | 'approve_model';
+  modelRevision?: string;
+  modelHash?: string;
 }
 
 export function registerJobRoutes(
@@ -33,6 +37,12 @@ export function registerJobRoutes(
       if (body.action === 'free-chat' && !body.prompt?.trim()) {
         return reply.code(400).send(fail(request.requestId, 'VALIDATION_FAILED', '自由对话需要输入内容'));
       }
+      if (
+        (body.action === 'create-report' || body.action === 'modify-report') &&
+        !body.reportId?.trim()
+      ) {
+        return reply.code(400).send(fail(request.requestId, 'VALIDATION_FAILED', '分阶段报表任务缺少 reportId'));
+      }
       try {
         // For free-chat the prompt is the user's verbatim message; for a preset
         // action it is the (possibly workspace-customized) full prompt that
@@ -46,11 +56,15 @@ export function registerJobRoutes(
           workspaceRoot: project.workspaceRoot,
           action: body.action,
           prompt: promptText,
+          ...(body.reportId?.trim() ? { reportId: body.reportId.trim() } : {}),
         });
         return reply.code(201).send(ok(request.requestId, { job }));
       } catch (err) {
         if (err instanceof WriteTaskConflictError) {
           return reply.code(409).send(fail(request.requestId, err.code, err.message));
+        }
+        if (body.action === 'create-report' || body.action === 'modify-report') {
+          return reply.code(400).send(fail(request.requestId, 'REPORT_WORKFLOW_UNAVAILABLE', String((err as Error).message)));
         }
         throw err;
       }
@@ -62,7 +76,7 @@ export function registerJobRoutes(
     async (request, reply) => {
       const job = jobs.getJob(request.params.taskId);
       if (!job) return reply.code(404).send(fail(request.requestId, 'NOT_FOUND', '任务不存在'));
-      return ok(request.requestId, { job, events: jobs.getEvents(job.id) });
+      return ok(request.requestId, { job, events: jobs.getEvents(job.id), runs: store.listRuns(job.id) });
     },
   );
 
@@ -80,7 +94,7 @@ export function registerJobRoutes(
       }
       const job = jobs.reopenJob(request.params.taskId, project.workspaceRoot);
       if (!job) return reply.code(404).send(fail(request.requestId, 'NOT_FOUND', '任务不存在'));
-      return ok(request.requestId, { job, events: jobs.getEvents(job.id) });
+      return ok(request.requestId, { job, events: jobs.getEvents(job.id), runs: store.listRuns(job.id) });
     },
   );
 
@@ -100,6 +114,29 @@ export function registerJobRoutes(
       const project = service.get(persisted.projectId);
       if (project) jobs.reopenJob(request.params.taskId, project.workspaceRoot);
       try {
+        if (body.intent === 'confirm_discovery') {
+          const run = await jobs.startFreshPhase({
+            jobId: request.params.taskId,
+            phase: 'MODELING',
+            userMessage: body.reply,
+            ...(body.modelRevision ? { modelRevision: body.modelRevision } : {}),
+            ...(body.modelHash ? { modelHash: body.modelHash } : {}),
+          });
+          return ok(request.requestId, { accepted: true, run });
+        }
+        if (body.intent === 'approve_model') {
+          const reviewerHeader = request.headers['x-easybi-user'];
+          const reviewedBy = (Array.isArray(reviewerHeader) ? reviewerHeader[0] : reviewerHeader)?.trim() || 'local-user';
+          const run = await jobs.startFreshPhase({
+            jobId: request.params.taskId,
+            phase: 'QUERY_COMPILATION',
+            userMessage: body.reply,
+            reviewedBy,
+            ...(body.modelRevision ? { modelRevision: body.modelRevision } : {}),
+            ...(body.modelHash ? { modelHash: body.modelHash } : {}),
+          });
+          return ok(request.requestId, { accepted: true, run });
+        }
         await jobs.replyToJob(request.params.taskId, body.reply);
         return ok(request.requestId, { accepted: true });
       } catch (err) {

@@ -92,6 +92,45 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id, seq);
     `,
   },
+  {
+    id: '0004_agent_runs',
+    up: `
+      ALTER TABLE jobs ADD COLUMN current_run_id TEXT;
+      ALTER TABLE job_events ADD COLUMN run_id TEXT;
+      ALTER TABLE job_events ADD COLUMN phase TEXT;
+
+      CREATE TABLE IF NOT EXISTS agent_runs (
+        id                  TEXT PRIMARY KEY,
+        conversation_id     TEXT NOT NULL,
+        phase               TEXT,
+        provider_task_id    TEXT NOT NULL,
+        provider_session_id TEXT,
+        context_mode        TEXT NOT NULL,
+        status              TEXT NOT NULL,
+        model_revision      TEXT,
+        model_hash          TEXT,
+        checkpoint_id       TEXT,
+        created_at          TEXT NOT NULL,
+        started_at          TEXT,
+        finished_at         TEXT,
+        FOREIGN KEY (conversation_id) REFERENCES jobs(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_agent_runs_conversation
+        ON agent_runs(conversation_id, created_at);
+    `,
+  },
+  {
+    id: '0005_job_report_scope',
+    up: `ALTER TABLE jobs ADD COLUMN report_id TEXT;`,
+  },
+  {
+    id: '0006_report_build_revisions',
+    up: `
+      ALTER TABLE jobs ADD COLUMN report_revision TEXT;
+      ALTER TABLE agent_runs ADD COLUMN unit_id TEXT;
+      ALTER TABLE agent_runs ADD COLUMN report_revision TEXT;
+    `,
+  },
 ];
 
 export function runMigrations(db: Database.Database): void {

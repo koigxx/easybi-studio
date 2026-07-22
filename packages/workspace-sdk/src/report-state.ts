@@ -178,7 +178,13 @@ const EDITABLE_PACKAGE_FILES = new Set([
   'transforms/index.ts',
   'transforms/index.mjs',
   'tests/cases.json',
+  'scripts/report.ts',
+  'scripts/report.mjs',
 ]);
+
+function isEditablePackageFile(path: string): boolean {
+  return EDITABLE_PACKAGE_FILES.has(path) || /^queries\/[a-z0-9_-]+\.sql$/.test(path);
+}
 
 export interface ReportPackageFile {
   /** Package-relative path, e.g. "queries/main.sql". */
@@ -270,16 +276,19 @@ export async function readReportPackageDetail(
   // When a TS transform source exists, its compiled `.mjs` is a generated
   // artifact — surface it read-only so the editor steers edits to `index.ts`.
   const hasTsTransform = listed.includes('transforms/index.ts');
+  const hasTsScript = listed.includes('scripts/report.ts');
   const files = listed.map((p) => ({
     // A file is editable only if the package is editable AND it's whitelisted,
     // and it's not the auto-generated `.mjs` (when a `.ts` source is present).
     path: p,
     editable:
       editable &&
-      EDITABLE_PACKAGE_FILES.has(p) &&
-      !(p === 'transforms/index.mjs' && hasTsTransform),
+      isEditablePackageFile(p) &&
+      !(p === 'transforms/index.mjs' && hasTsTransform) &&
+      !(p === 'scripts/report.mjs' && hasTsScript),
     // Generated artifacts are shown but explained as auto-produced (read-only).
     ...(p === 'transforms/index.mjs' && hasTsTransform ? { generated: true } : {}),
+    ...(p === 'scripts/report.mjs' && hasTsScript ? { generated: true } : {}),
   }));
   return {
     id,
@@ -306,7 +315,7 @@ export async function readReportPackageFile(
   try {
     const content = await readFile(target, 'utf8');
     const relPath = relative(abs, target).split('\\').join('/');
-    return { path: relPath, content, editable: EDITABLE_PACKAGE_FILES.has(relPath) };
+    return { path: relPath, content, editable: isEditablePackageFile(relPath) };
   } catch {
     throw new ReportPackageError('NOT_FOUND', `文件不存在：${filePath}`);
   }
@@ -331,7 +340,7 @@ export async function writeReportPackageFile(
     throw new ReportPackageError('PROTECTED', '已发布/生产报表包不可编辑，请另存新版本');
   }
   const normalized = filePath.split('\\').join('/');
-  if (!EDITABLE_PACKAGE_FILES.has(normalized)) {
+  if (!isEditablePackageFile(normalized)) {
     throw new ReportPackageError('INVALID', `该文件不可编辑：${filePath}`);
   }
   // `transforms/index.mjs` is a generated artifact: it's derived from
@@ -340,13 +349,16 @@ export async function writeReportPackageFile(
   // (older/hand-authored packages have no `.ts`), fall through and allow it.
   const tsRel = 'transforms/index.ts';
   const mjsRel = 'transforms/index.mjs';
-  if (normalized === mjsRel) {
-    const tsAbs = resolveWithinWorkspace(root, join(relative(root, abs), tsRel));
+  const scriptTsRel = 'scripts/report.ts';
+  const scriptMjsRel = 'scripts/report.mjs';
+  if (normalized === mjsRel || normalized === scriptMjsRel) {
+    const sourceRel = normalized === mjsRel ? tsRel : scriptTsRel;
+    const tsAbs = resolveWithinWorkspace(root, join(relative(root, abs), sourceRel));
     const hasTs = await stat(tsAbs).then(() => true).catch(() => false);
     if (hasTs) {
       throw new ReportPackageError(
         'PROTECTED',
-        'transforms/index.mjs 由 transforms/index.ts 自动生成，请改 index.ts（保存时会自动生成 index.mjs）',
+        `${normalized} 由 ${sourceRel} 自动生成，请修改源文件（保存时会自动生成 mjs）`,
       );
     }
   }
@@ -372,6 +384,20 @@ export async function writeReportPackageFile(
         throw new ReportPackageError(
           'INVALID',
           `transforms/index.ts 语法错误，无法生成 index.mjs：${(err as Error).message}`,
+        );
+      }
+    }
+  }
+  if (normalized === scriptTsRel) {
+    const mjsAbs = resolveWithinWorkspace(root, join(relative(root, abs), scriptMjsRel));
+    if (mjsAbs.startsWith(abs)) {
+      try {
+        await writeFile(mjsAbs, transpileTransformSource(content), 'utf8');
+        generated.push(scriptMjsRel);
+      } catch (err) {
+        throw new ReportPackageError(
+          'INVALID',
+          `scripts/report.ts 语法错误，无法生成 report.mjs：${(err as Error).message}`,
         );
       }
     }

@@ -71,6 +71,24 @@ describe('agent-chat reducer', () => {
     expect(m.lines).toHaveLength(0);
   });
 
+  it('keeps one chat while a fresh report phase adds a visible boundary', () => {
+    let m = emptyChat('SUCCEEDED');
+    m = reduceEvent(m, ev('phase_changed', {
+      phase: 'MODELING',
+      label: '确定建模',
+      contextReset: true,
+      runId: 'run-2',
+    }));
+    m = reduceEvent(m, ev('run_started', { phase: 'MODELING', runId: 'run-2' }));
+    m = reduceEvent(m, ev('user_message', { text: '确认关系' }));
+    expect(m.phase).toBe('MODELING');
+    expect(m.status).toBe('RUNNING');
+    expect(m.lines).toEqual([
+      { kind: 'notice', text: '进入「确定建模」：已启动干净的 Agent 上下文。' },
+      { kind: 'user', text: '确认关系' },
+    ]);
+  });
+
   it('completes with summary and clears waiting', () => {
     let m: ChatModel = { ...emptyChat('WAITING_FOR_USER'), waitingQuestion: 'q' };
     m = reduceEvent(m, ev('job_completed', { summary: '生成了 3 张表' }));
@@ -129,7 +147,7 @@ describe('agent-chat reducer', () => {
     expect(m.lines.at(-1)).toEqual({ kind: 'notice', text: '失败：连接超时' });
   });
 
-  it('ignores non-visual events (job_started/phase_changed)', () => {
+  it('ignores job_started and provider-only phase_changed events', () => {
     let m = emptyChat();
     m = reduceEvents(m, [ev('job_started'), ev('phase_changed', { sessionId: 's1' })]);
     expect(m.lines).toHaveLength(0);

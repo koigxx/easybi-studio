@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 import ExcelJS from "exceljs";
 import mysql from "mysql2";
 import { FLAG_OPERATOR_SYMBOLS, hasSkeletonInjection, hasUnsafeSqlExpression, isBareQuotedColumnRef, isValidExistsSkeleton, } from "./sql-guard.js";
+import { runScriptIsolated, ScriptExecutionError, } from "./script-runtime.js";
 export class RuntimeError extends Error {
     code;
     details;
@@ -76,10 +77,26 @@ export async function loadReportPackage(workspaceValue, reportId, reportVersion)
     const root = join(workspace, "reports", String(entry.path));
     const manifest = await readJson(join(root, "report.manifest.json"));
     const packageFormat = String(manifest.report_package_format_version ?? "");
-    if (packageFormat !== "2") {
+    if (packageFormat !== "2" && packageFormat !== "3") {
         throw new RuntimeError("UNSUPPORTED_REPORT_PACKAGE_FORMAT", `Runtime 不支持报表包格式 ${packageFormat}`);
     }
     const entrypoints = manifest.entrypoints ?? {};
+    if (packageFormat === "3") {
+        return {
+            root,
+            manifest,
+            fields: await readJson(join(root, entrypoints.fields ?? "fields.json")),
+            parameters: await readJson(join(root, entrypoints.parameters ?? "parameters.schema.json")),
+            bindings: {},
+            knowledgeLock: await readJson(join(root, entrypoints.knowledge_lock ?? "knowledge.lock.json")),
+            sql: "",
+            script: await readFile(join(root, entrypoints.script ?? "scripts/report.mjs"), "utf8"),
+            scriptQueries: manifest.queries ?? [],
+            enums: entrypoints.enums
+                ? await readJson(join(root, String(entrypoints.enums))).catch(() => null)
+                : null,
+        };
+    }
     return {
         root,
         manifest,
@@ -916,6 +933,191 @@ async function createQueryAdapter(dialect, profile, database) {
         ? createPostgresAdapter(profile, database)
         : createMysqlAdapter(profile, database);
 }
+class AsyncRowQueue {
+    capacity;
+    rows = [];
+    readers = [];
+    writers = [];
+    ended = false;
+    failure = null;
+    constructor(capacity = 256) {
+        this.capacity = capacity;
+    }
+    async push(row) {
+        if (this.failure)
+            throw this.failure;
+        if (this.ended)
+            throw new RuntimeError("SCRIPT_CANCELED", "脚本输出流已关闭");
+        const reader = this.readers.shift();
+        if (reader) {
+            reader.resolve({ value: row, done: false });
+            return;
+        }
+        while (this.rows.length >= this.capacity && !this.ended && !this.failure) {
+            await new Promise((resolvePromise) => this.writers.push(resolvePromise));
+        }
+        if (this.failure)
+            throw this.failure;
+        if (this.ended)
+            throw new RuntimeError("SCRIPT_CANCELED", "脚本输出流已关闭");
+        this.rows.push(row);
+    }
+    end() {
+        this.ended = true;
+        for (const reader of this.readers.splice(0))
+            reader.resolve({ value: undefined, done: true });
+        for (const writer of this.writers.splice(0))
+            writer();
+    }
+    fail(error) {
+        this.failure = error;
+        for (const reader of this.readers.splice(0))
+            reader.reject(error);
+        for (const writer of this.writers.splice(0))
+            writer();
+    }
+    [Symbol.asyncIterator]() {
+        return {
+            next: async () => {
+                if (this.rows.length) {
+                    const value = this.rows.shift();
+                    this.writers.shift()?.();
+                    return { value, done: false };
+                }
+                if (this.failure)
+                    throw this.failure;
+                if (this.ended)
+                    return { value: undefined, done: true };
+                return new Promise((resolvePromise, rejectPromise) => {
+                    this.readers.push({ resolve: resolvePromise, reject: rejectPromise });
+                });
+            },
+            return: async () => {
+                this.end();
+                return { value: undefined, done: true };
+            },
+        };
+    }
+}
+function throwIfAborted(signal) {
+    if (signal?.aborted)
+        throw new RuntimeError("REQUEST_CANCELED", "报表执行已取消");
+}
+async function createScriptRows(options) {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    options.signal?.addEventListener("abort", abort, { once: true });
+    throwIfAborted(options.signal);
+    const queue = new AsyncRowQueue(256);
+    const appConfig = await readJson(join(options.workspace, "config", "easy-bi.json"));
+    const activeAdapters = new Set();
+    controller.signal.addEventListener("abort", () => {
+        for (const adapter of activeAdapters)
+            void adapter.close().catch(() => undefined);
+    }, { once: true });
+    const queryById = new Map((options.report.scriptQueries ?? []).map((query) => [String(query.id), query]));
+    const resolveQuery = async (id, expectedMode) => {
+        throwIfAborted(controller.signal);
+        const definition = queryById.get(id);
+        if (!definition)
+            throw new RuntimeError("SCRIPT_QUERY_NOT_FOUND", `脚本查询不存在：${id}`);
+        if (definition.mode !== expectedMode) {
+            throw new RuntimeError("SCRIPT_QUERY_MODE_MISMATCH", `脚本查询 ${id} 声明为 ${definition.mode}，不能通过 ${expectedMode} 调用`);
+        }
+        const profile = appConfig.connections?.database_profiles?.find((candidate) => candidate.id === definition.profile_id);
+        if (!profile)
+            throw new RuntimeError("DATABASE_PROFILE_NOT_FOUND", `未找到数据库连接：${definition.profile_id}`);
+        const sqlPath = String(definition.sql ?? "");
+        if (!/^queries\/[a-z0-9_-]+\.sql$/.test(sqlPath)) {
+            throw new RuntimeError("INVALID_SCRIPT_QUERY_PATH", `脚本查询路径无效：${sqlPath}`);
+        }
+        return {
+            definition,
+            sql: await readFile(join(options.report.root, sqlPath), "utf8"),
+            profile,
+            dialect: runtimeDialect(profile.connector_id ?? options.report.manifest.sql_dialect ?? "mysql"),
+        };
+    };
+    const handlers = {
+        async queryStream(queryId, values) {
+            const resolved = await resolveQuery(queryId, "stream");
+            const adapter = await createQueryAdapter(resolved.dialect, resolved.profile, String(resolved.definition.database));
+            activeAdapters.add(adapter);
+            await adapter.beginReadOnly();
+            const source = await adapter.rows(resolved.sql, values, Number(options.policy.query_timeout_seconds ?? 600) * 1000);
+            return (async function* () {
+                try {
+                    for await (const row of source) {
+                        throwIfAborted(controller.signal);
+                        yield row;
+                    }
+                    await adapter.rollback();
+                }
+                finally {
+                    activeAdapters.delete(adapter);
+                    await adapter.close().catch(() => undefined);
+                }
+            })();
+        },
+        async loadIndex(queryId, values) {
+            const resolved = await resolveQuery(queryId, "index");
+            const adapter = await createQueryAdapter(resolved.dialect, resolved.profile, String(resolved.definition.database));
+            activeAdapters.add(adapter);
+            try {
+                await adapter.beginReadOnly();
+                const rows = await adapter.queryAll(resolved.sql, values, Number(options.policy.query_timeout_seconds ?? 600) * 1000);
+                await adapter.rollback();
+                return rows;
+            }
+            finally {
+                activeAdapters.delete(adapter);
+                await adapter.close().catch(() => undefined);
+            }
+        },
+        async batchLookup(queryId, keys, values) {
+            const resolved = await resolveQuery(queryId, "batch");
+            const placeholders = Array.from({ length: Math.max(1, keys.length) }, () => "?").join(", ");
+            const sql = resolved.sql.replace(/\/\*\s*KEYS\s*\*\//, placeholders);
+            const adapter = await createQueryAdapter(resolved.dialect, resolved.profile, String(resolved.definition.database));
+            activeAdapters.add(adapter);
+            try {
+                await adapter.beginReadOnly();
+                const rows = await adapter.queryAll(sql, [...keys, ...values], Number(options.policy.query_timeout_seconds ?? 600) * 1000);
+                await adapter.rollback();
+                return rows;
+            }
+            finally {
+                activeAdapters.delete(adapter);
+                await adapter.close().catch(() => undefined);
+            }
+        },
+    };
+    const declaredBudget = options.report.manifest.resource_budget ?? {};
+    const ceiling = options.policy.script_budget_ceiling ?? {};
+    const effectiveBudget = Object.fromEntries(Object.entries(declaredBudget).map(([name, value]) => [
+        name,
+        ceiling[name] == null ? value : Math.min(Number(value), Number(ceiling[name])),
+    ]));
+    const completion = runScriptIsolated({
+        scriptPath: join(options.report.root, String(options.report.manifest.entrypoints?.script ?? "scripts/report.mjs")),
+        filters: options.filters,
+        context: options.context,
+        budget: effectiveBudget,
+        handlers,
+        onEmit: (row) => queue.push(row),
+        signal: controller.signal,
+    }).then((result) => {
+        queue.end();
+        return result;
+    }, (error) => {
+        const mapped = error instanceof ScriptExecutionError
+            ? new RuntimeError(error.code, error.message)
+            : error instanceof Error ? error : new Error(String(error));
+        queue.fail(mapped);
+        throw mapped;
+    }).finally(() => options.signal?.removeEventListener("abort", abort));
+    return { rows: queue, completion, cancel: () => controller.abort() };
+}
 function safeFileName(value) {
     return value.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 160);
 }
@@ -1142,7 +1344,10 @@ async function* arrayToAsyncIterable(rows) {
     for (const row of rows)
         yield row;
 }
-export async function runGroupQueriesMerged(adapter, main, groupQueries, queryTimeoutMs, numericFieldIds) {
+export async function runGroupQueriesMerged(adapter, main, groupQueries, queryTimeoutMs, numericFieldIds, maxMergedGroups = 100000) {
+    if (!Number.isInteger(maxMergedGroups) || maxMergedGroups < 1) {
+        throw new RuntimeError("INVALID_RUNTIME_POLICY", "max_merged_groups 必须是正整数");
+    }
     const { mergeKeys } = groupQueries;
     const keyOf = (row) => JSON.stringify(mergeKeys.map((k) => row[k] ?? null));
     const merged = new Map();
@@ -1152,6 +1357,9 @@ export async function runGroupQueriesMerged(adapter, main, groupQueries, queryTi
             const key = keyOf(row);
             let target = merged.get(key);
             if (!target) {
+                if (merged.size >= maxMergedGroups) {
+                    throw new RuntimeError("GROUP_QUERY_LIMIT_EXCEEDED", `多查询分组结果超过上限 ${maxMergedGroups}，请缩小筛选范围或提高 max_merged_groups`);
+                }
                 target = {};
                 // Seed the merge-key columns so every merged row carries the dimension.
                 for (const k of mergeKeys)
@@ -1335,6 +1543,97 @@ export async function collectRows(report, rows, transform, options) {
     }
     return { rows: out, rowCount: out.length, truncated };
 }
+async function queryScriptSync(workspaceValue, request, options = {}) {
+    const startedAt = Date.now();
+    const { workspace, config } = await loadRuntimeContext(workspaceValue);
+    const report = await loadReportPackage(workspace, request.reportId, request.reportVersion);
+    const policy = options.policy ?? config.execution_strategy?.sync;
+    if (!policy?.enabled)
+        throw new RuntimeError("SYNC_DISABLED", "同步查询/导出未启用");
+    const policyMax = Number(policy.preview_max_rows ?? 1000);
+    const requested = Number.isFinite(Number(request.limit)) ? Number(request.limit) : policyMax;
+    const maxRows = Math.max(1, Math.min(policyMax, requested > 0 ? requested : policyMax));
+    const context = { ...(request.context ?? {}) };
+    if (!isEmpty(request.tenantId) && isEmpty(context.tenantId))
+        context.tenantId = request.tenantId;
+    const execution = await createScriptRows({
+        workspace,
+        report,
+        filters: request.filters ?? {},
+        context,
+        policy,
+        signal: options.signal,
+    });
+    const collected = await collectRows(report, execution.rows, identityTransform, {
+        maxRows,
+        startedAt,
+        totalTimeoutSeconds: Math.min(Number(policy.total_timeout_seconds ?? 900), Number(report.manifest.resource_budget?.timeout_seconds ?? 300)),
+    });
+    if (collected.truncated) {
+        execution.cancel();
+        await execution.completion.catch(() => undefined);
+    }
+    else {
+        await execution.completion;
+    }
+    return {
+        reportId: report.manifest.id,
+        reportName: report.manifest.name,
+        reportVersion: report.manifest.version,
+        columns: outputColumns(report),
+        rows: collected.rows,
+        rowCount: collected.rowCount,
+        truncated: collected.truncated,
+        limit: maxRows,
+        totalDurationMs: Date.now() - startedAt,
+        executionModel: "isolated_script",
+    };
+}
+async function exportScriptSync(workspaceValue, request, options = {}) {
+    const startedAt = Date.now();
+    const { workspace, config } = await loadRuntimeContext(workspaceValue);
+    const report = await loadReportPackage(workspace, request.reportId, request.reportVersion);
+    const policy = options.policy ?? config.execution_strategy?.sync;
+    if (!policy?.enabled)
+        throw new RuntimeError("SYNC_DISABLED", "同步查询/导出未启用");
+    const outputDirectory = relativeToWorkspace(workspace, config.storage?.local_output_directory ?? "outputs/files");
+    await mkdir(outputDirectory, { recursive: true });
+    const output = resolve(options.output ?? join(outputDirectory, safeFileName(`${report.manifest.name}_${timestamp()}.xlsx`)));
+    await mkdir(dirname(output), { recursive: true });
+    const context = { ...(request.context ?? {}) };
+    if (!isEmpty(request.tenantId) && isEmpty(context.tenantId))
+        context.tenantId = request.tenantId;
+    const execution = await createScriptRows({
+        workspace,
+        report,
+        filters: request.filters ?? {},
+        context,
+        policy,
+        signal: options.signal,
+    });
+    try {
+        const written = await writeWorkbookRows(report, execution.rows, output, policy, identityTransform, startedAt);
+        const executionStats = await execution.completion;
+        return {
+            reportId: report.manifest.id,
+            reportVersion: report.manifest.version,
+            filePath: output,
+            fileName: basename(output),
+            rowCount: written.rowCount,
+            sheetCount: written.sheetCount,
+            fileBytes: written.fileBytes,
+            totalDurationMs: Date.now() - startedAt,
+            executionModel: "isolated_script",
+            scriptStats: executionStats,
+        };
+    }
+    catch (error) {
+        execution.cancel();
+        await execution.completion.catch(() => undefined);
+        await unlink(output).catch(() => undefined);
+        throw error;
+    }
+}
 /**
  * Synchronous JSON query: runs the report's query/filters/transform exactly like
  * `exportSync` but returns the 中文 column headers and data rows as JSON instead
@@ -1342,6 +1641,10 @@ export async function collectRows(report, rows, transform, options) {
  * Studio 测试页 data preview.
  */
 export async function querySync(workspaceValue, request, options = {}) {
+    const candidate = await loadReportPackage(workspaceValue, request.reportId, request.reportVersion);
+    if (String(candidate.manifest.report_package_format_version) === "3") {
+        return queryScriptSync(workspaceValue, request, options);
+    }
     const startedAt = Date.now();
     const prepared = await prepareSyncQuery(workspaceValue, request, options);
     const { report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments, groupQueries } = prepared;
@@ -1378,7 +1681,7 @@ export async function querySync(workspaceValue, request, options = {}) {
             const numericFieldIds = new Set((report.fields.fields ?? [])
                 .filter((f) => f.value_type === "number")
                 .map((f) => String(f.id)));
-            const mergedRows = await runGroupQueriesMerged(adapter, compiled, groupQueries, queryTimeoutMs, numericFieldIds);
+            const mergedRows = await runGroupQueriesMerged(adapter, compiled, groupQueries, queryTimeoutMs, numericFieldIds, Number(policy.max_merged_groups ?? 100000));
             rowStream = arrayToAsyncIterable(mergedRows);
         }
         else {
@@ -1427,6 +1730,10 @@ export async function querySync(workspaceValue, request, options = {}) {
     }
 }
 export async function exportSync(workspaceValue, request, options = {}) {
+    const candidate = await loadReportPackage(workspaceValue, request.reportId, request.reportVersion);
+    if (String(candidate.manifest.report_package_format_version) === "3") {
+        return exportScriptSync(workspaceValue, request, options);
+    }
     const startedAt = Date.now();
     const prepared = await prepareSyncQuery(workspaceValue, request, options);
     const { workspace, config, report, policy, source, profile, dialect, compiled, transform, postFilter, enrichments, groupQueries } = prepared;
@@ -1450,7 +1757,7 @@ export async function exportSync(workspaceValue, request, options = {}) {
             const numericFieldIds = new Set((report.fields.fields ?? [])
                 .filter((f) => f.value_type === "number")
                 .map((f) => String(f.id)));
-            const mergedRows = await runGroupQueriesMerged(adapter, compiled, groupQueries, queryTimeoutMs, numericFieldIds);
+            const mergedRows = await runGroupQueriesMerged(adapter, compiled, groupQueries, queryTimeoutMs, numericFieldIds, Number(policy.max_merged_groups ?? 100000));
             rowStream = arrayToAsyncIterable(mergedRows);
         }
         else {
@@ -1596,7 +1903,6 @@ function taskDatabase(workspace, config) {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
-    UPDATE runtime_tasks SET status = 'QUEUED' WHERE status = 'RUNNING';
   `);
     return database;
 }
@@ -1657,7 +1963,7 @@ async function uploadOss(config, filePath) {
         expires: Number(config.signed_url_expires_seconds ?? 86400),
     });
 }
-async function processOneTask(context) {
+async function processOneTask(context, activeTasks) {
     const database = taskDatabase(context.workspace, context.config);
     let task;
     try {
@@ -1685,6 +1991,8 @@ async function processOneTask(context) {
         database.close();
     }
     const request = JSON.parse(task.request_json);
+    const controller = new AbortController();
+    activeTasks.set(String(task.id), controller);
     let generatedFile;
     try {
         const exported = await exportSync(context.workspace, request, {
@@ -1694,6 +2002,7 @@ async function processOneTask(context) {
                 query_timeout_seconds: context.config.execution_strategy.async.query_timeout_seconds,
                 total_timeout_seconds: context.config.execution_strategy.async.query_timeout_seconds + 300,
             },
+            signal: controller.signal,
         });
         generatedFile = exported.filePath;
         const fileUrl = await uploadOss(context.config.aliyun_oss, exported.filePath);
@@ -1712,23 +2021,32 @@ async function processOneTask(context) {
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        const stateDb = taskDatabase(context.workspace, context.config);
+        const current = stateDb.prepare("SELECT status FROM runtime_tasks WHERE id=?").get(task.id);
+        stateDb.close();
+        const canceled = current?.status === "CANCELED" || controller.signal.aborted;
         try {
             await callBusiness(context.config.business_task_integration, context.config.business_task_integration.update_task, {
                 taskId: task.business_task_id,
                 reportId: request.reportId,
                 tenantId: request.tenantId ?? request.context?.tenantId ?? null,
-                status: "FAILED",
+                status: canceled ? "CANCELED" : "FAILED",
                 errorMessage: message,
             }, task.business_task_id);
         }
+        catch {
+            // Internal cancellation/failure state remains authoritative when the
+            // optional business-task endpoint does not understand CANCELED.
+        }
         finally {
             const failed = taskDatabase(context.workspace, context.config);
-            failed.prepare("UPDATE runtime_tasks SET status='FAILED',last_error=?,updated_at=? WHERE id=?")
-                .run(message, new Date().toISOString(), task.id);
+            failed.prepare("UPDATE runtime_tasks SET status=?,last_error=?,updated_at=? WHERE id=?")
+                .run(canceled ? "CANCELED" : "FAILED", message, new Date().toISOString(), task.id);
             failed.close();
         }
     }
     finally {
+        activeTasks.delete(String(task.id));
         if (generatedFile)
             await unlink(generatedFile).catch(() => undefined);
     }
@@ -1736,14 +2054,20 @@ async function processOneTask(context) {
 }
 export async function createRuntimeServer(workspaceValue) {
     const context = await loadRuntimeContext(workspaceValue);
+    const recoveryDatabase = taskDatabase(context.workspace, context.config);
+    recoveryDatabase.prepare("UPDATE runtime_tasks SET status='QUEUED',updated_at=? WHERE status='RUNNING'")
+        .run(new Date().toISOString());
+    recoveryDatabase.close();
     let stopping = false;
+    const activeRequests = new Map();
+    const activeTasks = new Map();
     const workerTimers = new Set();
     const worker = async () => {
         if (stopping)
             return;
         try {
             if (context.config.execution_strategy?.async?.enabled) {
-                await processOneTask(context);
+                await processOneTask(context, activeTasks);
             }
         }
         catch (error) {
@@ -1763,6 +2087,33 @@ export async function createRuntimeServer(workspaceValue) {
         const requestId = String(request.headers["x-request-id"] ?? "").trim() || randomUUID();
         try {
             const url = new URL(request.url ?? "/", "http://easybi.local");
+            const cancelMatch = url.pathname.match(/^\/api\/v1\/executions\/([^/]+)$/);
+            if (request.method === "DELETE" && cancelMatch) {
+                const targetRequestId = decodeURIComponent(cancelMatch[1]);
+                const controller = activeRequests.get(targetRequestId);
+                if (!controller) {
+                    throw new RuntimeError("EXECUTION_NOT_FOUND", `未找到运行中的执行：${targetRequestId}`);
+                }
+                controller.abort();
+                jsonResponse(response, success(requestId, { canceled: true, requestId: targetRequestId }));
+                return;
+            }
+            const cancelTaskMatch = url.pathname.match(/^\/api\/v1\/tasks\/([^/]+)$/);
+            if (request.method === "DELETE" && cancelTaskMatch) {
+                const taskId = decodeURIComponent(cancelTaskMatch[1]);
+                const database = taskDatabase(context.workspace, context.config);
+                const task = database.prepare("SELECT status FROM runtime_tasks WHERE id=?").get(taskId);
+                if (!task || !["QUEUED", "RUNNING"].includes(String(task.status))) {
+                    database.close();
+                    throw new RuntimeError("TASK_NOT_CANCELABLE", `异步任务不存在或不可取消：${taskId}`);
+                }
+                database.prepare("UPDATE runtime_tasks SET status='CANCELED',updated_at=? WHERE id=?")
+                    .run(new Date().toISOString(), taskId);
+                database.close();
+                activeTasks.get(taskId)?.abort();
+                jsonResponse(response, success(requestId, { canceled: true, runtimeTaskId: taskId }));
+                return;
+            }
             if (request.method === "GET" && url.pathname === "/api/v1/reports") {
                 jsonResponse(response, success(requestId, { items: await listReports(context.workspace) }));
                 return;
@@ -1786,7 +2137,23 @@ export async function createRuntimeServer(workspaceValue) {
                 if (mode !== "sync") {
                     throw new RuntimeError("INVALID_EXECUTION_MODE", `未知执行方式：${mode}`);
                 }
-                const exported = await exportSync(context.workspace, body);
+                const controller = new AbortController();
+                activeRequests.set(requestId, controller);
+                const cancelOnDisconnect = () => {
+                    if (!response.writableEnded)
+                        controller.abort();
+                };
+                response.once("close", cancelOnDisconnect);
+                request.once("aborted", cancelOnDisconnect);
+                let exported;
+                try {
+                    exported = await exportSync(context.workspace, body, { signal: controller.signal });
+                }
+                finally {
+                    activeRequests.delete(requestId);
+                    response.removeListener("close", cancelOnDisconnect);
+                    request.removeListener("aborted", cancelOnDisconnect);
+                }
                 response.writeHead(200, {
                     "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(exported.fileName)}`,
@@ -1808,7 +2175,22 @@ export async function createRuntimeServer(workspaceValue) {
                 const body = (await readBody(request));
                 if (!body.reportId)
                     throw new RuntimeError("REPORT_ID_REQUIRED", "缺少 reportId");
-                jsonResponse(response, success(requestId, await querySync(context.workspace, body)));
+                const controller = new AbortController();
+                activeRequests.set(requestId, controller);
+                const cancelOnDisconnect = () => {
+                    if (!response.writableEnded)
+                        controller.abort();
+                };
+                response.once("close", cancelOnDisconnect);
+                request.once("aborted", cancelOnDisconnect);
+                try {
+                    jsonResponse(response, success(requestId, await querySync(context.workspace, body, { signal: controller.signal })));
+                }
+                finally {
+                    activeRequests.delete(requestId);
+                    response.removeListener("close", cancelOnDisconnect);
+                    request.removeListener("aborted", cancelOnDisconnect);
+                }
                 return;
             }
             throw new RuntimeError("NOT_FOUND", "接口不存在");
@@ -1834,6 +2216,12 @@ export async function createRuntimeServer(workspaceValue) {
         context,
         close: async () => {
             stopping = true;
+            for (const controller of activeRequests.values())
+                controller.abort();
+            activeRequests.clear();
+            for (const controller of activeTasks.values())
+                controller.abort();
+            activeTasks.clear();
             for (const timer of workerTimers)
                 clearTimeout(timer);
             workerTimers.clear();
