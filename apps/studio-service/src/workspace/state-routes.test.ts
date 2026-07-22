@@ -59,7 +59,7 @@ describe('knowledge & report state routes', () => {
     expect(s.reports).toEqual([]);
   });
 
-  it('deletes a development-only report package but protects published ones', async () => {
+  it('deletes any report package unrestricted, drafts and published alike', async () => {
     await mkdir(join(ws, 'reports', 'packages', 'r1', '0.1.0-draft'), { recursive: true });
     await writeFile(join(ws, 'reports', 'packages', 'r1', '0.1.0-draft', 'f.txt'), 'x');
     await mkdir(join(ws, 'reports', 'packages', 'r2', '1.0.0'), { recursive: true });
@@ -73,16 +73,17 @@ describe('knowledge & report state routes', () => {
       }),
     );
 
-    // Protected: published package cannot be deleted.
-    const blocked = await studio.app.inject({
+    // A published package is now deletable (report packages are unrestricted).
+    const pubDel = await studio.app.inject({
       method: 'DELETE',
       url: '/api/easybi/projects/wss/reports/package',
       payload: { id: 'r2', version: '1.0.0' },
     });
-    expect(blocked.statusCode).toBe(409);
-    expect(existsSync(join(ws, 'reports', 'packages', 'r2', '1.0.0'))).toBe(true);
+    expect(pubDel.statusCode).toBe(200);
+    expect(pubDel.json().data.removedDir).toBe(true);
+    expect(existsSync(join(ws, 'reports', 'packages', 'r2', '1.0.0'))).toBe(false);
 
-    // Allowed: development-only package is removed + deregistered.
+    // A draft package is likewise removed + deregistered.
     const okRes = await studio.app.inject({
       method: 'DELETE',
       url: '/api/easybi/projects/wss/reports/package',
@@ -94,8 +95,8 @@ describe('knowledge & report state routes', () => {
 
     const state = await studio.app.inject({ method: 'GET', url: '/api/easybi/projects/wss/reports' });
     const ids = (state.json().data.reports as Array<{ id: string }>).map((r) => r.id);
-    expect(ids).toContain('r2');
     expect(ids).not.toContain('r1');
+    expect(ids).not.toContain('r2');
   });
 
   it('404s deleting an unknown package', async () => {
@@ -107,7 +108,7 @@ describe('knowledge & report state routes', () => {
     expect(res.statusCode).toBe(404);
   });
 
-  it('report package editor: detail/read/write with dev-only + whitelist guards', async () => {
+  it('report package editor: detail/read/write with whitelist guard (unrestricted lifecycle)', async () => {
     const dir = join(ws, 'reports', 'packages', 'edit1', '0.1.0-draft', 'queries');
     await mkdir(dir, { recursive: true });
     await writeFile(join(dir, 'main.sql'), 'SELECT 1;\n');
@@ -163,18 +164,18 @@ describe('knowledge & report state routes', () => {
     });
     expect(badFile.statusCode).toBe(400);
 
-    // A published package is protected from writes and reseal.
-    const protectedWrite = await studio.app.inject({
+    // Report packages are unrestricted: a whitelisted file on any package
+    // (including a published one) is now writable.
+    const pubWrite = await studio.app.inject({
       method: 'PUT',
       url: '/api/easybi/projects/wss/reports/package/file',
-      payload: { id: 'pub1', version: '1.0.0', path: 'queries/main.sql', content: 'x' },
+      payload: { id: 'pub1', version: '1.0.0', path: 'queries/main.sql', content: 'SELECT 3;\n' },
     });
-    expect(protectedWrite.statusCode).toBe(409);
-    const protectedReseal = await studio.app.inject({
-      method: 'POST',
-      url: '/api/easybi/projects/wss/reports/package/reseal',
-      payload: { id: 'pub1', version: '1.0.0' },
+    expect(pubWrite.statusCode).toBe(200);
+    const pubReread = await studio.app.inject({
+      method: 'GET',
+      url: '/api/easybi/projects/wss/reports/package/file?id=pub1&version=1.0.0&path=queries/main.sql',
     });
-    expect(protectedReseal.statusCode).toBe(409);
+    expect(pubReread.json().data.content).toContain('SELECT 3');
   });
 });

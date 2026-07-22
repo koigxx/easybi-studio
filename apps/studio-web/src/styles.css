@@ -1245,3 +1245,91 @@ body {
   color: var(--ide-accent, #2563eb);
   font-weight: 600;
 }
+
+/* ---- Test panel: dynamic filter form ---- */
+.tp-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+}
+.tp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+/* Range fields hold two pickers — let them span the full row. */
+.tp-field-wide {
+  grid-column: 1 / -1;
+}
+.tp-field-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+}
+.tp-field-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ide-text-secondary);
+}
+.tp-field-req {
+  color: var(--state-error);
+  margin-left: 2px;
+}
+.tp-field-meta {
+  font-family: var(--ide-font-mono);
+  font-size: 10.5px;
+  color: var(--ide-text-tertiary);
+  background: var(--ide-bg-chrome);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: var(--ide-radius-sm);
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+.tp-field-clear {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--ide-text-tertiary);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 2px 5px;
+  border-radius: var(--ide-radius-sm);
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.tp-field-clear:hover {
+  color: var(--ide-text-primary);
+  background: var(--ide-bg-elevated);
+}
+.tp-range {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tp-range-sep {
+  color: var(--ide-text-tertiary);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+.tp-actions {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--ide-border-subtle);
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.tp-actions-spacer {
+  flex: 1 1 auto;
+}
+.tp-hint {
+  margin-top: 12px;
+  color: var(--ide-text-tertiary);
+  font-size: 11.5px;
+  line-height: 1.65;
+}

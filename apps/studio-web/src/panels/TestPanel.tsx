@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Play, Square, Download, Table2, FileBarChart } from 'lucide-react';
+import { Play, Square, Download, Table2, FileBarChart, X, RotateCcw } from 'lucide-react';
 import { runtimeApi, type Project, type RuntimeInfo, type QueryResult } from '../api.js';
 import { TopBar, PageBody, Card, SectionTitle, ErrorBanner, Badge, EmptyState } from '../components/ui/common.js';
 import { useNavigate } from '../nav.js';
@@ -45,6 +45,15 @@ function isBooleanParam(p: Param): boolean {
 }
 function isRangeValue(v: FilterValue | undefined): v is RangeValue {
   return typeof v === 'object' && v !== null;
+}
+/** Empty value for a param: range → {from,to}, single-value → ''. */
+function emptyValue(p: Param): FilterValue {
+  return isRangeParam(p) ? { from: '', to: '' } : '';
+}
+/** Does this param currently hold a value the user could clear? */
+function hasValue(v: FilterValue | undefined): boolean {
+  if (isRangeValue(v)) return Boolean(v.from || v.to);
+  return typeof v === 'string' && v.length > 0;
 }
 /** HTML input type for a range bound based on the param's value type. */
 function rangeInputType(valueType: string): string {
@@ -186,6 +195,20 @@ export function TestPanel({ project }: { project: Project }): JSX.Element {
     return { filters };
   }
 
+  /** 清空单个筛选项（范围重置为空起止，单值重置为空串）。 */
+  function clearField(p: Param): void {
+    setValues((prev) => ({ ...prev, [p.id]: emptyValue(p) }));
+  }
+
+  /** 重置全部筛选项为初始空值。 */
+  function clearAll(): void {
+    const seed: Record<string, FilterValue> = {};
+    for (const p of params) seed[p.id] = emptyValue(p);
+    setValues(seed);
+  }
+
+  const anyFilterSet = params.some((p) => hasValue(values[p.id]));
+
   async function previewData(): Promise<void> {
     if (!selectedReport) return;
     setPreviewing(true);
@@ -324,23 +347,37 @@ export function TestPanel({ project }: { project: Project }): JSX.Element {
             <section>
               <SectionTitle>动态筛选表单</SectionTitle>
               <Card>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div className="tp-filter-grid">
                   {params.map((p) => {
                     const v = values[p.id];
                     const range = isRangeValue(v) ? v : { from: '', to: '' };
+                    const filled = hasValue(v);
+                    const wide = isRangeParam(p) || (isEnumParam(p) && p.defaultOperator === 'in');
                     return (
-                      <label key={p.id} style={{ fontSize: 12.5, color: 'var(--ide-text-secondary)' }}>
-                        {p.label}
-                        {p.required && <span style={{ color: 'var(--state-error)', marginLeft: 4 }}>*</span>}
-                        <span className="ide-text-mono" style={{ color: 'var(--ide-text-tertiary)', marginLeft: 6, fontSize: 11 }}>
-                          {p.valueType} · {p.defaultOperator}
-                        </span>
+                      <div key={p.id} className={'tp-field' + (wide ? ' tp-field-wide' : '')}>
+                        <div className="tp-field-head">
+                          <span className="tp-field-label">
+                            {p.label}
+                            {p.required && <span className="tp-field-req">*</span>}
+                          </span>
+                          <span className="tp-field-meta">{p.valueType} · {p.defaultOperator}</span>
+                          {filled && (
+                            <button
+                              type="button"
+                              className="tp-field-clear"
+                              onClick={() => clearField(p)}
+                              title="清除此项"
+                            >
+                              <X className="w-3 h-3" />
+                              清除
+                            </button>
+                          )}
+                        </div>
                         {isBooleanParam(p) ? (
                           <select
                             className="ide-select"
                             value={typeof v === 'string' ? v : ''}
                             onChange={(e) => setValues((prev) => ({ ...prev, [p.id]: e.target.value }))}
-                            style={{ marginTop: 4 }}
                           >
                             <option value="">（不筛选）</option>
                             <option value="true">是</option>
@@ -362,7 +399,7 @@ export function TestPanel({ project }: { project: Project }): JSX.Element {
                                   : e.target.value;
                               setValues((prev) => ({ ...prev, [p.id]: next }));
                             }}
-                            style={{ marginTop: 4, minHeight: p.defaultOperator === 'in' ? 84 : undefined }}
+                            style={{ minHeight: p.defaultOperator === 'in' ? 96 : undefined }}
                           >
                             {p.defaultOperator !== 'in' && <option value="">（不筛选）</option>}
                             {(p.enumOptions ?? []).map((o) => (
@@ -372,7 +409,7 @@ export function TestPanel({ project }: { project: Project }): JSX.Element {
                             ))}
                           </select>
                         ) : isRangeParam(p) ? (
-                          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4 }}>
+                          <div className="tp-range">
                             <input
                               className="ide-input"
                               type={rangeInputType(p.valueType)}
@@ -384,7 +421,7 @@ export function TestPanel({ project }: { project: Project }): JSX.Element {
                               aria-label={`${p.label} 起`}
                               style={{ flex: 1 }}
                             />
-                            <span style={{ color: 'var(--ide-text-tertiary)' }}>至</span>
+                            <span className="tp-range-sep">至</span>
                             <input
                               className="ide-input"
                               type={rangeInputType(p.valueType)}
@@ -407,14 +444,13 @@ export function TestPanel({ project }: { project: Project }): JSX.Element {
                                 ? `按 ${p.defaultOperator} 过滤（必填）`
                                 : `按 ${p.defaultOperator} 过滤（留空则不筛选）`
                             }
-                            style={{ marginTop: 4 }}
                           />
                         )}
-                      </label>
+                      </div>
                     );
                   })}
                 </div>
-                <div style={{ marginTop: 14, display: 'flex', gap: 10, alignItems: 'center' }}>
+                <div className="tp-actions">
                   <button
                     className="ide-btn"
                     onClick={() => void previewData()}
@@ -428,8 +464,18 @@ export function TestPanel({ project }: { project: Project }): JSX.Element {
                     {exporting ? '导出中…' : '同步导出 Excel'}
                   </button>
                   {status && <span style={{ color: 'var(--state-success)', fontSize: 12.5 }}>{status}</span>}
+                  <span className="tp-actions-spacer" />
+                  <button
+                    className="ide-btn ide-btn-ghost ide-btn-sm"
+                    onClick={clearAll}
+                    disabled={!anyFilterSet || previewing || exporting}
+                    title="重置全部筛选项"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    重置全部
+                  </button>
                 </div>
-                <div style={{ marginTop: 8, color: 'var(--ide-text-tertiary)', fontSize: 11.5, lineHeight: 1.6 }}>
+                <div className="tp-hint">
                   预览与同步导出都需要工作区已配置可连的 MySQL；未配置时返回标准错误。预览直接返回中文表头与数据（默认最多前 1000 行，滚动查看），只有真实生成并下载 Excel 才计入 REAL_SYNC_EXPORT。
                 </div>
               </Card>

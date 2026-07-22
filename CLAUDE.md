@@ -8,11 +8,11 @@ Build a standalone local Easy BI Studio. It must work with Claude Code first and
 
 Before implementation, read:
 
-- /Users/admin/innos/easy-bi-workspace/easy-bi/docs/总体架构.md
-- /Users/admin/innos/easy-bi-workspace/easy-bi/docs/开发维护指南.md
-- /Users/admin/innos/easy-bi-workspace/easy-bi/skills/目录与项目兼容性规范.md
-- /Users/admin/innos/easy-bi-workspace/easy-bi/skills/bundle.manifest.json
-- /Users/admin/innos/easy-bi-workspace/easy-bi/toolkit/contracts/统一接口契约.md
+- skill-source/easy-bi/docs/总体架构.md
+- skill-source/easy-bi/docs/开发维护指南.md
+- skill-source/easy-bi/skills/目录与项目兼容性规范.md
+- skill-source/easy-bi/skills/bundle.manifest.json
+- skill-source/easy-bi/toolkit/contracts/统一接口契约.md
 - docs/ARCHITECTURE.md (system overview, module map, data flow, security invariants — read first)
 - docs/AI_CONTRIBUTING.md (onboarding, layering, skill-sync workflow, quality gates, doc-maintenance duty)
 - docs/IMPLEMENTATION_STATUS.md
@@ -22,11 +22,11 @@ Before implementation, read:
 
 ## Directory boundaries
 
-- Product source: /Users/admin/innos/easy-bi-workspace/easybi-studio
-- Test workspaces: /Users/admin/innos/easy-bi-workspace/easybi-studio-workspaces
-- Canonical Easy BI source: /Users/admin/innos/easy-bi-workspace/easy-bi
+- Single repo: product code + in-repo skill source (skill-source/easy-bi) live together in easybi-studio/.
+- Test workspaces are created OUTSIDE the repo, in a sibling easybi-studio-workspaces/ (never committed).
 - Never write generated customer data into the product repository.
-- Treat /Users/admin/innos/easy-bi-workspace/easy-bi as read-only unless the user explicitly requests a source change.
+- Treat the skill source (skill-source/easy-bi) as read-only for AI/runtime; change it only through the deliberate skill-maintenance flow (edit → build → sync), never as a side effect.
+- Default paths resolve relative to the repo (config.ts); they are overridable via EASYBI_SKILL_SOURCE_DIR / EASYBI_STUDIO_WORKSPACES_ROOT. Do not hardcode absolute machine paths.
 
 ## Architecture
 
@@ -56,6 +56,14 @@ Before implementation, read:
 - Never expose API keys, database passwords, tokens, or full configuration files in logs.
 - Never execute database DDL or DML.
 
+## Version control
+
+- Never run `git commit`, `git push`, `git reset`, `git rebase`, or any history-rewriting/publishing git command on your own initiative.
+- Staging or committing happens ONLY when the user explicitly asks for it in that turn; a prior commit request does not carry over to later changes.
+- You may run read-only git commands (`git status`, `git diff`, `git log`, `git show`) freely to inspect state.
+- When work is done, summarize what changed and let the user decide when to commit; do not offer to auto-commit as the default next step.
+- Never create or delete git repositories, remotes, tags, or branches without an explicit request.
+
 ## Stage execution
 
 - Work on only one current stage at a time.
@@ -68,7 +76,7 @@ Before implementation, read:
 
 ## Skill bundle
 
-- Synchronize only the documented whitelist from /Users/admin/innos/easy-bi-workspace/easy-bi.
+- Synchronize only the documented whitelist from the in-repo skill source (skill-source/easy-bi).
 - Use LocalDirectorySource first; keep LocalArchiveSource, BuiltInSource, and HttpRegistrySource behind the same interface.
 - Cache immutable Bundle versions and install an independent copy into each workspace.
 - Opening a workspace must automatically run bootstrap init or check from the installed Manifest.

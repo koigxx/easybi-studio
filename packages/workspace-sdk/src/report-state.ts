@@ -110,9 +110,9 @@ export interface DeleteReportResult {
 }
 
 /**
- * Delete a development-only report package: remove its directory under
- * reports/packages and deregister it from reports/index.json. Published /
- * production packages are protected (never deleted here). Idempotent on the
+ * Delete a report package: remove its directory under reports/packages and
+ * deregister it from reports/index.json. Report packages are unrestricted —
+ * any version may be deleted (drafts and released alike). Idempotent on the
  * directory (missing dir still deregisters).
  */
 export async function deleteReportPackage(
@@ -130,12 +130,8 @@ export async function deleteReportPackage(
   if (!entry) {
     throw new ReportPackageError('NOT_FOUND', `未找到报表包：${id} ${version}`);
   }
-  if (!entry.development_only) {
-    throw new ReportPackageError(
-      'PROTECTED',
-      `报表包 ${id} ${version} 非 development-only，禁止删除已发布/生产版本`,
-    );
-  }
+  // Report packages are unrestricted: any version may be deleted (drafts and
+  // released alike). No development_only / status gate here.
 
   // Resolve the package dir strictly under the workspace (guard traversal).
   const rel = typeof entry.path === 'string' && entry.path ? entry.path : `packages/${id}/${version}`;
@@ -206,21 +202,14 @@ export interface ReportPackageDetail {
   files: ReportPackageFile[];
 }
 
-/** Released statuses are immutable and must never be edited in place. */
-const RELEASED_STATUSES = new Set(['published', 'production', 'released', 'signed']);
-
 /**
- * A package is editable when it's still in the development lifecycle — i.e. its
- * own manifest status is NOT a released one. This is independent of whether the
- * underlying knowledge was published (`development_only`): a draft report package
- * built against published knowledge is still a work-in-progress a human may fix.
+ * Report packages are unrestricted: any package may be edited in place
+ * regardless of manifest status or knowledge publication. Kept as a function
+ * (rather than inlining `true`) so the call sites stay explicit and a future
+ * policy can reintroduce gating in one place.
  */
-function isPackageEditable(manifestStatus: unknown, developmentOnly: unknown): boolean {
-  const status = String(manifestStatus ?? '').toLowerCase();
-  if (status && RELEASED_STATUSES.has(status)) return false;
-  if (status) return true; // any non-released known status (draft/approved) is editable
-  // No status on the manifest: fall back to the index's development_only flag.
-  return developmentOnly === true;
+function isPackageEditable(_manifestStatus: unknown, _developmentOnly: unknown): boolean {
+  return true;
 }
 
 /** Read a package manifest's `status`, tolerating a missing/unreadable file. */
@@ -324,10 +313,10 @@ export async function readReportPackageFile(
 }
 
 /**
- * Write a single package file (development-only, whitelisted files). Does NOT
- * reseal — the caller reseals after a batch of edits so checksums are recomputed
- * once. Guards: dev-only package, editable whitelist, traversal-safe, file must
- * already exist (no creating arbitrary files).
+ * Write a single package file (whitelisted files). Does NOT reseal — the caller
+ * reseals after a batch of edits so checksums are recomputed once. Guards:
+ * editable whitelist, traversal-safe, file must already exist (no creating
+ * arbitrary files). Package lifecycle is unrestricted (see isPackageEditable).
  */
 export async function writeReportPackageFile(
   workspaceRoot: string,

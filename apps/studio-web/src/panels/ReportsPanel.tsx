@@ -217,9 +217,9 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
                       {state.reports.map((r) => {
                         const ver = r.version ?? r.currentVersion ?? '';
                         const key = `${r.id}@${ver}`;
-                        const canDelete = Boolean(r.developmentOnly) && Boolean(ver);
-                        // Open the editor for any versioned package; the editor
-                        // itself enforces read-only for released packages.
+                        // Report packages are unrestricted: any versioned package
+                        // may be edited or deleted (drafts and released alike).
+                        const canDelete = Boolean(ver);
                         const canEdit = Boolean(ver);
                         return (
                           <tr key={key}>
@@ -253,11 +253,7 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
                                 <button
                                   className="ide-btn ide-btn-sm ide-btn-ghost"
                                   disabled={!canDelete || deleting === key}
-                                  title={
-                                    canDelete
-                                      ? '删除该报表包'
-                                      : '仅 development-only 报表包可删除；已发布/生产版本受保护'
-                                  }
+                                  title="删除该报表包"
                                   onClick={() => void removePackage(r.id, ver, r.name ?? r.id)}
                                 >
                                   <Trash2 className="w-3.5 h-3.5" />

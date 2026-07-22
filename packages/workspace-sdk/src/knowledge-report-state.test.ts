@@ -91,7 +91,7 @@ describe('deleteReportPackage', () => {
     );
   }
 
-  it('deletes a development-only package: removes dir + deregisters', async () => {
+  it('deletes a draft package: removes dir + deregisters', async () => {
     const { deleteReportPackage, readReportState } = await import('./report-state.js');
     const { existsSync } = await import('node:fs');
     await seed();
@@ -103,13 +103,15 @@ describe('deleteReportPackage', () => {
     expect(state.reports.find((r) => r.id === 'r2')).toBeDefined();
   });
 
-  it('refuses to delete a non development-only (published) package', async () => {
-    const { deleteReportPackage, ReportPackageError } = await import('./report-state.js');
+  it('deletes any package unrestricted, including published ones', async () => {
+    const { deleteReportPackage, readReportState } = await import('./report-state.js');
     const { existsSync } = await import('node:fs');
     await seed();
-    await expect(deleteReportPackage(ws, 'r2', '1.0.0')).rejects.toBeInstanceOf(ReportPackageError);
-    // dir intact
-    expect(existsSync(join(ws, 'reports', 'packages', 'r2', '1.0.0'))).toBe(true);
+    const res = await deleteReportPackage(ws, 'r2', '1.0.0');
+    expect(res.removedDir).toBe(true);
+    expect(existsSync(join(ws, 'reports', 'packages', 'r2', '1.0.0'))).toBe(false);
+    const state = await readReportState(ws);
+    expect(state.reports.find((r) => r.id === 'r2')).toBeUndefined();
   });
 
   it('404s for an unknown package', async () => {
