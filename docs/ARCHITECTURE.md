@@ -72,29 +72,37 @@ Studio 不重复实现 HTTP/MySQL/Excel/OSS/任务等能力——这些在 bundl
 
 ## 4. 目录与数据布局
 
+**单仓库分发**：Studio 应用代码与技能包源同处一个 git 仓库；工作区在仓库外自动创建。三层各司其职——**仓库内技能源**（分发单元）、**用户数据目录的缓存**（不可变版本）、**仓库外工作区**（客户数据）。
+
 ```
-easybi-studio/                        # 产品仓库（永不写入客户数据）
+easybi-studio/                        # 产品仓库 = 应用代码 + 技能包源（永不写入客户数据）
 ├── apps/{studio-web,studio-service}
 ├── packages/*                        # 领域 SDK
 ├── scripts/{sync-easybi-bundle,create-test-workspace}.mjs
-├── vendor/easybi-bundle              # 从正式来源同步的技能包快照（只读产物）
+├── skill-source/                     # 【入库】技能包源容器（可扩展多个技能包）
+│   └── easy-bi/                      #   内置技能包源：skills/(含编译产物 dist) + toolkit/
+├── vendor/easybi-bundle              # 【不入库】sync 快照产物，运行时零引用，可重新生成
 ├── docs/                             # 见 docs/README.md
 └── tests/                            # 跨包集成测试
 
-~/.easybi-studio/                     # Studio 数据目录（EASYBI_STUDIO_DATA_DIR）
+~/.easybi-studio/                     # Studio 数据目录（EASYBI_STUDIO_DATA_DIR，用户本地）
 ├── studio.db                         # 项目登记、任务、job_events、检查点索引（EASYBI_STUDIO_DB_FILE）
-└── skill-cache/easybi/<version>/     # 不可变版本缓存（按版本键）
+└── skill-cache/easybi/<version>/     # 不可变版本缓存（按版本键，create 工作区的直接来源）
 
-<workspaces-root>/<id>/               # 一个工作区 = 一个客户系统（在产品仓库之外）
-├── skills/                           # 独立安装的技能包 + bundle.lock.json
-├── config/easy-bi.json              # 连接/OSS/报表配置（revision 乐观锁）
+<workspaces-root>/<id>/               # 一个工作区 = 一个客户系统（在产品仓库之外，不入库）
+├── skills/                           # 独立安装的技能包 + bundle.lock.json + bundle.manifest.json
+├── config/easy-bi.json              # 连接/OSS/报表配置（revision 乐观锁；含明文 DB 密码）
+├── toolkit/config/runtime.json      # Runtime 实例配置（含 OSS key / 业务 token；页面写入）
 ├── knowledge/{drafts,versions,scans} # 草稿可改；versions/ 不可变
 └── reports/{index.json,packages/<id>/<version>/}  # 已发布包不可原地覆盖
 ```
 
+> **默认路径自解析**：技能源默认 = 仓库内 `skill-source/easy-bi/`，工作区根默认 = 仓库外同级 `easybi-studio-workspaces/`，均由 `config.ts` 相对本仓库位置推导（`import.meta.url` 上溯），克隆到任意目录零配置可跑；仍可用 `EASYBI_SKILL_SOURCE_DIR` / `EASYBI_STUDIO_WORKSPACES_ROOT` 覆盖。
+> **入库边界**：只含基础代码 + 技能包源（技能包 `dist/` 作为发布制品入库以实现零构建即用）；`node_modules`、应用 `dist/`、`vendor/`、工作区、`.claude`/`.idea`、工作区实例 `runtime.json` 均不入库。详见根 `README.md`。
+
 ## 5. 关键流程
 
-- **技能包同步**：`scripts/sync-easybi-bundle.mjs`：正式来源 → `SkillBundleSource` 白名单快照 + SHA-256 → 写入不可变版本缓存 → 刷新 `vendor/easybi-bundle`。**缓存按版本键**，改了技能包需先删对应缓存目录再同步（否则复用旧版）。
+- **技能包同步**：`scripts/sync-easybi-bundle.mjs`：技能源（默认仓库内 `skill-source/easy-bi/`）→ `SkillBundleSource` 白名单快照 + SHA-256 → 写入不可变版本缓存 → 刷新 `vendor/easybi-bundle`。**缓存按版本键**，改了技能包需先删对应缓存目录再同步（否则复用旧版）。完整联动链路见 §6。
 - **创建工作区**：`POST /api/easybi/projects/create` → `workspace-bootstrapper`：建目录 → 从缓存独立安装技能包 → 写 lock → bootstrap init → 登记进 SQLite。既有工作区**不自动升级**。
 - **知识库**：AI 在工作区跑知识库 Skill → 产物默认落 `knowledge/drafts/`（草稿）。Studio 提供草稿可视化编辑与发布；发布生成 `knowledge/versions/<semver>/`（不可变），草稿保留供后续迭代。
 - **枚举中文映射**：知识库 `build` 自动做非阻断枚举初始化（真实 distinct 探测带 LIMIT + 短超时 + 只读事务，绝不覆盖人工 label）。Studio 枚举页经 Skill 适配器读写，字段绑定 ↔ 枚举字典，JSON/Excel 双通道。
@@ -102,9 +110,65 @@ easybi-studio/                        # 产品仓库（永不写入客户数据�
 - **同步导出**：测试页命中 `runtime-supervisor` 代理的 `easybi-runtime`，Excel 二进制触发下载；未配 DB/OSS 时返回 HTTP-200 JSON 友好错误，**静态校验绝不记为成功导出**。
 - **AI 对话**：前端全局对话抽屉（`AgentDrawerProvider`）→ `POST /agent-actions`（带 action + 可选自由文本）→ `JobManager` 起写/读任务（写任务先建检查点）→ `AgentBridge` Provider（本机 `ClaudeCodeBridge`）执行 → 事件经 `normalizeAgentEvent` 归一为 `JobEvent` → `GET /jobs/:id/events`(SSE) 流式回前端 → `panels/agent-chat.ts` 折叠成对话视图，`ChatMarkdown.tsx` 渲染 Markdown。**多轮**经 `/agent-tasks/:id/messages`：真实 Claude 每轮以 `completed` 收尾（不发 `waiting_for_user`），回复时 `replyToJob` 从 SUCCEEDED 续轮（`--resume <session>` + 重新 pump 新事件流，`JOB_TRANSITIONS` 允许 `SUCCEEDED→RUNNING`）。回复后前端重新订阅 SSE 时带 `?since=<已消费事件数>` 游标，`subscribe(jobId, since)` 只重放未看过的事件、并按任务真实状态（而非最后缓冲事件）决定关流，避免重放上一轮 `job_completed` 导致新一轮无响应。前端把连续 tool 行折叠成可展开分组（`groupRows`），`job_completed.summary` 与末尾 assistant 行同文时不重复渲染。**终止**经 `POST /agent-tasks/:id/interrupt`（`AgentBridge.interrupt?`）：停当前轮但保留 session，任务落 SUCCEEDED 可继续对话，区别于 `POST /cancel`（终态 CANCELED）。删除历史经 `DELETE /agent-tasks/:id`（级联 job_events；活跃任务 409）。**普通对话**：`action='free-chat'`（只读、不占写锁）发用户原文，不套模板。**可配置预置提示词**：各 skill 的 `prompts.json`（manifest `agent_prompts` 引用）→ 首次回退默认；`GET/PUT /projects/:id/agent-prompts` 存到 config 可选 `agent_prompts` 块（`buildActionPrompt` 的 `fullPrompt` 覆盖内置模板）。**对话持久化**：每个 `JobEvent` 落 SQLite `job_events` 表（`0003`），重启后 `POST /agent-tasks/:id/reopen` 从库重建会话供查看，并可用保存的 `session_id`（`AgentBridge.rehydrate` + `--resume`）继续追问——像 Claude Code 一样关闭后仍能找回。**Provider 切换是后端环境变量（`EASYBI_AGENT_PROVIDER`），前端零改动**；前端不直连任何 AI 厂商 API。
 
-## 6. 安全不变量（任何改动都必须守住）
+## 6. Studio 与技能包的联动（Skill Interop）
 
-- **目录边界**：客户数据只进工作区，**永不写入产品仓库**；正式 Easy BI 来源 (`/Users/admin/innos/easy-bi-workspace/easy-bi`) 默认只读；工具全权限不等于可越界到已登记产品/工作区目录之外。
+技能包（Skill）是 Studio 之外的**独立执行体**：Studio 不复制它的业务逻辑，而是通过一条稳定的分发—安装—寻址—执行链路与它协作。理解这条链路是理解整个产品的关键。
+
+### 6.1 三级分发链：源 → 缓存 → 工作区
+
+```
+skill-source/easy-bi/          scripts/sync         ~/.easybi-studio/skill-cache/        create-workspace       <workspaces-root>/<id>/
+（仓库内技能源，可改）  ──────────────▶  easybi/<version>/（不可变缓存）  ──────────────▶  skills/（独立安装副本）
+   SkillBundleSource               白名单+SHA-256                    SkillVersionCache                  cp skills/+toolkit/ + 写 lock
+```
+
+- **源（Source）**：`SkillBundleSource` 抽象了“技能包从哪来”。首版 `LocalDirectorySource` 读仓库内 `skill-source/easy-bi/`；`LocalArchiveSource`（.tar.gz）与 `HttpRegistrySource`（云端）走**完全相同**的后续管线，切换来源只改配置（`EASYBI_SKILL_SOURCE_TYPE/_DIR`，唯一接缝 `skill-source/resolve.ts`）。
+- **缓存（Cache）**：`SkillVersionCache` 按 `bundleId/version` 键把源快照成**不可变**版本目录。快照只收白名单内容（`skills/*` 含 `dist/scripts`、`toolkit/config/runtime.example|schema.json`、`contracts`），**排除** `node_modules`、`tests`、`dist/tests`、密钥、业务数据；写入时算 SHA-256。**缓存按版本键，改了技能包但版本号不变时需先删对应缓存目录再同步**，否则复用旧版。
+- **工作区安装（Install）**：`workspace-bootstrapper` 把缓存里的 `skills/` + `toolkit/` **独立拷贝**进工作区，并写 `skills/bundle.lock.json`（记录 bundleId/version/sha256/source_type/revision）。一个工作区一份独立副本，互不影响；**既有工作区不静默升级**（有 lock 就只 check 不重装）。
+
+> `vendor/easybi-bundle` 是 sync 的“已裁剪快照”副产物，用于将来 archive/registry 分发，运行时零引用、可随时重生成，故不入库。
+
+### 6.2 Manifest 驱动的寻址：Studio 从不硬编码 Skill 深层路径
+
+安装进工作区的 `skills/bundle.manifest.json` 是 Studio 调用技能包的**唯一路由表**。每个 skill 声明：
+
+```jsonc
+{ "id": "create-report-package", "path": "create-report-package",
+  "agent_entry": ".../SKILL.md", "agent_prompts": ".../prompts.json",
+  "commands": { "cli": "create-report-package/dist/scripts/report-package-cli.js", ... } }
+```
+
+`workspace-sdk` 的 `WorkspaceSkillAdapter` 是**唯一**把逻辑名解析成绝对路径的地方：
+- `resolveCommand(skillId, commandKey)` → 读 manifest 的 `commands[commandKey]`（相对 `skills/`）→ `resolveWithinWorkspace` 解析成工作区内绝对路径（带防穿越）。
+- `resolveLogicalPath(key)` → 读 `workspace_contract.paths[key]`（如 `knowledge_index`）→ 工作区内绝对路径。
+- `readSkillPromptPresets()` → 读各 skill 的 `agent_prompts` 文件，汇总预置提示词。
+
+**页面与业务服务只认逻辑名，绝不写死 `dist/scripts/...` 深层目录**——技能包内部结构变化只要 manifest 不变，Studio 无需改动。
+
+### 6.3 两种调用形态：AI 编排 vs 确定性 CLI
+
+技能包被 Studio 以两种方式驱动，二者互补：
+
+1. **AI 编排（生成）**：`AgentBridge` spawn Claude Code CLI，`cwd=工作区`，让 AI **阅读 `SKILL.md` 按其审批门禁**运行技能包 CLI 来生成知识库/报表包。产物落工作区 `knowledge/drafts`、`reports/packages`。事件经 Job/SSE 回前端（详见 §5 AI 对话）。
+2. **确定性 CLI（执行/校验）**：Studio 后端**直接** spawn manifest 里声明的编译 CLI（`shell:false` + 数组参数 + `cwd=工作区`）做确定性操作——如报表包 `validate`、知识库 catalog 操作。不经 AI，结果可复现。
+
+其中**报表运行时（easybi-runtime）**是特例：`runtime-supervisor` 以动态端口托管技能包内 bundled 的 runtime 进程，Studio 测试页经它透明代理三接口（list/parameters/export|query）。Runtime **每次请求都重新读工作区里的报表包**，改报表包无需重启进程；只有改了 runtime 的 dist 代码才需重启。
+
+### 6.4 版本演进（改技能包的完整回路）
+
+```
+改 skill-source/easy-bi/skills/<skill>/scripts/*.ts
+  → 在该 skill 目录 npm run build（更新 dist/scripts）
+  → 提交 dist（因 dist 入库，别人才拿到新版）
+  → 需要新分发单元时：bump bundle/skill 版本 → node scripts/sync-easybi-bundle.mjs（刷新缓存 + vendor）
+  → 重装/新建目标工作区（既有工作区手动重装，保留 config/knowledge/reports 与工作区 runtime.json，重生成 lock）
+```
+
+> 报表包本身的热更新（改 `reports/packages/**`）不需要重装、不需要重启 Runtime——Runtime 每请求重读。只有**技能包 dist 代码**变更才涉及上面的分发回路。
+
+## 7. 安全不变量（任何改动都必须守住）
+
+- **目录边界**：客户数据只进工作区，**永不写入产品仓库**；技能包源（仓库内 `skill-source/easy-bi/`）对 AI/运行时只读——只有维护者在开发流程中改它；工具全权限不等于可越界到已登记产品/工作区目录之外。
 - **路径**：一切工作区路径经 `workspace-sdk` 解析并防穿越；技能包路径经 `bundle.manifest.json` + Skill 适配器，**不硬编码 Skill 深层目录**。
 - **进程**：`child_process.spawn` + `shell:false` + 数组参数 + `cwd=工作区`；只停 Studio 自己启动的进程。
 - **数据库**：只读，禁止 DDL/DML；探测扫描带 LIMIT + 服务端/客户端超时 + 只读事务，降级不阻断。支持 MySQL（默认）与 PostgreSQL，经 skill 的 `dialect.ts` 方言层分派（`connector_id` 决定）；报表包记录 `sql_dialect`。新增引擎 = 实现方言接口，不改扫描/生成主流程。
@@ -113,6 +177,6 @@ easybi-studio/                        # 产品仓库（永不写入客户数据�
 - **契约**：改公共契约需分类（内部 / 兼容扩展 / 破坏性）；破坏性需 `catalog_format_version` bump + 迁移 + 回滚 + 变更记录。
 - **门禁**：TS strict；每个 Agent 写任务先建检查点与变更摘要；无错误/取消/重启/空态处理不算完成。
 
-## 7. 接入 Innos（预留，未连接）
+## 8. 接入 Innos（预留，未连接）
 
 Provider 经 `buildApp` 注入切换（`EASYBI_AGENT_PROVIDER=innos`）。接入时 Innos 只需：实现 `InnosAgentBridge`、进程托管、cloud-gateway 反代 `/api/easybi/* → 127.0.0.1:8932`、可选实现 `HttpRegistrySource` 的三只读接口。Studio 页面与 Easy BI 业务模块无需重写。客户数据库与工作区**不经过 cloud-gateway**。详见 [INNOS_INTEGRATION.md](./INNOS_INTEGRATION.md)。
