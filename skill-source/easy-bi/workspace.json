@@ -1,0 +1,20 @@
+{
+  "workspace_format_version": "1",
+  "status": "unconfigured",
+  "system": {
+    "id": null,
+    "name": null
+  },
+  "paths": {
+    "config": "config",
+    "skills": "skills",
+    "skill_bundle_manifest": "skills/bundle.manifest.json",
+    "skill_bundle_lock": "skills/bundle.lock.json",
+    "toolkit": "toolkit",
+    "scripts": "scripts",
+    "knowledge": "knowledge",
+    "report_packages": "reports/packages",
+    "outputs": "outputs",
+    "work": "work"
+  }
+}

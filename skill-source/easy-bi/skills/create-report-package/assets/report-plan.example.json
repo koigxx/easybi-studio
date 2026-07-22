@@ -1,0 +1,40 @@
+{
+  "plan_format_version": "2",
+  "report": {
+    "id": "driver-basic-detail",
+    "name": "司机基础信息明细",
+    "version": "0.1.0-draft",
+    "description": ""
+  },
+  "execution_policy": {
+    "supported_modes": [
+      "sync",
+      "async"
+    ],
+    "default_mode": "sync",
+    "request_field": "executionMode",
+    "allow_request_selection": true,
+    "runtime_policy_ref": "default"
+  },
+  "source": {
+    "primary_table": null,
+    "tables": [],
+    "joins": []
+  },
+  "aggregation": {
+    "group_by": [],
+    "having": []
+  },
+  "custom_logic": {
+    "required": false,
+    "mode": "identity",
+    "group_keys": [],
+    "max_group_rows": 100000,
+    "description": ""
+  },
+  "approval": {
+    "status": "draft",
+    "reviewed_by": null,
+    "reviewed_at": null
+  }
+}

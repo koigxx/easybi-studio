@@ -1,0 +1,22 @@
+{
+  "schema_version": "1",
+  "skill_id": "initialize-report-knowledge",
+  "configs": [
+    {
+      "target": "build",
+      "file": "config/easy-bi.json",
+      "title": "构建配置",
+      "summary": "描述这个客户系统是什么、连哪些库、要做哪些报表。知识库初始化和报表生成都以它为输入。多数字段可在「连接」「报表」页用表单编辑，这里是完整 JSON。",
+      "sections": [
+        { "key": "system", "label": "系统信息", "desc": "系统 id/名称/描述、时区、语言、业务域。用于生成知识库和报表时的语义上下文。" },
+        { "key": "connections.database_profiles", "label": "数据库连接", "desc": "一个或多个 MySQL 连接：host/port/username、该连接下要纳入的数据库列表。密码可明文填 password，或用 password_env 指向环境变量（推荐，不落盘/不入日志）。只读使用。" },
+        { "key": "connections.object_storage_profiles", "label": "对象存储", "desc": "阿里云 OSS 等：endpoint/region/bucket/前缀，AccessKey 建议走环境变量。用于异步导出报表文件。" },
+        { "key": "knowledge.report_requirements", "label": "预期报表与字段", "desc": "你希望产出的报表清单及每张报表需要的字段（中文语义名）。每个字段可标记角色（输出/筛选/分组，可多选，缺省=输出）；每张报表可写业务说明/口径（如“仅统计签收复核后”“毛利=应收-各方应付-内部成本”）。知识库据此判断热点，报表 Skill 据此定位物理字段、决定筛选与分组。" },
+        { "key": "knowledge.report_scenarios", "label": "报表场景", "desc": "报表的使用场景/筛选维度说明，帮助 AI 理解口径。" },
+        { "key": "security", "label": "安全约束", "desc": "只读、禁止 DDL/DML、脱敏等约束的开关与说明；一般保持默认。" },
+        { "key": "delivery", "label": "交付", "desc": "报表交付方式相关配置。" },
+        { "key": "export", "label": "导出", "desc": "导出格式/命名等默认项。" }
+      ]
+    }
+  ]
+}

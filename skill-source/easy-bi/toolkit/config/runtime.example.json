@@ -1,0 +1,70 @@
+{
+  "config_version": "1",
+  "http": {
+    "host": "127.0.0.1",
+    "port": 39080,
+    "always_http_200": true
+  },
+  "execution_strategy": {
+    "supported_modes": [
+      "sync",
+      "async"
+    ],
+    "default_mode": "sync",
+    "request_field": "executionMode",
+    "never_auto_switch_mode": true,
+    "sync": {
+      "enabled": true,
+      "query_timeout_seconds": 600,
+      "total_timeout_seconds": 900,
+      "max_rows_per_sheet": 1048575,
+      "max_sheets_per_workbook": 2,
+      "max_columns": 16384,
+      "max_file_bytes": 2147483648,
+      "sheet_overflow": "split",
+      "build_to_temp_file_before_response": true
+    },
+    "async": {
+      "enabled": true,
+      "query_timeout_seconds": 3600,
+      "worker_concurrency": 2,
+      "max_queue_size": 1000,
+      "requires_object_storage": true,
+      "requires_business_task_integration": true
+    }
+  },
+  "aliyun_oss": {
+    "enabled": false,
+    "endpoint": "",
+    "region": "",
+    "bucket": "",
+    "access_key_id": "",
+    "access_key_secret": "",
+    "object_prefix": "easybi",
+    "url_mode": "signed",
+    "signed_url_expires_seconds": 86400
+  },
+  "business_task_integration": {
+    "enabled": false,
+    "base_url": "",
+    "create_task": {
+      "method": "POST",
+      "path": "/internal/easybi/report-tasks",
+      "timeout_seconds": 10
+    },
+    "update_task": {
+      "method": "POST",
+      "path": "/internal/easybi/report-tasks/{taskId}",
+      "timeout_seconds": 10
+    },
+    "auth": {
+      "type": "bearer",
+      "token": ""
+    }
+  },
+  "storage": {
+    "sqlite_path": "data/easybi-runtime.db",
+    "temp_directory": "data/tmp",
+    "local_output_directory": "outputs/files"
+  }
+}

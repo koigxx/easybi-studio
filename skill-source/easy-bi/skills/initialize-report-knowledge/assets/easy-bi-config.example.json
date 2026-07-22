@@ -1,0 +1,138 @@
+{
+  "config_version": "4",
+  "setup_status": "draft",
+  "system": {
+    "id": "transport-system",
+    "name": "运输管理系统",
+    "description": "管理运输订单、履约节点和承运商结算",
+    "timezone": "Asia/Shanghai",
+    "locale": "zh-CN",
+    "business_domains": ["订单", "运输履约", "结算"]
+  },
+  "connections": {
+    "database_profiles": [
+      {
+        "id": "transport-main-mysql",
+        "connector_id": "mysql",
+        "connection_group": "transport-db-server",
+        "password": "在本地填写或改用 password_env",
+        "settings": {
+          "host": "127.0.0.1",
+          "port": 3306,
+          "username": "report_reader",
+          "databases": ["transport_order", "transport_settlement"],
+          "discover_databases": false,
+          "exclude_databases": ["information_schema", "mysql", "performance_schema", "sys"]
+        }
+      },
+      {
+        "id": "transport-archive-mysql",
+        "connector_id": "mysql",
+        "password_env": "EASY_BI_ARCHIVE_DB_PASSWORD",
+        "settings": {
+          "host": "127.0.0.1",
+          "port": 3306,
+          "username": "report_reader",
+          "databases": ["transport_archive"]
+        }
+      }
+    ],
+    "object_storage_profiles": [
+      {
+        "id": "transport-report-oss",
+        "connector_id": "aliyun-oss",
+        "access_key_id_env": "EASY_BI_OSS_ACCESS_KEY_ID",
+        "access_key_secret_env": "EASY_BI_OSS_ACCESS_KEY_SECRET",
+        "settings": {
+          "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+          "region": "",
+          "bucket": "transport-report-files",
+          "object_key_prefix": "easy-bi/transport-system",
+          "signed_url_expires_seconds": 86400
+        }
+      }
+    ]
+  },
+  "knowledge": {
+    "database_profile_ids": ["transport-main-mysql", "transport-archive-mysql"],
+    "inactivity_days": 90,
+    "classification": {
+      "hot_threshold": 80,
+      "cold_threshold": 25
+    },
+    "activity_probe": {
+      "enabled": true,
+      "require_index": false,
+      "unindexed_max_columns": 2,
+      "statement_timeout_seconds": 8,
+      "candidate_columns": ["updated_at", "update_time", "created_at", "create_time", "business_date"]
+    },
+    "forced_hot_tables": [],
+    "business_semantics": ["运输订单", "运输节点和签收时效", "承运商结算"],
+    "report_scenarios": ["运输订单明细", "承运商结算明细"],
+    "report_requirements": [
+      {
+        "id": "transport-order-detail",
+        "name": "运输订单明细",
+        "required_fields": ["运输订单号", "承运商名称", "创建时间", "订单状态"]
+      },
+      {
+        "id": "carrier-settlement-detail",
+        "name": "承运商结算明细",
+        "required_fields": [
+          "transport_settlement.settlement_order.settlement_no",
+          "结算金额",
+          "结算状态"
+        ]
+      }
+    ],
+    "semantic_defaults": {
+      "interaction_mode": "minimal",
+      "filters": {
+        "report_fields_enabled": true,
+        "identifier_operator": "eq",
+        "string_operator": "contains",
+        "number_operator": "between",
+        "date_operator": "between",
+        "enum_operator": "in",
+        "boolean_operator": "eq",
+        "large_text_enabled": false
+      },
+      "review": {
+        "ask_only_blocking_questions": true,
+        "one_confirmation_per_stage": true,
+        "enum_review_mode": "batch_after_build",
+        "security_review_mode": "batch_after_build"
+      }
+    },
+    "confirmed_cold_patterns": [],
+    "evidence_sources": {
+      "source_code_paths": [],
+      "existing_report_paths": [],
+      "query_history_enabled": false
+    },
+    "profiling": {
+      "allow_value_sampling": false,
+      "candidate_tables_only": true,
+      "sample_limit": 1000
+    }
+  },
+  "security": {
+    "tenant_mode": "unknown",
+    "tenant_field_hints": [],
+    "organization_field_hints": []
+  },
+  "delivery": {
+    "mode": "auto",
+    "object_storage_profile_id": "transport-report-oss",
+    "local_output_directory": "outputs/files"
+  },
+  "export": {
+    "target": "linux-x64-glibc",
+    "business_integration": {
+      "base_url": null,
+      "task_event_path": "/internal/easybi/report-task-events",
+      "auth": null
+    }
+  }
+}

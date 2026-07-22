@@ -1,0 +1,1247 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Easy BI Studio — Innos IDE-Mono design tokens + structural CSS.
+   Ported from Innos embodied-platform/desktop/renderer/styles/innos-tokens.css.
+   Light = Mono White (:root default); Dark = Mono Grayscale ([data-theme=dark]).
+   Tokens (--ide-*) are global; structural rules are scoped under .innos-app.
+   ============================================================ */
+
+/* ---- Light theme · Mono White (default) ---- */
+:root {
+  --ide-accent: #1a1a1a;
+  --ide-accent-hover: #2e2e2e;
+  --ide-accent-press: #000000;
+  --ide-accent-soft: rgba(0, 0, 0, 0.05);
+  --ide-accent-ring: rgba(0, 0, 0, 0.12);
+  --ide-text-on-accent-inverse: #ffffff;
+
+  --ide-bg-app: #ffffff;
+  --ide-bg-chrome: #f7f7f7;
+  --ide-bg-panel: #ffffff;
+  --ide-bg-editor: #ffffff;
+  --ide-bg-elevated: #ffffff;
+  --ide-bg-input: #ffffff;
+
+  --ide-border-subtle: #ececec;
+  --ide-border: #e0e0e0;
+  --ide-border-strong: #c8c8c8;
+  --ide-border-focus: var(--ide-accent);
+
+  --ide-text-primary: #1a1a1a;
+  --ide-text-secondary: #5a5a5a;
+  --ide-text-tertiary: #888888;
+  --ide-text-muted: #b0b0b0;
+
+  --state-success: #1faa6a;
+  --state-success-soft: rgba(31, 170, 106, 0.12);
+  --state-warning: #c98610;
+  --state-warning-soft: rgba(201, 134, 16, 0.14);
+  --state-error: #d23a3a;
+  --state-error-soft: rgba(210, 58, 58, 0.1);
+  --state-info: #2a85e8;
+  --state-info-soft: rgba(42, 133, 232, 0.12);
+
+  --ide-font-sans: "Inter", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui,
+    -apple-system, "Segoe UI", sans-serif;
+  --ide-font-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", Menlo, Consolas,
+    monospace;
+
+  --ide-radius-sm: 4px;
+  --ide-radius-md: 6px;
+  --ide-radius-lg: 8px;
+  --ide-radius-full: 9999px;
+
+  --ide-shadow-1: 0 1px 0 rgba(0, 0, 0, 0.03);
+  --ide-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.03);
+  --ide-shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  --ide-ring: 0 0 0 1px var(--ide-accent), 0 0 0 3px var(--ide-accent-ring);
+
+  --innos-sidebar-w: 240px;
+  --innos-titlebar-h: 52px;
+
+  color-scheme: light;
+}
+
+/* ---- Dark theme · Mono Grayscale ---- */
+[data-theme="dark"] {
+  --ide-accent: #f0f0f0;
+  --ide-accent-hover: #ffffff;
+  --ide-accent-press: #d4d4d4;
+  --ide-accent-soft: rgba(255, 255, 255, 0.08);
+  --ide-accent-ring: rgba(255, 255, 255, 0.18);
+  --ide-text-on-accent-inverse: #1a1a1a;
+
+  --ide-bg-app: #1a1a1a;
+  --ide-bg-chrome: #141414;
+  --ide-bg-panel: #1a1a1a;
+  --ide-bg-editor: #1a1a1a;
+  --ide-bg-elevated: #232323;
+  --ide-bg-input: #1f1f1f;
+
+  --ide-border-subtle: #2a2a2a;
+  --ide-border: #333333;
+  --ide-border-strong: #3d3d3d;
+
+  --ide-text-primary: #e5e5e5;
+  --ide-text-secondary: #a0a0a0;
+  --ide-text-tertiary: #6e6e6e;
+  --ide-text-muted: #4a4a4a;
+
+  --state-success: #2dbd7e;
+  --state-success-soft: rgba(45, 189, 126, 0.16);
+  --state-warning: #d8a657;
+  --state-warning-soft: rgba(216, 166, 87, 0.16);
+  --state-error: #ff7373;
+  --state-error-soft: rgba(255, 115, 115, 0.16);
+  --state-info: #5cb4e8;
+  --state-info-soft: rgba(92, 180, 232, 0.16);
+
+  --ide-shadow-1: 0 1px 0 rgba(0, 0, 0, 0.3);
+  --ide-shadow-card: 0 2px 8px rgba(0, 0, 0, 0.35), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --ide-shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+
+  color-scheme: dark;
+}
+
+/* ---- Base ---- */
+* {
+  box-sizing: border-box;
+}
+html {
+  font-family: var(--ide-font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+body {
+  margin: 0;
+  background: var(--ide-bg-app);
+  color: var(--ide-text-primary);
+  font-family: var(--ide-font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ---- Typography helpers ---- */
+.ide-text-mono {
+  font-family: var(--ide-font-mono);
+}
+.ide-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ide-num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Scrollbars ---- */
+.ide-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.ide-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.ide-scroll::-webkit-scrollbar-thumb {
+  background: var(--ide-border-strong);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+.ide-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--ide-text-muted);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* ---- Card / input / button ---- */
+.ide-card {
+  background: var(--ide-bg-elevated);
+  border: 1px solid var(--ide-border);
+  border-radius: var(--ide-radius-lg);
+}
+.ide-input,
+.ide-select,
+.ide-textarea {
+  width: 100%;
+  background: var(--ide-bg-input);
+  border: 1px solid var(--ide-border);
+  border-radius: var(--ide-radius-md);
+  color: var(--ide-text-primary);
+  font-family: var(--ide-font-sans);
+  font-size: 13px;
+  padding: 7px 10px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  outline: none;
+}
+.ide-textarea {
+  font-family: var(--ide-font-mono);
+  line-height: 1.55;
+  resize: vertical;
+}
+.ide-input::placeholder,
+.ide-textarea::placeholder {
+  color: var(--ide-text-tertiary);
+}
+.ide-input:focus,
+.ide-select:focus,
+.ide-textarea:focus {
+  border-color: var(--ide-accent);
+  box-shadow: var(--ide-ring);
+}
+.ide-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 14px;
+  font-family: var(--ide-font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--ide-radius-md);
+  border: 1px solid var(--ide-border);
+  background: var(--ide-bg-panel);
+  color: var(--ide-text-primary);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.ide-btn:hover {
+  background: var(--ide-bg-elevated);
+  border-color: var(--ide-border-strong);
+}
+.ide-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ide-btn-primary {
+  background: var(--ide-accent);
+  color: var(--ide-text-on-accent-inverse);
+  border-color: transparent;
+}
+.ide-btn-primary:hover {
+  background: var(--ide-accent-hover);
+  border-color: transparent;
+}
+.ide-btn-danger {
+  background: var(--state-error);
+  color: #fff;
+  border-color: transparent;
+}
+.ide-btn-ghost {
+  background: transparent;
+  color: var(--ide-text-secondary);
+  border-color: transparent;
+}
+.ide-btn-ghost:hover {
+  background: var(--ide-bg-elevated);
+  color: var(--ide-text-primary);
+  border-color: transparent;
+}
+.ide-btn-sm {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* ---- Badge ---- */
+.ide-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--ide-radius-full);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.4;
+  border: 1px solid transparent;
+}
+.ide-badge-neutral {
+  background: var(--ide-bg-elevated);
+  color: var(--ide-text-secondary);
+  border-color: var(--ide-border);
+}
+.ide-badge-success {
+  background: var(--state-success-soft);
+  color: var(--state-success);
+}
+.ide-badge-warning {
+  background: var(--state-warning-soft);
+  color: var(--state-warning);
+}
+.ide-badge-error {
+  background: var(--state-error-soft);
+  color: var(--state-error);
+}
+.ide-badge-info {
+  background: var(--state-info-soft);
+  color: var(--state-info);
+}
+.ide-badge-dot::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+}
+
+/* ---- Chip / mono chip ---- */
+.ide-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--ide-radius-sm);
+  font-size: 11.5px;
+  font-family: var(--ide-font-mono);
+  background: var(--ide-bg-elevated);
+  color: var(--ide-text-secondary);
+  border: 1px solid var(--ide-border-subtle);
+}
+
+/* ---- Table ---- */
+.ide-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 13px;
+}
+.ide-table thead th {
+  text-align: left;
+  padding: 9px 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ide-text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--ide-bg-chrome);
+  border-bottom: 1px solid var(--ide-border);
+  white-space: nowrap;
+}
+.ide-table tbody td {
+  padding: 10px 12px;
+  color: var(--ide-text-primary);
+  border-bottom: 1px solid var(--ide-border-subtle);
+  vertical-align: middle;
+}
+.ide-table tbody tr:last-child td {
+  border-bottom: none;
+}
+.ide-table tbody tr:hover td {
+  background: var(--ide-bg-elevated);
+}
+
+/* ---- Link ---- */
+.ide-link {
+  color: var(--ide-text-primary);
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+}
+.ide-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ---- Focus ring ---- */
+*:focus-visible {
+  outline: 2px solid var(--ide-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ============================================================
+   Structural CSS (scoped under .innos-app)
+   ============================================================ */
+.innos-app {
+  display: flex;
+  flex-direction: row;
+  width: 100%;
+  min-height: 100vh;
+  background: var(--ide-bg-app);
+  color: var(--ide-text-primary);
+  font-family: var(--ide-font-sans);
+}
+
+/* Sidebar */
+.innos-app .sidebar {
+  width: var(--innos-sidebar-w);
+  flex: 0 0 auto;
+  background: var(--ide-bg-chrome);
+  border-right: 1px solid var(--ide-border-subtle);
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  position: sticky;
+  top: 0;
+}
+.innos-app .sb-top {
+  height: var(--innos-titlebar-h);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--ide-border-subtle);
+}
+.innos-app .brand-mark {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--ide-accent);
+  color: var(--ide-text-on-accent-inverse);
+  display: inline-grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 13px;
+  flex: 0 0 auto;
+}
+.innos-app .brand-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ide-text-primary);
+}
+.innos-app .brand-sub {
+  font-size: 11px;
+  color: var(--ide-text-tertiary);
+}
+.innos-app .sb-section {
+  padding: 12px 10px 0;
+}
+.innos-app .sb-label {
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ide-text-tertiary);
+  padding: 0 8px 6px;
+}
+.innos-app .sb-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ide-text-secondary);
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.innos-app .sb-nav-item:hover {
+  background: var(--ide-accent-soft);
+  color: var(--ide-text-primary);
+}
+.innos-app .sb-nav-item.active {
+  background: var(--ide-accent-soft);
+  color: var(--ide-accent-press);
+  font-weight: 600;
+}
+.innos-app .sb-nav-item .badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-family: var(--ide-font-mono);
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--ide-bg-elevated);
+  color: var(--ide-text-tertiary);
+  border: 1px solid var(--ide-border-subtle);
+}
+.innos-app .sb-spacer {
+  flex: 1 1 auto;
+}
+.innos-app .sb-bottom {
+  padding: 8px 10px 14px;
+  border-top: 1px solid var(--ide-border-subtle);
+}
+
+/* Canvas / topbar / page */
+.innos-app .canvas {
+  flex: 1 1 0%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.innos-app .topbar {
+  height: var(--innos-titlebar-h);
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--ide-border-subtle);
+  background: var(--ide-bg-chrome);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.innos-app .topbar .crumb {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ide-text-primary);
+}
+.innos-app .topbar-right {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.innos-app .page-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 24px;
+  background: var(--ide-bg-app);
+}
+
+/* Section title */
+.innos-app .ide-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ide-text-primary);
+  margin-bottom: 12px;
+}
+.innos-app .ide-section-title::before {
+  content: "";
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--ide-accent);
+  display: inline-block;
+}
+
+/* Segmented (workspace tabs, top) */
+.innos-app .ws-tabs {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--ide-bg-elevated);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: var(--ide-radius-full);
+}
+.innos-app .ws-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ide-text-tertiary);
+  font-size: 12.5px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.innos-app .ws-tab.active {
+  background: var(--ide-bg-panel);
+  color: var(--ide-text-primary);
+  font-weight: 600;
+  box-shadow: var(--ide-shadow-1);
+}
+
+/* Icon sizes */
+.innos-app .ic-14 svg,
+.ic-14 svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* ============================================================
+   AI 对话抽屉（AgentDrawer）—— IDE-Mono 令牌，右侧滑出 + 遮罩
+   ============================================================ */
+.innos-app .chat-backdrop,
+.chat-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.28);
+  z-index: 119;
+}
+.innos-app .chat-drawer,
+.chat-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 460px;
+  max-width: 96vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--ide-bg-panel);
+  border-left: 1px solid var(--ide-border);
+  box-shadow: var(--ide-shadow-pop, -8px 0 24px rgba(0, 0, 0, 0.18));
+  z-index: 120;
+}
+.chat-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ide-border);
+  background: var(--ide-bg-chrome);
+}
+.chat-provider {
+  padding: 6px 12px;
+  font-size: 11.5px;
+  color: var(--ide-text-tertiary);
+  border-bottom: 1px solid var(--ide-border-subtle);
+  background: var(--ide-bg-chrome);
+}
+.chat-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  background: var(--ide-bg-panel);
+}
+.chat-empty {
+  color: var(--ide-text-tertiary);
+  font-size: 12.5px;
+  padding: 8px;
+}
+.chat-typing {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ide-text-tertiary);
+  font-size: 12.5px;
+  padding: 6px 2px;
+}
+.chat-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--state-error-soft);
+  color: var(--state-error);
+  border-radius: 8px;
+  font-size: 12.5px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+
+/* 气泡 */
+.chat-bubble-assistant {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ide-text-primary);
+  background: var(--ide-bg-elevated);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: 10px;
+  padding: 8px 11px;
+  margin: 8px 0;
+}
+.chat-line-user {
+  display: flex;
+  justify-content: flex-end;
+  margin: 8px 0;
+}
+.chat-bubble-user {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ide-text-on-accent, #fff);
+  background: var(--ide-accent);
+  border-radius: 10px;
+  padding: 7px 11px;
+  max-width: 85%;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-tool {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ide-text-secondary);
+  background: var(--ide-bg-chrome);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin: 4px 0;
+}
+.chat-notice {
+  font-size: 12.5px;
+  color: var(--ide-text-secondary);
+  background: var(--ide-bg-chrome);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 6px 0;
+  white-space: pre-wrap;
+}
+
+/* Collapsed group of consecutive tool calls */
+.chat-tool-group {
+  margin: 4px 0;
+}
+.chat-tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  font-size: 12px;
+  color: var(--ide-text-secondary);
+  background: var(--ide-bg-chrome);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: 6px;
+  padding: 5px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.chat-tool-group-head:hover {
+  background: var(--ide-bg-hover, var(--ide-bg-chrome));
+  color: var(--ide-text-primary);
+}
+.chat-tool-group-body {
+  margin-top: 2px;
+  padding-left: 10px;
+  border-left: 2px solid var(--ide-border-subtle);
+}
+.chat-tool-group-body .chat-tool {
+  margin: 3px 0;
+}
+
+/* Footer */
+.chat-footer {
+  border-top: 1px solid var(--ide-border);
+  padding: 10px;
+  background: var(--ide-bg-chrome);
+}
+.chat-waiting {
+  font-size: 12px;
+  color: var(--ide-text-secondary);
+  margin-bottom: 6px;
+}
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.chat-input {
+  flex: 1;
+  resize: none;
+  min-height: 38px;
+  font-size: 13px;
+}
+.chat-send {
+  height: 38px;
+  padding: 0 12px;
+}
+
+/* ── Markdown (chat-md) ── */
+.chat-md {
+  white-space: normal;
+}
+.chat-md-fallback {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.chat-md > :first-child {
+  margin-top: 0;
+}
+.chat-md > :last-child {
+  margin-bottom: 0;
+}
+.chat-md p {
+  margin: 0.5em 0;
+}
+.chat-md ul,
+.chat-md ol {
+  padding-left: 1.4em;
+  margin: 0.5em 0;
+}
+.chat-md li {
+  margin: 0.15em 0;
+}
+.chat-md h1,
+.chat-md h2,
+.chat-md h3,
+.chat-md h4 {
+  margin: 0.8em 0 0.4em;
+  line-height: 1.3;
+  font-weight: 600;
+}
+.chat-md h1 {
+  font-size: 1.25em;
+}
+.chat-md h2 {
+  font-size: 1.15em;
+}
+.chat-md h3 {
+  font-size: 1.05em;
+}
+.chat-md blockquote {
+  border-left: 3px solid var(--ide-border-strong);
+  padding-left: 0.8em;
+  margin: 0.5em 0;
+  color: var(--ide-text-secondary);
+}
+.chat-md table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 12px;
+}
+.chat-md th,
+.chat-md td {
+  border: 1px solid var(--ide-border);
+  padding: 3px 8px;
+}
+.chat-md a {
+  color: var(--ide-accent);
+  text-decoration: none;
+}
+.chat-md a:hover {
+  text-decoration: underline;
+}
+.chat-md hr {
+  border: none;
+  border-top: 1px solid var(--ide-border);
+  margin: 0.8em 0;
+}
+.chat-inline-code {
+  font-family: var(--ide-font-mono, ui-monospace, monospace);
+  font-size: 0.88em;
+  background: var(--ide-bg-chrome);
+  border: 1px solid var(--ide-border);
+  border-radius: 4px;
+  padding: 0.05em 0.35em;
+}
+.chat-code-block {
+  margin: 0.5em 0;
+  border: 1px solid var(--ide-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--ide-bg-editor);
+}
+.chat-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 3px 10px;
+  background: var(--ide-bg-chrome);
+  border-bottom: 1px solid var(--ide-border);
+  font-size: 11px;
+}
+.chat-code-lang {
+  color: var(--ide-text-tertiary);
+  text-transform: lowercase;
+}
+.chat-code-copy {
+  color: var(--ide-text-tertiary);
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+.chat-code-copy:hover {
+  color: var(--ide-text-primary);
+}
+.chat-code-body {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: var(--ide-font-mono, ui-monospace, monospace);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ide-text-primary);
+}
+
+/* AI 助手快捷入口下拉：修正文字挤压（issue #1）—— 列表项纵向排布、正常换行 */
+.innos-app .agent-quick-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  width: 280px;
+  background: var(--ide-bg-panel);
+  border: 1px solid var(--ide-border);
+  border-radius: var(--ide-radius-md);
+  box-shadow: var(--ide-shadow-pop, 0 8px 24px rgba(0, 0, 0, 0.16));
+  z-index: 111;
+  padding: 6px;
+}
+.innos-app .agent-quick-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  border-radius: var(--ide-radius-sm);
+  cursor: pointer;
+  text-align: left;
+}
+.innos-app .agent-quick-item:hover {
+  background: var(--ide-bg-chrome);
+}
+.innos-app .agent-quick-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.innos-app .agent-quick-item:disabled:hover {
+  background: transparent;
+}
+.innos-app .agent-quick-item .aqi-title {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 13px;
+  color: var(--ide-text-primary);
+}
+.innos-app .agent-quick-item .aqi-hint {
+  font-size: 11.5px;
+  color: var(--ide-text-tertiary);
+  white-space: normal;
+  line-height: 1.4;
+}
+
+/* 历史对话列表项 */
+.chat-history-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  text-align: left;
+  padding: 9px 11px;
+  margin: 4px 0;
+  background: var(--ide-bg-elevated);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.chat-history-item:hover {
+  border-color: var(--ide-border-strong);
+  background: var(--ide-bg-chrome);
+}
+.chat-history-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+}
+.chat-history-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ide-text-primary);
+  min-width: 0;
+}
+.chat-history-sub {
+  font-size: 11.5px;
+  color: var(--ide-text-tertiary);
+}
+
+/* 新建对话按钮 + 历史项删除按钮 */
+.chat-newchat {
+  width: 100%;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+.chat-history-item {
+  position: relative;
+}
+.chat-history-del {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--ide-text-tertiary);
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.chat-history-item:hover .chat-history-del {
+  opacity: 1;
+}
+.chat-history-del:hover {
+  color: var(--state-error);
+  background: var(--state-error-soft);
+}
+
+/* 表单小标签（提示词编辑器等） */
+.innos-app .ide-label {
+  font-size: 11.5px;
+  color: var(--ide-text-tertiary);
+  margin-bottom: 3px;
+}
+
+/* AI 助手拆分按钮：主体(直接对话) + 下拉箭头(预置提示词) */
+.innos-app .ide-split-btn {
+  display: inline-flex;
+  align-items: stretch;
+}
+.innos-app .ide-split-btn .ide-split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.innos-app .ide-split-btn .ide-split-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid color-mix(in srgb, var(--ide-text-on-accent, #fff) 28%, transparent);
+  padding-left: 6px;
+  padding-right: 6px;
+}
+
+/* ---- Report package editor (modal) ---- */
+.pkg-editor-backdrop,
+.ide-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, #000 42%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.ide-modal {
+  display: flex;
+  flex-direction: column;
+  background: var(--ide-bg-panel);
+  border: 1px solid var(--ide-border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+}
+.ide-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--ide-border);
+  background: var(--ide-bg-chrome);
+  font-weight: 600;
+  font-size: 13px;
+}
+.ide-modal-body {
+  padding: 14px;
+  overflow-y: auto;
+  min-height: 0;
+}
+.ide-modal-footer {
+  padding: 10px 14px;
+  border-top: 1px solid var(--ide-border);
+  background: var(--ide-bg-chrome);
+}
+.pkg-editor {
+  width: min(1040px, 94vw);
+  height: min(760px, 90vh);
+  display: flex;
+  flex-direction: column;
+  background: var(--ide-bg-panel);
+  border: 1px solid var(--ide-border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+}
+.pkg-editor-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ide-border);
+  background: var(--ide-bg-chrome);
+}
+.pkg-editor-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--ide-border-subtle);
+}
+.pkg-editor-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.pkg-editor-files {
+  width: 240px;
+  border-right: 1px solid var(--ide-border);
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.pkg-editor-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--ide-text-secondary);
+  cursor: pointer;
+}
+.pkg-editor-file:hover {
+  background: var(--ide-bg-chrome);
+}
+.pkg-editor-file-active {
+  background: var(--ide-bg-chrome);
+  border-color: var(--ide-border-subtle);
+  color: var(--ide-text-primary);
+}
+.pkg-editor-ro {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--ide-text-tertiary);
+}
+.pkg-editor-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 8px;
+}
+.pkg-editor-text {
+  flex: 1;
+  resize: none;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 2;
+}
+.pkg-editor-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 8px;
+}
+.pkg-editor-hint {
+  padding: 8px 12px;
+  border-top: 1px solid var(--ide-border-subtle);
+  font-size: 11.5px;
+  color: var(--ide-text-tertiary);
+  line-height: 1.6;
+  background: var(--ide-bg-chrome);
+}
+/* Grouped file tree: a small uppercase-ish 中文 label above each group. */
+.pkg-editor-group {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--ide-text-tertiary);
+  padding: 4px 8px 2px;
+  text-transform: none;
+}
+/* Description bar above the editor explaining the active file. */
+.pkg-editor-desc {
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: 6px;
+  background: var(--ide-bg-chrome);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.pkg-editor-desc-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--ide-text-primary);
+}
+.pkg-editor-desc-body {
+  font-size: 12px;
+  color: var(--ide-text-secondary);
+  line-height: 1.55;
+}
+.pkg-editor-desc-hint {
+  font-size: 11.5px;
+  color: var(--ide-text-tertiary);
+  line-height: 1.55;
+}
+.pkg-editor-tag {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--ide-text-tertiary);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+/* Transform dependency (raw_*) helper. */
+.pkg-editor-deps {
+  margin-bottom: 6px;
+}
+.pkg-editor-deps-toggle {
+  background: transparent;
+  border: none;
+  color: var(--ide-text-secondary);
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.pkg-editor-deps-toggle:hover {
+  color: var(--ide-text-primary);
+}
+.pkg-editor-deps-body {
+  font-size: 11.5px;
+  color: var(--ide-text-secondary);
+  line-height: 1.6;
+  background: var(--ide-bg-chrome);
+  border: 1px solid var(--ide-border-subtle);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* Save/seal phase chip in the footer. */
+.pkg-editor-phase {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 4px;
+}
+.pkg-editor-phase[data-phase='dirty'] {
+  color: var(--state-warning, #b8860b);
+  background: color-mix(in srgb, var(--state-warning, #b8860b) 14%, transparent);
+}
+.pkg-editor-phase[data-phase='saved'] {
+  color: var(--ide-accent, var(--ide-text-secondary));
+  background: color-mix(in srgb, var(--ide-accent, #4a90d9) 14%, transparent);
+}
+.pkg-editor-phase[data-phase='sealed'] {
+  color: var(--state-success);
+  background: color-mix(in srgb, var(--state-success) 14%, transparent);
+}
+
+/* ---- Field role toggle chips (ReportsEditor) ---- */
+.ide-chip-toggle {
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--ide-border);
+  background: var(--ide-bg-chrome);
+  color: var(--ide-text-tertiary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ide-chip-toggle:hover {
+  color: var(--ide-text-primary);
+  border-color: var(--ide-border-strong, var(--ide-border));
+}
+.ide-chip-toggle-on {
+  background: color-mix(in srgb, var(--ide-accent, #2563eb) 16%, transparent);
+  border-color: var(--ide-accent, #2563eb);
+  color: var(--ide-accent, #2563eb);
+  font-weight: 600;
+}

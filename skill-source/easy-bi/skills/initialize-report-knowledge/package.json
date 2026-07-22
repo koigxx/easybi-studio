@@ -1,0 +1,48 @@
+{
+  "name": "@easybi/initialize-report-knowledge",
+  "version": "0.16.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "bin": {
+    "easybi-knowledge": "dist/scripts/catalog-cli.js"
+  },
+  "files": [
+    "SKILL.md",
+    "\u4f7f\u7528\u8bf4\u660e.md",
+    "agents",
+    "assets",
+    "dist/scripts",
+    "npm-shrinkwrap.json",
+    "scripts",
+    "references"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "cli": "node dist/scripts/catalog-cli.js",
+    "bootstrap:core": "node scripts/bootstrap-dependencies.mjs core",
+    "bootstrap:excel": "node scripts/bootstrap-dependencies.mjs excel",
+    "bootstrap:dev": "node scripts/bootstrap-dependencies.mjs dev"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "mysql2": "3.23.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/pg": "^8.20.0",
+    "typescript": "7.0.2"
+  },
+  "optionalDependencies": {
+    "exceljs": "4.4.0"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
+  }
+}

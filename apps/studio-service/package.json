@@ -1,0 +1,33 @@
+{
+  "name": "@easybi-studio/studio-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@easybi-studio/agent-bridge": "workspace:*",
+    "@easybi-studio/artifact-exporter": "workspace:*",
+    "@easybi-studio/checkpoint": "workspace:*",
+    "@easybi-studio/config-sdk": "workspace:*",
+    "@easybi-studio/contracts": "workspace:*",
+    "@easybi-studio/job-manager": "workspace:*",
+    "@easybi-studio/runtime-supervisor": "workspace:*",
+    "@easybi-studio/skill-bundle-manager": "workspace:*",
+    "@easybi-studio/skill-bundle-source": "workspace:*",
+    "@easybi-studio/workspace-bootstrapper": "workspace:*",
+    "@easybi-studio/workspace-sdk": "workspace:*",
+    "better-sqlite3": "^11.8.1",
+    "fastify": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "tsx": "^4.19.2"
+  }
+}

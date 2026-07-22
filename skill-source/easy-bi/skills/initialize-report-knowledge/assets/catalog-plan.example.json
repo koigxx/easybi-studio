@@ -1,0 +1,33 @@
+{
+  "plan_version": "2",
+  "status": "proposed",
+  "approval": {
+    "status": "pending",
+    "approved_by": null,
+    "approved_at": null,
+    "decision": null
+  },
+  "entries": [
+    {
+      "table_id": "transport-mysql/transport_order/transport_order",
+      "forced_hot": true,
+      "proposed_tier": "hot",
+      "final_tier": "hot",
+      "lifecycle": "active",
+      "confidence": "confirmed",
+      "classification": {
+        "score": 100,
+        "hot_threshold": 80,
+        "cold_threshold": 25,
+        "override": {
+          "source": "user",
+          "reason": "用户指定为强制热表"
+        }
+      },
+      "reasons": [
+        "用户指定为强制热表"
+      ],
+      "business_domain": "订单域"
+    }
+  ]
+}

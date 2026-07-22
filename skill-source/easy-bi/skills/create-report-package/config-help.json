@@ -1,0 +1,18 @@
+{
+  "schema_version": "1",
+  "skill_id": "create-report-package",
+  "configs": [
+    {
+      "target": "runtime",
+      "file": "toolkit/config/runtime.json",
+      "title": "Runtime 配置",
+      "summary": "报表 Runtime（执行报表查询、生成 Excel、导出到 OSS 的本地服务）的运行参数。Studio 启动 Runtime 时读取。多数项有默认值，通常无需改动。",
+      "sections": [
+        { "key": "server", "label": "服务", "desc": "Runtime 监听的端口/地址等（Studio 会用动态端口托管，一般不用手填）。" },
+        { "key": "database", "label": "数据库执行", "desc": "查询超时、最大返回行数、连接池等执行期限制。只读查询。" },
+        { "key": "export", "label": "导出", "desc": "Excel 生成与分片、临时目录、单次导出上限等。" },
+        { "key": "storage", "label": "对象存储", "desc": "导出文件上传目标（对应构建配置里的 OSS profile）。" }
+      ]
+    }
+  ]
+}

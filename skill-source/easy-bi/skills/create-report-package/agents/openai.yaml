@@ -1,0 +1,4 @@
+interface:
+  display_name: "生成 Easy BI 报表包"
+  short_description: "生成报表逻辑包，并通过共享 Runtime 提供接口和导出"
+  default_prompt: "使用 $create-report-package 根据当前 Easy BI 知识库和报表需求生成可审核的报表包，并用内置共享 Runtime 校验接口或同步导出。"

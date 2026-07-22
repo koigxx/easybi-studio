@@ -1,0 +1,21 @@
+{
+  "bundle_manifest": "bundle.manifest.json",
+  "bundle_contract": {
+    "path": "目录与项目兼容性规范.md",
+    "version": "1",
+    "required_before_skill_update": true
+  },
+  "skills": [],
+  "design_references": [
+    {
+      "id": "initialize-report-knowledge",
+      "path": "initialize-report-knowledge",
+      "status": "typescript-implementation-maintained-v0.12.0"
+    },
+    {
+      "id": "create-report-package",
+      "path": "create-report-package",
+      "status": "typescript-v2-only-maintained-v2.2.0"
+    }
+  ]
+}

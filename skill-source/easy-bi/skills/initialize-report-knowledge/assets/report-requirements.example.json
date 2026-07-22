@@ -1,0 +1,42 @@
+{
+  "report_requirements": [
+    {
+      "id": "driver-basic-detail",
+      "name": "司机基础信息明细",
+      "required_fields": [
+        {
+          "field": "base_primary_driver.code",
+          "label": "司机编码"
+        },
+        {
+          "field": "base_primary_driver.name",
+          "label": "司机姓名"
+        },
+        {
+          "field": "base_primary_driver.phone",
+          "label": "手机号"
+        },
+        {
+          "field": "base_primary_driver.driver_license",
+          "label": "驾照类型"
+        },
+        {
+          "field": "base_primary_driver.driver_license_number",
+          "label": "驾驶证件号"
+        },
+        {
+          "field": "base_primary_driver.carrier_name",
+          "label": "承运商名称"
+        },
+        {
+          "field": "base_primary_driver.enable_status",
+          "label": "启用状态"
+        },
+        {
+          "field": "base_primary_driver.create_time",
+          "label": "创建时间"
+        }
+      ]
+    }
+  ]
+}

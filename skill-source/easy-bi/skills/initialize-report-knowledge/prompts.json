@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "skill_id": "initialize-report-knowledge",
+  "presets": [
+    {
+      "action": "initialize-knowledge",
+      "label": "初始化知识库",
+      "hint": "按 SKILL 引导校验配置、扫描、提出热温冷分层",
+      "write": true,
+      "prompt": "你在一个 Easy BI 工作区中。请阅读 skills/initialize-report-knowledge/SKILL.md，根据 config/easy-bi.json 引导初始化知识库：校验配置、（在获得授权且有连接时）扫描数据库、提出热温冷分层方案。严格遵循 SKILL.md 的审核门禁；使用 dist/scripts 下的确定性 CLI；数据库只读、禁止 DDL/DML；不要修改 /Users/admin/innos/easy-bi-workspace/easy-bi；涉及业务判断（热温冷分层、枚举语义）时先输出待确认内容并停下等待用户确认，不要自行批准。"
+    }
+  ]
+}

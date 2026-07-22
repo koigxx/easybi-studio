@@ -1,0 +1,40 @@
+# ── Easy BI Studio 单仓库 .gitignore ──
+# 本仓库 = Studio 应用代码 + skill-source/（技能包源，含编译产物 dist）。
+# 用户 clone 本仓库 → install → 启动 → 新建工作区（技能包从 skill-source/ 装入
+# 仓库外同级的 easybi-studio-workspaces/）→ 页面配连接 → 即用。
+
+# ── 依赖 / 日志 / 系统文件 ──
+node_modules/
+*.log
+.DS_Store
+coverage/
+.studio-data/
+*.tsbuildinfo
+.vite/
+# Claude Code 本机个人配置（权限授权等），不入库
+.claude/
+# JetBrains IDE 个人配置 / 本地缓存，不入库
+.idea/
+
+# ── 构建产物 ──
+# Studio 应用自身的 dist 可由 build 重生成，不入库。
+dist/
+# 但技能包编译产物【必须入库】—— create 工作区时直接拷贝，实现零构建拉取即用。
+# 用取消忽略规则把 skill-source 下的 dist 重新纳入。
+!skill-source/**/dist/
+!skill-source/**/dist/**
+
+# ── 技能源里的依赖不入库（体量大；工作区安装时从别处恢复） ──
+skill-source/**/node_modules/
+
+# ── vendor/ 是 sync 的技能包快照产物，运行时零引用（create 直接用 skill-source），
+#    可由 `npm run sync` 随时重新生成 → 不入库。 ──
+vendor/
+
+# ── 运行时密钥文件：实例级 runtime.json 不入库（双保险） ──
+# 模板 runtime.example.json / runtime.schema.json 始终入库。
+**/toolkit/config/runtime.json
+**/*.secret.json
+# 例外：skill-source 里各技能包的 runtime.json 是随技能包分发的空占位模板，
+# 约定绝不填敏感信息，入库。（* 匹配 easy-bi 及后续新增的技能包目录）
+!skill-source/*/toolkit/config/runtime.json

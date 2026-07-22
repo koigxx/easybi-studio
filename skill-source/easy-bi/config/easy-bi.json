@@ -1,0 +1,110 @@
+{
+  "config_version": "4",
+  "setup_status": "draft",
+  "system": {
+    "id": null,
+    "name": null,
+    "description": "",
+    "timezone": "Asia/Shanghai",
+    "locale": "zh-CN",
+    "business_domains": []
+  },
+  "connections": {
+    "database_profiles": [],
+    "object_storage_profiles": []
+  },
+  "knowledge": {
+    "database_profile_ids": [],
+    "inactivity_days": 90,
+    "classification": {
+      "hot_threshold": 80,
+      "cold_threshold": 25
+    },
+    "activity_probe": {
+      "enabled": true,
+      "require_index": false,
+      "unindexed_max_columns": 2,
+      "statement_timeout_seconds": 8,
+      "candidate_columns": [
+        "updated_at",
+        "update_time",
+        "modified_at",
+        "modified_time",
+        "gmt_modified",
+        "created_at",
+        "create_time",
+        "created_time",
+        "gmt_create",
+        "business_date",
+        "biz_date"
+      ]
+    },
+    "forced_hot_tables": [],
+    "business_semantics": [],
+    "report_scenarios": [],
+    "report_requirements": [
+      {
+        "id": "driver-basic-detail",
+        "name": "司机基础信息明细",
+        "required_fields": [
+          { "field": "base_primary_driver.code", "label": "司机编码" },
+          { "field": "base_primary_driver.name", "label": "司机姓名" },
+          { "field": "base_primary_driver.phone", "label": "手机号" },
+          { "field": "base_primary_driver.driver_license", "label": "驾照类型" },
+          { "field": "base_primary_driver.driver_license_number", "label": "驾驶证件号" },
+          { "field": "base_primary_driver.carrier_name", "label": "承运商名称" },
+          { "field": "base_primary_driver.enable_status", "label": "启用状态" },
+          { "field": "base_primary_driver.create_time", "label": "创建时间" }
+        ]
+      }
+    ],
+    "semantic_defaults": {
+      "interaction_mode": "minimal",
+      "filters": {
+        "report_fields_enabled": true,
+        "identifier_operator": "eq",
+        "string_operator": "contains",
+        "number_operator": "between",
+        "date_operator": "between",
+        "enum_operator": "in",
+        "boolean_operator": "eq",
+        "large_text_enabled": false
+      },
+      "review": {
+        "ask_only_blocking_questions": true,
+        "one_confirmation_per_stage": true,
+        "enum_review_mode": "batch_after_build",
+        "security_review_mode": "batch_after_build"
+      }
+    },
+    "confirmed_cold_patterns": [],
+    "evidence_sources": {
+      "source_code_paths": [],
+      "existing_report_paths": [],
+      "query_history_enabled": false
+    },
+    "profiling": {
+      "allow_value_sampling": false,
+      "candidate_tables_only": true,
+      "sample_limit": 1000
+    }
+  },
+  "security": {
+    "tenant_mode": "unknown",
+    "tenant_field_hints": [],
+    "organization_field_hints": []
+  },
+  "delivery": {
+    "mode": "auto",
+    "object_storage_profile_id": null,
+    "local_output_directory": "outputs/files"
+  },
+  "export": {
+    "target": "linux-x64-glibc",
+    "business_integration": {
+      "base_url": null,
+      "task_event_path": "/internal/easybi/report-task-events",
+      "auth": null
+    }
+  }
+}

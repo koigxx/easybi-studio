@@ -1,0 +1,79 @@
+{
+  "table_id": "demo-mysql/demo_db/base_primary_driver",
+  "physical": {
+    "profile_id": "demo-mysql",
+    "database": "demo_db",
+    "table": "base_primary_driver",
+    "comment": "司机基础信息"
+  },
+  "schema_fingerprint": "fp-driver-0001",
+  "business": { "name": "司机", "status": "inferred" },
+  "security": { "scope_status": "not_applicable" },
+  "system_conditions": [
+    { "field": "is_delete", "operator": "eq", "value": 0 }
+  ],
+  "physical_fields": [
+    {
+      "physical": { "name": "code", "native_type": "varchar(64)", "comment": "司机编码", "primary_key": false },
+      "semantic": { "name": "司机编码", "status": "inferred", "report_exposed": true },
+      "filter": {
+        "enabled": true,
+        "role": "business_identifier",
+        "visibility": "user",
+        "default_operator": "eq",
+        "operators": ["eq", "in"],
+        "input_type": "string",
+        "required": false,
+        "status": "inferred"
+      }
+    },
+    {
+      "physical": { "name": "name", "native_type": "varchar(128)", "comment": "司机姓名", "primary_key": false },
+      "semantic": { "name": "司机姓名", "status": "inferred", "report_exposed": true },
+      "filter": {
+        "enabled": true,
+        "role": "text",
+        "visibility": "user",
+        "default_operator": "contains",
+        "operators": ["contains", "eq"],
+        "input_type": "string",
+        "required": false,
+        "status": "inferred"
+      }
+    },
+    {
+      "physical": { "name": "id", "native_type": "bigint", "comment": "主键", "primary_key": true },
+      "semantic": { "name": "主键", "status": "inferred", "report_exposed": false },
+      "filter": { "enabled": false, "role": "business_identifier", "visibility": "system", "default_operator": "eq", "operators": ["eq"], "input_type": "number", "required": false, "status": "inferred" }
+    },
+    {
+      "physical": { "name": "create_time", "native_type": "datetime", "comment": "创建时间", "primary_key": false },
+      "semantic": { "name": "创建时间", "status": "inferred", "report_exposed": true },
+      "filter": {
+        "enabled": true,
+        "role": "time",
+        "visibility": "user",
+        "default_operator": "between",
+        "operators": ["between", "gte", "lte"],
+        "input_type": "datetime",
+        "required": false,
+        "status": "inferred"
+      }
+    },
+    {
+      "physical": { "name": "is_delete", "native_type": "tinyint", "comment": "0正常,1删除", "primary_key": false },
+      "semantic": { "name": "逻辑删除", "status": "inferred", "report_exposed": false },
+      "filter": {
+        "enabled": true,
+        "role": "system_condition",
+        "visibility": "system",
+        "default_operator": "eq",
+        "operators": ["eq"],
+        "input_type": "number",
+        "required": false,
+        "status": "inferred",
+        "fixed_value": 0
+      }
+    }
+  ]
+}

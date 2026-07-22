@@ -1,0 +1,48 @@
+{
+  "name": "@easybi/create-report-package",
+  "version": "2.21.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "bin": {
+    "easybi-report-package": "dist/scripts/report-package-cli.js",
+    "easybi-runtime": "dist/scripts/runtime-cli.js"
+  },
+  "files": [
+    "SKILL.md",
+    "使用说明.md",
+    "agents",
+    "assets",
+    "dist/scripts",
+    "npm-shrinkwrap.json",
+    "scripts",
+    "references"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "cli": "node dist/scripts/report-package-cli.js",
+    "runtime": "node dist/scripts/runtime-cli.js",
+    "bootstrap:core": "node scripts/bootstrap-dependencies.mjs core",
+    "bootstrap:runtime": "node scripts/bootstrap-dependencies.mjs runtime",
+    "bootstrap:dev": "node scripts/bootstrap-dependencies.mjs dev"
+  },
+  "optionalDependencies": {
+    "ali-oss": "6.23.0",
+    "exceljs": "4.4.0",
+    "mysql2": "3.23.0",
+    "pg": "8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/pg": "8.15.6",
+    "typescript": "7.0.2"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
+  }
+}

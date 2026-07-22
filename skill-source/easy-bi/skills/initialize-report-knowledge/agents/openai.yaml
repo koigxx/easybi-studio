@@ -1,0 +1,4 @@
+interface:
+  display_name: "初始化报表知识库"
+  short_description: "连接多个MySQL数据库，生成可审核、可维护、可发布的报表知识库"
+  default_prompt: "使用 $initialize-report-knowledge 引导我配置 MySQL 和计划报表，确认热温冷后自动应用语义与筛选默认值；只汇总询问阻塞问题，不逐表提问。"

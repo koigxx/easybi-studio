@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://easybi.local/schemas/runtime-config-v1.json",
+  "title": "Easy BI Runtime 配置",
+  "type": "object",
+  "required": [
+    "config_version",
+    "http",
+    "execution_strategy",
+    "aliyun_oss",
+    "business_task_integration",
+    "storage"
+  ],
+  "properties": {
+    "config_version": {
+      "const": "1"
+    },
+    "http": {
+      "type": "object",
+      "required": [
+        "host",
+        "port",
+        "always_http_200"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "always_http_200": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution_strategy": {
+      "type": "object",
+      "required": [
+        "supported_modes",
+        "default_mode",
+        "request_field",
+        "never_auto_switch_mode",
+        "sync",
+        "async"
+      ],
+      "properties": {
+        "supported_modes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "sync",
+              "async"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "default_mode": {
+          "enum": [
+            "sync",
+            "async"
+          ]
+        },
+        "request_field": {
+          "const": "executionMode"
+        },
+        "never_auto_switch_mode": {
+          "const": true
+        },
+        "sync": {
+          "$ref": "#/$defs/syncPolicy"
+        },
+        "async": {
+          "$ref": "#/$defs/asyncPolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "aliyun_oss": {
+      "$ref": "#/$defs/ossProfile"
+    },
+    "business_task_integration": {
+      "$ref": "#/$defs/businessTaskProfile"
+    },
+    "storage": {
+      "type": "object",
+      "required": [
+        "sqlite_path",
+        "temp_directory",
+        "local_output_directory"
+      ],
+      "properties": {
+        "sqlite_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "temp_directory": {
+          "type": "string",
+          "minLength": 1
+        },
+        "local_output_directory": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "syncPolicy": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "query_timeout_seconds",
+        "total_timeout_seconds",
+        "max_rows_per_sheet",
+        "max_sheets_per_workbook",
+        "max_columns",
+        "max_file_bytes",
+        "sheet_overflow",
+        "build_to_temp_file_before_response"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "query_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "total_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_rows_per_sheet": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048575
+        },
+        "max_sheets_per_workbook": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_columns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16384
+        },
+        "max_file_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sheet_overflow": {
+          "enum": [
+            "split",
+            "error"
+          ]
+        },
+        "build_to_temp_file_before_response": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "asyncPolicy": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "query_timeout_seconds",
+        "worker_concurrency",
+        "max_queue_size",
+        "requires_object_storage",
+        "requires_business_task_integration"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "query_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "worker_concurrency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_queue_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "requires_object_storage": {
+          "const": true
+        },
+        "requires_business_task_integration": {
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "ossProfile": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "endpoint",
+        "region",
+        "bucket",
+        "access_key_id",
+        "access_key_secret",
+        "object_prefix",
+        "url_mode",
+        "signed_url_expires_seconds"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "bucket": {
+          "type": "string"
+        },
+        "access_key_id": {
+          "type": "string"
+        },
+        "access_key_secret": {
+          "type": "string"
+        },
+        "object_prefix": {
+          "type": "string"
+        },
+        "url_mode": {
+          "enum": [
+            "signed",
+            "public"
+          ]
+        },
+        "signed_url_expires_seconds": {
+          "type": "integer",
+          "minimum": 60
+        }
+      },
+      "additionalProperties": false
+    },
+    "businessTaskProfile": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "base_url",
+        "create_task",
+        "update_task",
+        "auth"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "create_task": {
+          "$ref": "#/$defs/taskEndpoint"
+        },
+        "update_task": {
+          "$ref": "#/$defs/taskEndpoint"
+        },
+        "auth": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    },
+    "taskEndpoint": {
+      "type": "object",
+      "required": [
+        "method",
+        "path",
+        "timeout_seconds"
+      ],
+      "properties": {
+        "method": {
+          "enum": [
+            "POST",
+            "PUT",
+            "PATCH"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

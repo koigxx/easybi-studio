@@ -1,0 +1,142 @@
+{
+  "bundle_format_version": "1",
+  "bundle_id": "easybi",
+  "bundle_version": "1.24.0",
+  "display_name": "Easy BI 技能包",
+  "compatibility": {
+    "workspace_formats": [
+      "1"
+    ],
+    "config_formats": [
+      "4"
+    ],
+    "catalog_formats": [
+      "3"
+    ],
+    "report_plan_formats": [
+      "2"
+    ],
+    "report_package_formats": [
+      "2"
+    ],
+    "runtime_config_formats": [
+      "1"
+    ],
+    "runtime_api_versions": [
+      "v1"
+    ]
+  },
+  "skills": [
+    {
+      "id": "initialize-report-knowledge",
+      "version": "0.16.0",
+      "path": "initialize-report-knowledge",
+      "agent_entry": "initialize-report-knowledge/SKILL.md",
+      "agent_prompts": "initialize-report-knowledge/prompts.json",
+      "config_help": "initialize-report-knowledge/config-help.json",
+      "commands": {
+        "cli": "initialize-report-knowledge/dist/scripts/catalog-cli.js",
+        "approve_plan": "initialize-report-knowledge/dist/scripts/catalog-cli.js",
+        "bootstrap_dependencies": "initialize-report-knowledge/scripts/bootstrap-dependencies.mjs"
+      }
+    },
+    {
+      "id": "create-report-package",
+      "version": "2.21.0",
+      "path": "create-report-package",
+      "agent_entry": "create-report-package/SKILL.md",
+      "agent_prompts": "create-report-package/prompts.json",
+      "config_help": "create-report-package/config-help.json",
+      "commands": {
+        "package_cli": "create-report-package/dist/scripts/report-package-cli.js",
+        "configure_plan": "create-report-package/dist/scripts/report-package-cli.js",
+        "runtime_cli": "create-report-package/dist/scripts/runtime-cli.js",
+        "bootstrap_dependencies": "create-report-package/scripts/bootstrap-dependencies.mjs"
+      }
+    }
+  ],
+  "workspace_contract": {
+    "bootstrap_contract_version": "1",
+    "supported_modes": [
+      "init",
+      "check",
+      "upgrade"
+    ],
+    "path_bases": {
+      "skill_paths_and_commands": "bundle-root",
+      "workspace_paths": "workspace-root",
+      "template_sources": "workspace-root"
+    },
+    "paths": {
+      "workspace_manifest": "workspace.json",
+      "project_config": "config/easy-bi.json",
+      "skill_registry": "skills/index.json",
+      "installed_bundle_manifest": "skills/bundle.manifest.json",
+      "installed_bundle_lock": "skills/bundle.lock.json",
+      "runtime_config": "toolkit/config/runtime.json",
+      "knowledge_index": "knowledge/index.json",
+      "knowledge_scans": "knowledge/scans",
+      "knowledge_drafts": "knowledge/drafts",
+      "knowledge_versions": "knowledge/versions",
+      "reports_index": "reports/index.json",
+      "report_plans": "reports/plans",
+      "report_packages": "reports/packages",
+      "outputs_index": "outputs/index.json",
+      "output_files": "outputs/files",
+      "work": "work"
+    },
+    "templates": {
+      "workspace_manifest": {
+        "source": "workspace.json",
+        "target": "workspace.json"
+      },
+      "project_config": {
+        "source": "skills/initialize-report-knowledge/assets/easy-bi-config.example.json",
+        "target": "config/easy-bi.json"
+      },
+      "runtime_config": {
+        "source": "toolkit/config/runtime.example.json",
+        "target": "toolkit/config/runtime.json"
+      }
+    },
+    "empty_indexes": {
+      "knowledge/index.json": {
+        "current_version": null,
+        "versions": []
+      },
+      "reports/index.json": {
+        "reports": []
+      },
+      "outputs/index.json": {
+        "artifacts": []
+      }
+    },
+    "bootstrap_policy": {
+      "create_missing_directories": true,
+      "create_missing_templates": true,
+      "create_missing_indexes": true,
+      "fill_missing_optional_config_defaults": true,
+      "overwrite_existing_user_config": false,
+      "overwrite_knowledge_drafts": false,
+      "overwrite_published_knowledge": false,
+      "overwrite_report_packages": false,
+      "overwrite_outputs": false,
+      "require_checkpoint_before_upgrade": true,
+      "require_user_confirmation_for_incompatible_upgrade": true
+    }
+  },
+  "distribution": {
+    "supported_source_types": [
+      "local-directory",
+      "local-archive",
+      "built-in",
+      "http-registry"
+    ],
+    "immutable_versions": true,
+    "verify_file_hashes": true,
+    "silent_workspace_upgrade": false
+  },
+  "contracts": {
+    "directory_compatibility": "目录与项目兼容性规范.md"
+  }
+}

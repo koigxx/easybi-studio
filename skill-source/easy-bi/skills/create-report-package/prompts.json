@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "skill_id": "create-report-package",
+  "presets": [
+    {
+      "action": "create-report",
+      "label": "构建报表",
+      "hint": "按 report_requirements 生成报表计划与报表包",
+      "write": true,
+      "prompt": "阅读 skills/create-report-package/SKILL.md，根据 config/easy-bi.json 里的 knowledge.report_requirements 生成报表计划；仅在有阻塞或缺失业务逻辑时提出一个合并问题，批准后生成报表包并静态校验。严格遵循 SKILL.md 的审核门禁；使用 dist/scripts 下的确定性 CLI；数据库只读、禁止 DDL/DML；不要修改 /Users/admin/innos/easy-bi-workspace/easy-bi；涉及业务判断（报表计划、发布）时先输出待确认内容并停下等待用户确认，不要自行批准；不要把静态校验当作真实导出成功。"
+    }
+  ]
+}
