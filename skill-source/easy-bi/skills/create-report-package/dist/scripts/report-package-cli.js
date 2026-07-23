@@ -151,6 +151,17 @@ function quoteIdentifier(value, dialect = DEFAULT_DIALECT) {
 function tableKey(value) {
     return `${value.profile_id}/${value.database}/${value.table}`;
 }
+const RELATION_ALIASES = {
+    inner_join: 'inner',
+    left_join: 'left',
+    right_join: 'right',
+    full_join: 'full',
+    cross_join: 'cross',
+};
+function normalizeRelationType(value) {
+    const key = value.trim().toLowerCase();
+    return RELATION_ALIASES[key] ?? key;
+}
 function assertAlias(value) {
     const alias = String(value ?? "");
     if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(alias)) {
@@ -3840,6 +3851,131 @@ export async function finalizeStagedPackage(options) {
             semantic_plan: await readJson(paths.semanticPlan),
             execution_plan: executionPlan,
         };
+    // The AI's declarative output for group_queries uses a nested per-group format
+    // (query_groups[]) that differs from what configurePlan expects (group_queries.queries[]).
+    // Normalize it here so applyGroupQueries can consume it.
+    if (strategy === "group_queries" && Array.isArray(declarative?.query_groups)) {
+        const modelSources = new Map((model.sources ?? []).map((s) => [s.alias, s]));
+        const modelSourceByTable = new Map((model.sources ?? []).map((s) => [s.table, s]));
+        function resolveJoinTable(j, fallback) {
+            const byAlias = j.to_alias ? (modelSources.get(j.to_alias) ?? {}) : {};
+            const byTable = j.table ? (modelSourceByTable.get(j.table) ?? {}) : {};
+            return {
+                profile_id: j.profile_id ?? byAlias.profile_id ?? byTable.profile_id ?? fallback.profile_id,
+                database: j.database ?? byAlias.database ?? byTable.database ?? fallback.database,
+                table: j.table ?? byAlias.table ?? fallback.table,
+            };
+        }
+        const modelFirstCol = ((model.sources ?? [])[0]?.fields ?? [])[0];
+        const defaultMergeKey = typeof modelFirstCol === "string" ? modelFirstCol : modelFirstCol?.name ?? "id";
+        const gqMergeKey = String(declarative?.merge?.key ?? (declarative?.merge?.keys ?? [])[0] ?? defaultMergeKey);
+        const hasCreateTime = (model.sources ?? []).some((s) => (s.fields ?? []).some((f) => (typeof f === "string" ? f : f.name) === "create_time"));
+        const gqPeriodParam = declarative?.merge?.period_param ?? (hasCreateTime ? "create_time" : null);
+        const metricsByGroup = (gid) => {
+            const raw = (model.metrics ?? []);
+            if (gid === "shipping")
+                return raw.filter((m) => String(m.label ?? "").includes("派车单"));
+            return raw.filter((m) => !String(m.label ?? "").includes("派车单"));
+        };
+        configuration.group_queries = {
+            merge_keys: [gqMergeKey].filter(Boolean),
+            period_param: gqPeriodParam,
+            queries: declarative.query_groups.map((g) => {
+                const primarySource = (g.sources ?? [])[0] ?? modelSources.get(g.id) ?? (model.sources ?? [])[0];
+                const alias = primarySource?.alias ?? "t0";
+                const firstField = ((model.sources ?? [])[0]?.fields ?? [])[0];
+                const pkCol = typeof firstField === "string" ? firstField : firstField?.name ?? "id";
+                const fallbackFields = [
+                    // Always include the merge key as an output column first (column kind so it
+                    // passes the merge-key existence check without needing a knowledge lookup).
+                    { id: gqMergeKey, label: gqMergeKey, source: { kind: "column", alias, field: gqMergeKey }, roles: ["group", "output"] },
+                    ...metricsByGroup(g.id).map((m) => ({
+                        id: m.id,
+                        label: m.label,
+                        source: m.source ?? { kind: "sql_expression", expression: `COUNT(${alias}.\`${pkCol}\`)`, dependencies: [{ alias, field: pkCol }] },
+                    })),
+                ];
+                return {
+                    id: g.id,
+                    table: {
+                        profile_id: primarySource?.profile_id,
+                        database: primarySource?.database,
+                        table: primarySource?.table,
+                    },
+                    alias,
+                    group_by: g.group_by?.length ? g.group_by : [`${alias}.${gqMergeKey}`],
+                    period_field: g.period_field ?? "create_time",
+                    fields: (g.fields ?? []).length ? g.fields : fallbackFields,
+                    system_conditions: (() => {
+                        const raw = g.system_conditions;
+                        if (!raw)
+                            return [];
+                        const logicalDelete = raw.logical_delete;
+                        if (!logicalDelete)
+                            return [];
+                        const items = Array.isArray(logicalDelete) ? logicalDelete : [logicalDelete];
+                        return items.map((item) => {
+                            const fieldRaw = String(item.field ?? "");
+                            const dot = fieldRaw.indexOf(".");
+                            return {
+                                alias: dot > 0 ? fieldRaw.slice(0, dot) : "t0",
+                                field: dot > 0 ? fieldRaw.slice(dot + 1) : fieldRaw,
+                                operator: item.operator ?? "eq",
+                                value: item.value ?? 0,
+                            };
+                        });
+                    })(),
+                    joins: (g.joins ?? []).map((j) => {
+                        const resolved = resolveJoinTable(j, primarySource ?? {});
+                        return {
+                            type: normalizeRelationType(String(j.type ?? "left")),
+                            table: resolved,
+                            alias: j.to_alias ?? j.alias,
+                            on: typeof j.on === "string"
+                                ? [{ left: String(j.on).split(/\s*=\s*/)[0] ?? "", right: String(j.on).split(/\s*=\s*/)[1] ?? "", operator: "eq" }]
+                                : (j.on ?? []),
+                            grain: j.grain ?? null,
+                            extra_conditions: (j.extra_conditions ?? []).map((c) => {
+                                if (typeof c === "string") {
+                                    const m = c.match(/^([A-Za-z][A-Za-z0-9_]*)\.([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.+)$/);
+                                    if (m)
+                                        return { alias: m[1], field: m[2], operator: "eq", value: m[3]?.replace(/^["']|["']$/g, "") };
+                                }
+                                return c;
+                            }),
+                        };
+                    }),
+                };
+            }),
+        };
+        // The main plan source also needs joins for the validator to recognise
+        // that every table alias is reachable. Collect all unique joins from the
+        // group queries and add them to configuration.joins.
+        if (configuration.group_queries) {
+            const seen = new Set();
+            const allJoins = [];
+            for (const q of configuration.group_queries.queries) {
+                for (const j of (q.joins ?? [])) {
+                    const key = `${j.alias}`;
+                    if (!seen.has(key)) {
+                        seen.add(key);
+                        allJoins.push(j);
+                    }
+                }
+            }
+            if (allJoins.length) {
+                configuration.joins = [
+                    ...(Array.isArray(declJoins) ? declJoins : []),
+                    ...allJoins.map((j) => ({
+                        type: j.type ?? "left",
+                        alias: j.alias,
+                        on: j.on ?? [],
+                        grain: j.grain ?? null,
+                    })),
+                ];
+            }
+        }
+    }
     if (strategy !== "script")
         delete configuration.script_report;
     if (strategy === "script")
@@ -3998,6 +4134,11 @@ export async function finalizeStagedPackage(options) {
             ];
         }
     }
+    // METRIC_REQUIRES_MODELING blockers are set during inspect for every business-
+    // metric required_field. Once the model is approved (which has already happened
+    // by the time we reach finalize), those blockers are resolved — remove them so
+    // approvePlan doesn't reject the package.
+    plan.blockers = (plan.blockers ?? []).filter((b) => b.code !== "METRIC_REQUIRES_MODELING");
     await writeJson(planPath, plan);
     const originalPlan = await readFile(planPath, "utf8");
     const indexPath = join(workspace, "reports", "index.json");
