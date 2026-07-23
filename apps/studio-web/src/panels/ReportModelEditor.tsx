@@ -6,11 +6,13 @@ import {
   Link2,
   Plus,
   Save,
+  Search,
   Trash2,
   X,
 } from 'lucide-react';
 import {
   workspaceApi,
+  type AvailableField,
   type ReportModelDetail,
   type ReportModelRelationship,
 } from '../api.js';
@@ -42,6 +44,10 @@ export function ReportModelEditor({
   const [saving, setSaving] = useState(false);
   const [changed, setChanged] = useState(false);
   const [savedAny, setSavedAny] = useState(false);
+  // Per-source add-field picker state: sourceId -> { loading, fields, open, search }
+  const [pickers, setPickers] = useState<
+    Record<string, { loading: boolean; fields: AvailableField[]; open: boolean; search: string }>
+  >({});
 
   const load = useCallback(async () => {
     setError(null);
@@ -60,12 +66,10 @@ export function ReportModelEditor({
   const endpoints = useMemo(
     () =>
       (model?.sources ?? []).flatMap((source) =>
-        source.fields
-          .filter((field) => field.selected)
-          .map((field) => ({
-            value: `${source.id}.${field.name}`,
-            label: `${source.alias || source.id}.${field.label || field.name}`,
-          })),
+        source.fields.map((field) => ({
+          value: `${source.id}.${field.name}`,
+          label: `${source.alias || source.id}.${field.label || field.name}`,
+        })),
       ),
     [model],
   );
@@ -81,26 +85,54 @@ export function ReportModelEditor({
     setStatus(null);
   }
 
-  function toggleField(sourceId: string, fieldName: string): void {
+  function removeField(sourceId: string, fieldName: string): void {
     if (
       model?.relationships.some(
-        (relationship) =>
-          relationship.from === `${sourceId}.${fieldName}` ||
-          relationship.to === `${sourceId}.${fieldName}`,
-      ) &&
-      model.sources
-        .find((source) => source.id === sourceId)
-        ?.fields.find((field) => field.name === fieldName)?.selected
+        (r) => r.from === `${sourceId}.${fieldName}` || r.to === `${sourceId}.${fieldName}`,
+      )
     ) {
       setError(`字段 ${sourceId}.${fieldName} 正被关联关系使用，请先删除或修改关联`);
       return;
     }
     mutate((draft) => {
-      const source = draft.sources.find((item) => item.id === sourceId);
-      const field = source?.fields.find((item) => item.name === fieldName);
-      if (!field) return;
-      field.selected = !field.selected;
+      const source = draft.sources.find((s) => s.id === sourceId);
+      if (!source) return;
+      source.fields = source.fields.filter((f) => f.name !== fieldName);
     });
+  }
+
+  function addField(sourceId: string, field: AvailableField): void {
+    mutate((draft) => {
+      const source = draft.sources.find((s) => s.id === sourceId);
+      if (!source) return;
+      if (source.fields.some((f) => f.name === field.name)) return;
+      source.fields.push({
+        name: field.name,
+        label: field.label || field.name,
+        role: 'source',
+        selected: true,
+      });
+    });
+    setPickers((prev) => ({ ...prev, [sourceId]: { ...prev[sourceId]!, open: false, search: '' } }));
+  }
+
+  async function openPicker(sourceId: string): Promise<void> {
+    const current = pickers[sourceId];
+    if (current?.open) {
+      setPickers((prev) => ({ ...prev, [sourceId]: { ...current, open: false, search: '' } }));
+      return;
+    }
+    setPickers((prev) => ({
+      ...prev,
+      [sourceId]: { loading: true, fields: [], open: true, search: '' },
+    }));
+    try {
+      const fields = await workspaceApi.getAvailableFields(projectId, reportId, sourceId);
+      setPickers((prev) => ({ ...prev, [sourceId]: { loading: false, fields, open: true, search: '' } }));
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+      setPickers((prev) => ({ ...prev, [sourceId]: { loading: false, fields: [], open: false, search: '' } }));
+    }
   }
 
   function updateRelationship(index: number, patch: Partial<ReportModelRelationship>): void {
@@ -129,7 +161,7 @@ export function ReportModelEditor({
     if (!model) return;
     setError(null);
     setStatus(null);
-    const empty = model.sources.find((source) => !source.fields.some((field) => field.selected));
+    const empty = model.sources.find((s) => !s.fields.length);
     if (empty) {
       setError(`表 ${empty.alias || empty.id} 至少需要保留一个字段`);
       return;
@@ -140,11 +172,9 @@ export function ReportModelEditor({
         projectId,
         reportId,
         model.revision,
-        model.sources.map((source) => ({
-          id: source.id,
-          fields: source.fields
-            .filter((field) => field.selected)
-            .map((field) => ({ name: field.name, role: field.role })),
+        model.sources.map((s) => ({
+          id: s.id,
+          fields: s.fields.map((f) => ({ name: f.name, role: f.role })),
         })),
         model.relationships,
       );
@@ -240,71 +270,169 @@ export function ReportModelEditor({
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ fontSize: 13, fontWeight: 600 }}>表与字段</div>
                   <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
-                    勾选生成报表允许使用的物理字段。表的物理定位由模型锁定，不能在此改换数据源。
+                    管理该报表使用的物理字段。可从知识库添加新字段，或删除已选字段。
                   </div>
                 </div>
                 <div
                   style={{
                     display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
                     gap: 10,
                   }}
                 >
-                  {model.sources.map((source) => (
-                    <div key={source.id} className="ide-card" style={{ padding: 0, overflow: 'hidden' }}>
-                      <div
-                        style={{
-                          padding: '10px 12px',
-                          borderBottom: '1px solid var(--ide-border-subtle)',
-                          background: 'var(--ide-bg-chrome)',
-                        }}
-                      >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                          <Database className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)' }} />
-                          <strong style={{ fontSize: 12.5 }}>{source.alias || source.id}</strong>
-                          <span className="ide-badge ide-badge-neutral">
-                            {source.fields.filter((field) => field.selected).length}/{source.fields.length}
-                          </span>
-                        </div>
+                  {model.sources.map((source) => {
+                    const picker = pickers[source.id];
+                    const searchFilter = (picker?.search ?? '').trim().toLowerCase();
+                    const visible = (picker?.fields ?? []).filter(
+                      (f) => !searchFilter || f.name.toLowerCase().includes(searchFilter) || f.label.includes(searchFilter),
+                    );
+                    return (
+                      <div key={source.id} className="ide-card" style={{ padding: 0, overflow: 'visible', position: 'relative' }}>
                         <div
-                          className="ide-text-mono"
-                          style={{ marginTop: 3, fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
+                          style={{
+                            padding: '10px 12px',
+                            borderBottom: '1px solid var(--ide-border-subtle)',
+                            background: 'var(--ide-bg-chrome)',
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            gap: 8,
+                          }}
                         >
-                          {source.profileId} / {source.database}.{source.table}
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                              <Database className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)' }} />
+                              <strong style={{ fontSize: 12.5 }}>{source.alias || source.id}</strong>
+                              <span className="ide-badge ide-badge-neutral">{source.fields.length}</span>
+                            </div>
+                            <div
+                              className="ide-text-mono"
+                              style={{ marginTop: 3, fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
+                            >
+                              {source.profileId} / {source.database}.{source.table}
+                            </div>
+                          </div>
+                          <button
+                            className="ide-btn ide-btn-sm"
+                            onClick={() => void openPicker(source.id)}
+                            title="从知识库添加字段"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
                         </div>
-                      </div>
-                      <div className="ide-scroll" style={{ maxHeight: 250, padding: 7 }}>
-                        {source.fields.map((field) => (
-                          <label
-                            key={field.name}
+
+                        {/* Add-field picker — slides out to the right */}
+                        {picker?.open && (
+                          <div
                             style={{
-                              display: 'grid',
-                              gridTemplateColumns: '18px minmax(0, 1fr)',
-                              gap: 6,
-                              alignItems: 'start',
-                              padding: '5px 4px',
-                              cursor: 'pointer',
+                              position: 'absolute',
+                              top: 0,
+                              left: 'calc(100% + 8px)',
+                              width: 280,
+                              maxHeight: 360,
+                              zIndex: 50,
+                              background: '#fff',
+                              border: '1px solid var(--ide-border-default)',
+                              borderRadius: 6,
+                              boxShadow: '0 8px 24px rgba(0,0,0,.2)',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              overflow: 'hidden',
                             }}
                           >
-                            <input
-                              type="checkbox"
-                              checked={field.selected}
-                              onChange={() => toggleField(source.id, field.name)}
-                            />
-                            <span style={{ minWidth: 0 }}>
-                              <span style={{ display: 'block', fontSize: 12 }}>{field.label || field.name}</span>
-                              <span
-                                className="ide-text-mono"
-                                style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 10px 8px', borderBottom: '1px solid var(--ide-border-subtle)', flexShrink: 0 }}>
+                              <Search className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)', flexShrink: 0 }} />
+                              <input
+                                className="ide-input"
+                                style={{ flex: 1, fontSize: 12, padding: '3px 6px' }}
+                                placeholder="搜索字段名或中文名…"
+                                value={picker.search}
+                                onChange={(e) =>
+                                  setPickers((prev) => ({
+                                    ...prev,
+                                    [source.id]: { ...prev[source.id]!, search: e.target.value },
+                                  }))
+                                }
+                                autoFocus
+                              />
+                              <button
+                                className="ide-btn ide-btn-sm ide-btn-ghost"
+                                onClick={() =>
+                                  setPickers((prev) => ({
+                                    ...prev,
+                                    [source.id]: { ...prev[source.id]!, open: false, search: '' },
+                                  }))
+                                }
+                                title="关闭"
                               >
-                                {field.name}
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                            {picker.loading ? (
+                              <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: '8px 10px', display: 'block' }}>
+                                加载中…
                               </span>
-                            </span>
-                          </label>
-                        ))}
+                            ) : (
+                              <div className="ide-scroll" style={{ flex: 1, overflowY: 'auto', padding: '4px 6px' }}>
+                                {visible.length === 0 ? (
+                                  <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: '4px 6px', display: 'block' }}>
+                                    {picker.search ? '无匹配字段' : '该表全部字段已添加'}
+                                  </span>
+                                ) : (
+                                  visible.map((f) => (
+                                    <button
+                                      key={f.name}
+                                      className="ide-btn ide-btn-ghost ide-btn-sm"
+                                      style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 10px', lineHeight: 1.3 , marginBottom: '20px',}}
+                                      onClick={() => addField(source.id, f)}
+                                    >
+                                      <span style={{ display: 'block', fontSize: 12 }}>{f.label}</span>
+                                      <span style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                                        <span className="ide-text-mono">{f.name}</span>
+                                        {f.nativeType && <span style={{ marginLeft: 6 }}>{f.nativeType}</span>}
+                                      </span>
+                                    </button>
+                                  ))
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Selected fields */}
+                        <div className="ide-scroll" style={{ maxHeight: 260, overflowY: 'auto' }}>
+                          {source.fields.map((field) => (
+                            <div
+                              key={field.name}
+                              style={{
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'center',
+                                padding: '5px 10px',
+                              }}
+                            >
+                              <span style={{ minWidth: 0 }}>
+                                <span style={{ display: 'block', fontSize: 12 }}>{field.label || field.name}</span>
+                                <span
+                                  className="ide-text-mono"
+                                  style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
+                                >
+                                  {field.name}
+                                </span>
+                              </span>
+                              <button
+                                className="ide-btn ide-btn-sm ide-btn-ghost"
+                                title="删除字段"
+                                onClick={() => removeField(source.id, field.name)}
+                              >
+                                <Trash2 className="w-3.5 h-3.5" style={{ color: 'var(--state-error)' }} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </section>
 
@@ -320,7 +448,7 @@ export function ReportModelEditor({
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 600 }}>关联关系</div>
                     <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
-                      每条关系直接连接两个已选字段；基数会影响去重和扇出风险判断。
+                      每条关系连接两个已选字段；基数影响去重和扇出风险判断。
                     </div>
                   </div>
                   <button className="ide-btn ide-btn-sm" onClick={addRelationship}>
@@ -334,9 +462,9 @@ export function ReportModelEditor({
                   </div>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                    {model.relationships.map((relationship, index) => (
+                    {model.relationships.map((rel, index) => (
                       <div
-                        key={`${index}-${relationship.from}-${relationship.to}`}
+                        key={`${index}-${rel.from}-${rel.to}`}
                         className="ide-card"
                         style={{
                           display: 'grid',
@@ -348,27 +476,27 @@ export function ReportModelEditor({
                       >
                         <select
                           className="ide-select"
-                          value={relationship.from}
-                          onChange={(event) => updateRelationship(index, { from: event.target.value })}
+                          value={rel.from}
+                          onChange={(e) => updateRelationship(index, { from: e.target.value })}
                         >
-                          {endpoints.map((endpoint) => (
-                            <option key={endpoint.value} value={endpoint.value}>{endpoint.label}</option>
+                          {endpoints.map((ep) => (
+                            <option key={ep.value} value={ep.value}>{ep.label}</option>
                           ))}
                         </select>
                         <Link2 className="w-4 h-4" style={{ color: 'var(--ide-text-tertiary)' }} />
                         <select
                           className="ide-select"
-                          value={relationship.to}
-                          onChange={(event) => updateRelationship(index, { to: event.target.value })}
+                          value={rel.to}
+                          onChange={(e) => updateRelationship(index, { to: e.target.value })}
                         >
-                          {endpoints.map((endpoint) => (
-                            <option key={endpoint.value} value={endpoint.value}>{endpoint.label}</option>
+                          {endpoints.map((ep) => (
+                            <option key={ep.value} value={ep.value}>{ep.label}</option>
                           ))}
                         </select>
                         <select
                           className="ide-select"
-                          value={relationship.type}
-                          onChange={(event) => updateRelationship(index, { type: event.target.value })}
+                          value={rel.type}
+                          onChange={(e) => updateRelationship(index, { type: e.target.value })}
                         >
                           {RELATION_TYPES.map(([value, label]) => (
                             <option key={value} value={value}>{label}</option>
@@ -376,15 +504,15 @@ export function ReportModelEditor({
                         </select>
                         <select
                           className="ide-select ide-text-mono"
-                          value={relationship.cardinality}
-                          onChange={(event) =>
+                          value={rel.cardinality}
+                          onChange={(e) =>
                             updateRelationship(index, {
-                              cardinality: event.target.value,
-                              fanoutRisk: event.target.value === '1:n' || event.target.value === 'n:n',
+                              cardinality: e.target.value,
+                              fanoutRisk: e.target.value === '1:n' || e.target.value === 'n:n',
                             })
                           }
                         >
-                          {CARDINALITIES.map((value) => <option key={value}>{value}</option>)}
+                          {CARDINALITIES.map((v) => <option key={v}>{v}</option>)}
                         </select>
                         <button
                           className="ide-btn ide-btn-sm ide-btn-ghost"

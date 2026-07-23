@@ -9,8 +9,26 @@ import { normalizeAbsolute, resolveWithinWorkspace } from './paths.js';
 type JsonRecord = Record<string, any>;
 
 const REPORT_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
-const RELATION_TYPES = new Set(['inner', 'left', 'right', 'full', 'cross']);
-const CARDINALITIES = new Set(['1:1', '1:n', 'n:1', 'n:n', 'unknown']);
+const KNOWN_RELATION_TYPES = ['inner', 'left', 'right', 'full', 'cross'] as const;
+const RELATION_TYPES = new Set<string>(KNOWN_RELATION_TYPES);
+const RELATION_ALIASES: Record<string, string> = {
+  inner_join: 'inner',
+  left_join: 'left',
+  right_join: 'right',
+  full_join: 'full',
+  cross_join: 'cross',
+};
+
+function normalizeRelationType(value: string): string {
+  const key = value.trim().toLowerCase();
+  return RELATION_ALIASES[key] ?? key;
+}
+const KNOWN_CARDINALITIES = ['1:1', '1:n', 'n:1', 'n:n', 'unknown'] as const;
+const CARDINALITIES = new Set<string>(KNOWN_CARDINALITIES);
+
+function normalizeCardinality(value: string): string {
+  return value.trim().toLowerCase();
+}
 
 function sha256(value: string | Buffer): string {
   return createHash('sha256').update(value).digest('hex');
@@ -245,17 +263,15 @@ export async function readReportModel(
     model.approval?.model_hash === currentHash;
 
   const sources = (model.sources ?? []).map((source: JsonRecord): EditableModelSource => {
-    const selected = new Map<string, JsonRecord>(
-      (source.fields ?? []).map((field: JsonRecord | string) => [
-        fieldName(field),
-        typeof field === 'string' ? { name: field, role: 'source' } : field,
-      ]),
+    const selectedFields = (source.fields ?? []).map(
+      (field: JsonRecord | string): { name: string; role: string } =>
+        typeof field === 'string' ? { name: field, role: 'source' } : { name: fieldName(field), role: String((field as JsonRecord).role ?? 'source') },
     );
+    const selectedNames = new Set(selectedFields.map((f) => f.name));
     const table =
       allTables.find((item) => sourceKey(item.physical ?? {}) === sourceKey(source)) ??
       compactTables.find((item: JsonRecord) => sourceKey(item.physical ?? {}) === sourceKey(source));
     const available = (table?.physical_fields ?? table?.fields ?? []) as JsonRecord[];
-    const names = new Set([...available.map(physicalFieldName), ...selected.keys()]);
     return {
       id: String(source.id),
       profileId: String(source.profile_id),
@@ -263,17 +279,15 @@ export async function readReportModel(
       table: String(source.table),
       alias: String(source.alias),
       purpose: String(source.purpose ?? ''),
-      fields: [...names]
-        .filter(Boolean)
-        .sort()
-        .map((name) => {
+      fields: selectedFields
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(({ name, role }) => {
           const known = available.find((field) => physicalFieldName(field) === name);
-          const chosen = selected.get(name);
           return {
             name,
             label: known ? physicalFieldLabel(known) : name,
-            role: String(chosen?.role ?? 'source'),
-            selected: selected.has(name),
+            role,
+            selected: true,
           };
         }),
     };
@@ -294,8 +308,8 @@ export async function readReportModel(
     relationships: (model.relationships ?? []).map((relationship: JsonRecord) => ({
       from: String(relationship.from ?? ''),
       to: String(relationship.to ?? ''),
-      type: String(relationship.type ?? 'left'),
-      cardinality: String(relationship.cardinality ?? 'unknown'),
+      type: normalizeRelationType(String(relationship.type ?? 'left')),
+      cardinality: normalizeCardinality(String(relationship.cardinality ?? 'unknown')),
       grain: relationship.grain == null ? null : String(relationship.grain),
       fanoutRisk: Boolean(relationship.fanout_risk),
     })),
@@ -336,10 +350,24 @@ export async function writeReportModel(
   ) {
     throw new ReportModelError('INVALID', '只能调整当前模型表的字段，不能在此新增或删除来源表');
   }
-  const detail = await readReportModel(workspaceRoot, reportId);
-  const availableBySource = new Map(
-    detail.sources.map((source) => [source.id, new Set(source.fields.map((field) => field.name))]),
+  const sourceLock: JsonRecord = await readJson(join(root, 'source.lock.json')).catch(
+    () => ({} as JsonRecord),
   );
+  const allTables = await readAllKnowledgeTables(workspaceRoot, sourceLock.knowledge?.source_dir);
+  const availableBySource = new Map<string, Set<string>>();
+  for (const source of model.sources ?? []) {
+    const table =
+      allTables.find((item) => sourceKey(item.physical ?? {}) === sourceKey(source)) ??
+      (Array.isArray(sourceLock.tables)
+        ? sourceLock.tables.find((item: JsonRecord) => sourceKey(item.physical ?? {}) === sourceKey(source))
+        : undefined);
+    const names = new Set(
+      ((table?.physical_fields ?? table?.fields ?? []) as JsonRecord[])
+        .map(physicalFieldName)
+        .filter(Boolean),
+    );
+    availableBySource.set(String(source.id), names);
+  }
   for (const source of edit.sources) {
     const names = source.fields.map((field) => field.name.trim()).filter(Boolean);
     if (!names.length) throw new ReportModelError('INVALID', `来源 ${source.id} 至少保留一个字段`);
@@ -384,8 +412,8 @@ export async function writeReportModel(
     return {
       from: relationship.from,
       to: relationship.to,
-      type: relationship.type,
-      cardinality: relationship.cardinality,
+      type: normalizeRelationType(relationship.type),
+      cardinality: normalizeCardinality(relationship.cardinality),
       grain: relationship.grain ?? null,
       fanout_risk:
         relationship.fanoutRisk ??
@@ -417,13 +445,13 @@ export async function writeReportModel(
     model_hash: modelHash(model),
   };
 
-  const sourceLock = await readJson(join(root, 'source.lock.json'));
-  sourceLock.model_hash = model.approval.model_hash;
+  const writeSourceLock = await readJson(join(root, 'source.lock.json'));
+  writeSourceLock.model_hash = model.approval.model_hash;
   const knowledgeTables = await readAllKnowledgeTables(
     workspaceRoot,
-    sourceLock.knowledge?.source_dir,
+    writeSourceLock.knowledge?.source_dir,
   );
-  sourceLock.tables = (sourceLock.tables ?? []).map((table: JsonRecord) => {
+  writeSourceLock.tables = (writeSourceLock.tables ?? []).map((table: JsonRecord) => {
     const selected = selectedByPhysical.get(sourceKey(table.physical ?? {}));
     if (!selected) return table;
     const allowed = new Set(selected);
@@ -473,7 +501,7 @@ export async function writeReportModel(
       await writeFile(join(backup, name), await readFile(join(root, name)));
     }
     await writeJsonAtomic(modelPath, model);
-    await writeJsonAtomic(join(root, 'source.lock.json'), sourceLock);
+    await writeJsonAtomic(join(root, 'source.lock.json'), writeSourceLock);
     await writeJsonAtomic(join(root, 'model.manifest.json'), manifest);
     await resealChecksums(root);
 
@@ -495,4 +523,41 @@ export async function writeReportModel(
     await rm(backup, { recursive: true, force: true });
   }
   return readReportModel(workspaceRoot, reportId);
+}
+
+export interface AvailableField {
+  name: string;
+  label: string;
+  nativeType: string;
+  nullable: boolean;
+}
+
+export async function readAvailableFields(
+  workspaceRoot: string,
+  reportId: string,
+  sourceId: string,
+): Promise<AvailableField[]> {
+  const { root } = await locateModel(workspaceRoot, reportId);
+  const model = await readJson(join(root, 'report-model.json'));
+  const source = (model.sources ?? []).find((s: JsonRecord) => String(s.id) === sourceId);
+  if (!source) throw new ReportModelError('NOT_FOUND', `模型中不存在来源：${sourceId}`);
+
+  const sourceLock: JsonRecord = await readJson(join(root, 'source.lock.json')).catch(() => ({} as JsonRecord));
+  const allTables = await readAllKnowledgeTables(workspaceRoot, sourceLock.knowledge?.source_dir);
+  const compactTables = Array.isArray(sourceLock.tables) ? sourceLock.tables : [];
+  const table =
+    allTables.find((item) => sourceKey(item.physical ?? {}) === sourceKey(source)) ??
+    compactTables.find((item: JsonRecord) => sourceKey(item.physical ?? {}) === sourceKey(source));
+  const available = (table?.physical_fields ?? table?.fields ?? []) as JsonRecord[];
+  const selected = new Set((source.fields ?? []).map((f: JsonRecord | string) => (typeof f === 'string' ? f : String((f as JsonRecord).name ?? ''))));
+
+  return available
+    .map((f) => ({
+      name: physicalFieldName(f),
+      label: physicalFieldLabel(f) || physicalFieldName(f),
+      nativeType: String(f.physical?.native_type ?? f.physical?.type ?? ''),
+      nullable: Boolean(f.physical?.nullable),
+    }))
+    .filter((f) => f.name && !selected.has(f.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }

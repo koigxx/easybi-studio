@@ -132,10 +132,15 @@ afterEach(async () => {
 });
 
 describe('current report model', () => {
-  it('reads available knowledge fields while keeping the package minimal', async () => {
+  it('returns only model-selected fields (not all knowledge fields)', async () => {
     const detail = await readReportModel(ws, 'r1');
     expect(detail.status).toBe('approved');
-    expect(detail.sources[0]?.fields.find((field) => field.name === 'name')?.selected).toBe(false);
+    const names = detail.sources[0]?.fields.map((field) => field.name) ?? [];
+    // Only the 2 fields declared in the model source should appear (not all knowledge fields).
+    expect(names).toEqual(['customer_id', 'id']);
+    for (const field of detail.sources[0]?.fields ?? []) {
+      expect(field.selected).toBe(true);
+    }
   });
 
   it('edits fields and relationships, approves the model, and updates its minimal source lock', async () => {

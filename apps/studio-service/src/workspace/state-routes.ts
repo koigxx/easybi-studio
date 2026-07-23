@@ -16,6 +16,7 @@ import {
   resealReportPackage,
   readReportModel,
   writeReportModel,
+  readAvailableFields,
   WorkspaceSkillAdapter,
   CatalogConflictError,
   CatalogNotFoundError,
@@ -65,6 +66,37 @@ export function registerWorkspaceStateRoutes(
         if (err instanceof ReportModelError) {
           return reply
             .code(err.code === 'NOT_FOUND' ? 404 : err.code === 'CONFLICT' ? 409 : 400)
+            .send(fail(request.requestId, `REPORT_MODEL_${err.code}`, err.message));
+        }
+        throw err;
+      }
+    },
+  );
+
+  app.get<{
+    Params: { projectId: string };
+    Querystring: { reportId?: string; sourceId?: string };
+  }>(
+    '/api/easybi/projects/:projectId/reports/model/fields',
+    async (request, reply) => {
+      const project = service.get(request.params.projectId);
+      if (!project) return reply.code(404).send(fail(request.requestId, 'NOT_FOUND', '项目不存在'));
+      if (!request.query.reportId || !request.query.sourceId) {
+        return reply.code(400).send(fail(request.requestId, 'VALIDATION_FAILED', '缺少 reportId / sourceId'));
+      }
+      try {
+        return ok(
+          request.requestId,
+          await readAvailableFields(
+            project.workspaceRoot,
+            request.query.reportId,
+            request.query.sourceId,
+          ),
+        );
+      } catch (err) {
+        if (err instanceof ReportModelError) {
+          return reply
+            .code(err.code === 'NOT_FOUND' ? 404 : 400)
             .send(fail(request.requestId, `REPORT_MODEL_${err.code}`, err.message));
         }
         throw err;

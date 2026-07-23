@@ -385,6 +385,11 @@ export const workspaceApi = {
       'GET',
       `/api/easybi/projects/${id}/reports/model?reportId=${encodeURIComponent(reportId)}`,
     ),
+  getAvailableFields: (id: string, reportId: string, sourceId: string) =>
+    call<AvailableField[]>(
+      'GET',
+      `/api/easybi/projects/${id}/reports/model/fields?reportId=${encodeURIComponent(reportId)}&sourceId=${encodeURIComponent(sourceId)}`,
+    ),
   saveReportModel: (
     id: string,
     reportId: string,
@@ -443,6 +448,13 @@ export interface ReportModelField {
   role: string;
   selected: boolean;
 }
+export interface AvailableField {
+  name: string;
+  label: string;
+  nativeType: string;
+  nullable: boolean;
+}
+
 export interface ReportModelSource {
   id: string;
   profileId: string;
