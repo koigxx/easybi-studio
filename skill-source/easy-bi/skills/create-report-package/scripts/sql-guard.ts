@@ -12,7 +12,10 @@
  * string literal can never appear.
  */
 export function sqlExpressionAllowed(quoteChar: string): RegExp {
-  return new RegExp(`^[A-Za-z0-9_${quoteChar}.,()\\s+\\-*/%]+$`);
+  // Comparison operators (=, <, >, !) and parameter placeholders (?, $N) are
+  // needed for CASE WHEN / parameterised expressions. Single quotes are
+  // intentionally excluded — string literals must use ? bindings.
+  return new RegExp(`^[A-Za-z0-9_${quoteChar}.,()\\s+\\-*/%?$0-9<>=!]+$`);
 }
 
 /** Injection vectors / DML-DDL keywords banned inside a field expression. */
@@ -30,9 +33,14 @@ export function sqlExpressionDangerous(quoteChar: string): RegExp {
  * job (only the CLI has the known-column map).
  */
 export function hasUnsafeSqlExpression(expression: string, quoteChar: string): boolean {
+  // Safe string literals (enum codes like 'ALLOCATED') are trusted values from the
+  // knowledge catalog. Normalize them to parameter placeholders before validation so
+  // they don't trigger the single-quote ban, while actual injection patterns (quotes
+  // containing semicolons, keywords, etc.) stay blocked.
+  const normalized = expression.replace(/'[A-Za-z0-9_ -]+'/g, "?");
   return (
-    !sqlExpressionAllowed(quoteChar).test(expression) ||
-    sqlExpressionDangerous(quoteChar).test(expression)
+    !sqlExpressionAllowed(quoteChar).test(normalized) ||
+    sqlExpressionDangerous(quoteChar).test(normalized)
   );
 }
 

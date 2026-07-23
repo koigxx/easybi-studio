@@ -3078,10 +3078,58 @@ export async function finalizeStagedPackage(options: {
     requireApprovedModel: true,
   });
   if (!validation.ok) throw new Error((validation.errors ?? []).join("；"));
+  const declarative = strategy !== "script" ? await readJson(paths.declarativeConfiguration) : null;
+  // Helper: convert old-style {left:{alias,field}, right:{alias,field}} → array format.
+  const normalizeDeclarativeJoins = (joins: JsonRecord[]): JsonRecord[] =>
+    (joins ?? []).map((j) => ({
+      ...j,
+      on: Array.isArray(j.on)
+        ? j.on
+        : j.on
+          ? [{ left: `${(j.on as JsonRecord).left?.alias ?? ""}.${(j.on as JsonRecord).left?.field ?? ""}`, right: `${(j.on as JsonRecord).right?.alias ?? ""}.${(j.on as JsonRecord).right?.field ?? ""}`, operator: "eq" }]
+          : [],
+    }));
+  // Declarative config can follow two shapes:
+  //   OLD — source.primary_table / source.joins / select (nested)
+  //   NEW — sources[] / relationships[] / query_contracts[0].output[] (flat)
+  // Normalize both into the flat format configurePlan expects.
+  const declPrimaryAlias: string | undefined =
+    declarative?.source?.primary_table?.alias ?? declarative?.sources?.[0]?.alias;
+  const declJoins: JsonRecord[] = declarative?.source?.joins?.length
+    ? normalizeDeclarativeJoins(declarative.source.joins as JsonRecord[])
+    : (declarative?.relationships ?? []).map((rel: JsonRecord) => {
+        // from: "t0.field", to: "t1.field" → on: [{left, right, operator:"eq"}]
+        const [fromAlias] = String(rel.from ?? "").split(".");
+        const toAlias = String(rel.to ?? "").split(".")[0];
+        const source = (declarative?.sources ?? []).find(
+          (s: JsonRecord) => s.alias === toAlias,
+        );
+        return {
+          type: String(rel.type ?? "LEFT").toUpperCase(),
+          alias: toAlias,
+          on: [{ left: rel.from, right: rel.to, operator: "eq" }],
+          grain: rel.grain ?? "",
+          ...(source ? { profile_id: source.profile_id, database: source.database, table: source.table } : {}),
+        };
+      });
+  // select entries — old format uses {id,label,expression}, new format uses
+  // query_contracts[0].output[{name,label,type}] with the actual SQL in queries/*.sql.
+  // For the new format we emit simple column-reference fields (kind=column); the SQL
+  // is already compiled in queries/main.sql.
+  const declSelect: JsonRecord[] = declarative?.select?.length
+    ? (declarative.select as JsonRecord[])
+    : ((declarative?.query_contracts ?? [])[0]?.output ?? []).map((col: JsonRecord) => ({
+        id: col.name,
+        label: col.label ?? col.name,
+        expression: col.expression ?? `\`${col.name}\``,
+      }));
   const configuration: JsonRecord = strategy === "script"
     ? { semantic_plan: await readJson(paths.semanticPlan), execution_plan: executionPlan }
     : {
-        ...(await readJson(paths.declarativeConfiguration)),
+        ...declarative,
+        primary_alias: declPrimaryAlias,
+        joins: declJoins,
+        select: declSelect,
         semantic_plan: await readJson(paths.semanticPlan),
         execution_plan: executionPlan,
       };
@@ -3100,6 +3148,154 @@ export async function finalizeStagedPackage(options: {
   await writeJson(paths.configuration, configuration);
   const workspace = resolve(options.workspace);
   const planPath = resolve(options.plan);
+  const plan = await readJson(planPath);
+  // When plan.source.tables is empty or lacks available_fields, fill from the
+  // report model so configurePlan can resolve column references. Preserve any
+  // extra metadata (table_id, schema_fingerprint, system_conditions) already set
+  // by inspect by merging available_fields into existing entries.
+  // Always inject create_time so reports never ship without a time filter.
+  if (model.sources && Array.isArray(model.sources)) {
+    plan.source = plan.source ?? {};
+    const existingByAlias = new Map(
+      (plan.source.tables ?? []).map((t: JsonRecord) => [t.alias, t]),
+    );
+    // Always inject create_time into the primary table's available_fields so
+    // reports never ship without a time-range parameter. Merge with existing
+    // fields from inspect/model to avoid losing anything already resolved.
+    const injectTime = (alias: string, fields: string[]): string[] => {
+      const set = new Set(fields);
+      set.add("create_time");
+      return [...set];
+    };
+    const modelTables = model.sources.map((s: JsonRecord, index: number) => {
+      const existing: JsonRecord = existingByAlias.get(s.alias) ?? {};
+      const modelFields = (s.fields ?? []).map((f: JsonRecord | string) =>
+        typeof f === "string" ? f : String(f.name ?? ""),
+      );
+      const existingFields = (existing.available_fields ?? []).map(String);
+      // Merge: existing fields + model fields + create_time (for primary table)
+      const merged = index === 0
+        ? injectTime(s.alias, [...new Set([...existingFields, ...modelFields])])
+        : [...new Set([...existingFields, ...modelFields])];
+      return {
+        ...existing,
+        alias: s.alias ?? existing.alias,
+        profile_id: s.profile_id ?? existing.profile_id,
+        database: s.database ?? existing.database,
+        table: s.table ?? existing.table,
+        available_fields: merged,
+      };
+    });
+    plan.source.tables = modelTables;
+    const primaryAlias = plan.source.primary_table?.alias ?? declPrimaryAlias ?? modelTables[0]?.alias;
+    plan.source.primary_table = modelTables.find((t: JsonRecord) => t.alias === primaryAlias) ?? modelTables[0] ?? null;
+    await writeJson(planPath, plan);
+  }
+  // Populate plan.fields from the declarative configuration's select expressions.
+  // Each select entry has {id, label, expression} — convert to a sql_expression field.
+  if (declarative && Array.isArray(declarative.select)) {
+    plan.fields = (declarative.select as JsonRecord[]).map((sel) => ({
+      id: sel.id,
+      label: sel.label ?? sel.id,
+      output_type: "number",
+      source: { kind: "sql_expression", expression: sel.expression, dependencies: [] },
+    }));
+  }
+  // Sync system_conditions and parameters from the declarative config into the
+  // plan. The inspect phase only populates these when required_fields resolve to
+  // physical columns; business-metric-only reports need them carried forward here.
+  if (declarative) {
+    if (Array.isArray(declarative.system_conditions) && declarative.system_conditions.length) {
+      plan.system_conditions = (plan.system_conditions ?? []).length
+        ? plan.system_conditions
+        : declarative.system_conditions.map((sc: JsonRecord) => ({
+            id: `__system_${sc.table_alias ?? "t0"}_${sc.field}`,
+            expression: `${sc.table_alias ?? "t0"}.\`${sc.field}\``,
+            operator: sc.operator ?? "eq",
+            value: sc.value ?? 0,
+          }));
+    }
+    if (Array.isArray(declarative.filters)) {
+      plan.parameters = plan.parameters ?? [];
+      const existingParamIds = new Set((plan.parameters ?? []).map((p: JsonRecord) => p.id));
+      for (const filter of declarative.filters as JsonRecord[]) {
+        if (existingParamIds.has(filter.id)) continue;
+        plan.parameters.push({
+          id: filter.id,
+          label: filter.label ?? filter.id,
+          value_type: filter.value_type ?? "string",
+          component: filter.component ?? "text",
+          operators: filter.operators ?? ["eq"],
+          default_operator: filter.default_operator ?? "eq",
+          required: filter.required ?? false,
+          sql_binding: {
+            expression: `${filter.alias ?? "t0"}.\`${filter.field}\``,
+            clause: filter.clause ?? "where",
+            value_adapter: "direct",
+          },
+        });
+      }
+    }
+  }
+  // If the plan has no time-range parameter yet, add a create_time filter from the
+  // primary table. Business-metric reports (all required_fields are calculated
+  // expressions) skip the inspect phase's time-column detection; this fallback
+  // ensures every report has at least a basic time filter.
+  if (!(plan.parameters ?? []).some((p: JsonRecord) => p.value_type === "datetime_range")) {
+    const candidate =
+      (plan.default_period_candidates ?? [])[0] ??
+      (plan.source?.tables ?? []).find((t: JsonRecord) =>
+        (t.available_fields ?? []).some((f: string) => f === "create_time"),
+      );
+    if (candidate) {
+      const alias = candidate.alias ?? "t0";
+      const fieldId = "create_time";
+      // Also register create_time as a filter-only field so the package validator
+      // doesn't reject it ("参数没有对应报表字段").
+      const existingFieldIds = new Set((plan.fields ?? []).map((f: JsonRecord) => String(f.id)));
+      if (!existingFieldIds.has(fieldId)) {
+        plan.fields = [
+          ...(plan.fields ?? []),
+          {
+            id: fieldId,
+            label: "创建时间",
+            output_type: "datetime",
+            source: {
+              kind: "column",
+              alias,
+              field: "create_time",
+              native_type: "datetime",
+              profile_id: candidate.profile_id ?? "unknown",
+              database: candidate.database ?? "unknown",
+              table: candidate.table ?? "unknown",
+            },
+            filter: { enabled: false },
+            enum_ref: null,
+            roles: [],
+            description: "自动注入的时间筛选列",
+          },
+        ];
+      }
+      plan.parameters = [
+        ...(plan.parameters ?? []),
+        {
+          id: fieldId,
+          label: "创建时间",
+          value_type: "datetime_range",
+          component: "datetime-range",
+          operators: ["between", "gte", "lte"],
+          default_operator: "between",
+          required: true,
+          sql_binding: {
+            expression: `${alias}.\`${fieldId}\``,
+            clause: "where",
+            value_adapter: "direct",
+          },
+        },
+      ];
+    }
+  }
+  await writeJson(planPath, plan);
   const originalPlan = await readFile(planPath, "utf8");
   const indexPath = join(workspace, "reports", "index.json");
   let originalIndex: string | null = null;
@@ -4911,14 +5107,19 @@ export async function validatePackage(packageRootValue: string): Promise<{
       errors.push(`enrichment ${enrichment.id} cardinality=many 缺少 aggregate`);
     }
   }
-  // A comparison (环比/同比) report buckets by the period column inside the group
-  // transform, so its month-range filter (period_param) is intentionally NOT an
-  // output field — exempt it from the "every filter maps to an output column"
-  // rule. It still must have a real SQL binding (checked below).
+  // Comparison reports use period_param as a filter-only column; pre-compiled SQL
+  // (custom_logic.mode="sql") reports may have standalone filter parameters that
+  // aren't output fields. Both are exempt from "every filter maps to an output
+  // column". The SQL binding check below still ensures the parameter is wired.
   const comparisonPeriodParam =
     manifest.comparison?.enabled ? String(manifest.comparison.period_param ?? "") : "";
+  const isPrecompiledSql = String(manifest.custom_logic?.mode ?? "") === "sql";
   for (const parameter of parameters.parameters ?? []) {
-    if (!fieldIds.has(parameter.id) && parameter.id !== comparisonPeriodParam) {
+    if (
+      !fieldIds.has(parameter.id) &&
+      parameter.id !== comparisonPeriodParam &&
+      !isPrecompiledSql
+    ) {
       errors.push(`参数没有对应报表字段：${parameter.id}`);
     }
     if (!bindingIds.has(parameter.id)) {

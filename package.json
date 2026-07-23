@@ -14,7 +14,8 @@
     "test:integration": "vitest run --config vitest.config.ts tests",
     "typecheck": "pnpm -r run typecheck",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "sync": "node scripts/sync-easybi-bundle.mjs"
   },
   "devDependencies": {
     "@easybi-studio/artifact-exporter": "workspace:*",
