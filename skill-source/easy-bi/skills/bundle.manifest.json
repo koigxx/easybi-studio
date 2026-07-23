@@ -1,7 +1,7 @@
 {
   "bundle_format_version": "1",
   "bundle_id": "easybi",
-  "bundle_version": "1.29.5",
+  "bundle_version": "1.31.8",
   "display_name": "Easy BI 技能包",
   "compatibility": {
     "workspace_formats": [
@@ -43,7 +43,7 @@
     },
     {
       "id": "create-report-package",
-      "version": "2.26.5",
+      "version": "2.28.8",
       "path": "create-report-package",
       "agent_entry": "create-report-package/SKILL.md",
       "agent_prompts": "create-report-package/prompts.json",
@@ -81,6 +81,7 @@
       "knowledge_versions": "knowledge/versions",
       "reports_index": "reports/index.json",
       "report_plans": "reports/plans",
+      "report_models": "reports/models",
       "report_packages": "reports/packages",
       "outputs_index": "outputs/index.json",
       "output_files": "outputs/files",

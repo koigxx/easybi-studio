@@ -35,6 +35,14 @@ beforeAll(async () => {
           agent_prompts: 'initialize-report-knowledge/prompts.json',
           commands: {},
         },
+        {
+          id: 'create-report-package',
+          version: '2.28.8',
+          path: 'create-report-package',
+          agent_entry: 'create-report-package/SKILL.md',
+          agent_prompts: 'create-report-package/prompts.json',
+          commands: {},
+        },
       ],
       workspace_contract: { bootstrap_contract_version: '1', supported_modes: [], path_bases: {}, paths: {} },
     }),
@@ -48,6 +56,19 @@ beforeAll(async () => {
       skill_id: 'initialize-report-knowledge',
       presets: [
         { action: 'initialize-knowledge', label: '初始化知识库', hint: 'h', write: true, prompt: '请初始化知识库' },
+      ],
+    }),
+    'utf8',
+  );
+  await mkdir(join(ws, 'skills', 'create-report-package'), { recursive: true });
+  await writeFile(
+    join(ws, 'skills', 'create-report-package', 'prompts.json'),
+    JSON.stringify({
+      schema_version: '1',
+      skill_id: 'create-report-package',
+      presets: [
+        { action: 'model-report', label: '构建报表建模', hint: 'h', write: true, prompt: '构建模型' },
+        { action: 'build-report-package', label: '生成报表', hint: 'h', write: true, prompt: '生成报表' },
       ],
     }),
     'utf8',
@@ -70,12 +91,12 @@ describe('agent-prompts config routes', () => {
     expect(res.statusCode).toBe(200);
     const data = res.json().data;
     expect(data.source).toBe('skill-defaults');
-    expect(data.presets).toHaveLength(1);
+    expect(data.presets).toHaveLength(3);
     expect(data.presets[0].action).toBe('initialize-knowledge');
     expect(data.presets[0].skillId).toBe('initialize-report-knowledge');
   });
 
-  it('saves presets into config and reads them back as source=config', async () => {
+  it('migrates a configured legacy report preset to the two split defaults', async () => {
     const read = await studio.app.inject({ method: 'GET', url: '/api/easybi/projects/pws/agent-prompts' });
     const revision = read.json().data.revision;
 
@@ -93,9 +114,11 @@ describe('agent-prompts config routes', () => {
 
     const after = await studio.app.inject({ method: 'GET', url: '/api/easybi/projects/pws/agent-prompts' });
     const data = after.json().data;
-    expect(data.source).toBe('config');
-    expect(data.presets).toHaveLength(1);
-    expect(data.presets[0].action).toBe('create-report');
+    expect(data.source).toBe('config-with-compatible-defaults');
+    expect(data.presets.map((preset: { action: string }) => preset.action)).toEqual([
+      'model-report',
+      'build-report-package',
+    ]);
   });
 
   it('rejects a preset with no prompt text', async () => {

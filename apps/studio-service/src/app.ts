@@ -186,7 +186,7 @@ export function buildApp(options: BuildAppOptions): StudioApp {
   registerJobRoutes(app, projects, jobs, jobStore);
   registerAgentPromptRoutes(app, projects);
   registerCheckpointRoutes(app, projects, checkpointManager, postTaskHashes);
-  registerWorkspaceStateRoutes(app, projects);
+  registerWorkspaceStateRoutes(app, projects, jobs);
   registerKnowledgeRoutes(app, projects, options.skillCliRunner ?? new NodeSkillCliRunner());
 
   const watchers = new WatcherRegistry();

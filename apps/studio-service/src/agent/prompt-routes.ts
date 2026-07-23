@@ -21,6 +21,27 @@ interface SaveBody {
   expectedRevision?: string;
 }
 
+const COMPAT_SPLIT_REPORT_PRESETS: PromptPreset[] = [
+  {
+    action: 'model-report',
+    label: '构建报表建模',
+    hint: '分析字段和关联关系，把不清晰事项一次统一确认，生成唯一当前模型',
+    write: true,
+    prompt:
+      '阅读 skills/create-report-package/SKILL.md，只执行报表建模。分析结果粒度、来源表字段、关联字段、关系基数、筛选分组和指标口径，把所有不清晰事项整理为一次统一确认；禁止生成 SQL、脚本或报表包。',
+    skillId: 'create-report-package',
+  },
+  {
+    action: 'build-report-package',
+    label: '生成报表',
+    hint: '只使用已确认的当前模型生成唯一当前报表包',
+    write: true,
+    prompt:
+      '阅读 skills/create-report-package/SKILL.md，只从该报表已确认的唯一当前模型生成报表包；不得重新分析知识库、改变字段或关联关系、再次确认业务口径。',
+    skillId: 'create-report-package',
+  },
+];
+
 function toPreset(p: SkillPromptPreset): PromptPreset {
   return {
     action: p.action,
@@ -56,6 +77,29 @@ function readConfiguredPresets(value: unknown): PromptPreset[] | null {
   return out;
 }
 
+function migrateLegacyReportPresets(
+  configured: PromptPreset[],
+  defaults: PromptPreset[],
+): PromptPreset[] {
+  const hasLegacy = configured.some(
+    (preset) => preset.action === 'create-report' || preset.action === 'modify-report',
+  );
+  const hasSplit = configured.some(
+    (preset) => preset.action === 'model-report' || preset.action === 'build-report-package',
+  );
+  if (!hasLegacy || hasSplit) return configured;
+  const retained = configured.filter(
+    (preset) => preset.action !== 'create-report' && preset.action !== 'modify-report',
+  );
+  const splitDefaults = defaults.filter(
+    (preset) => preset.action === 'model-report' || preset.action === 'build-report-package',
+  );
+  return [
+    ...retained,
+    ...(splitDefaults.length === 2 ? splitDefaults : COMPAT_SPLIT_REPORT_PRESETS),
+  ];
+}
+
 /**
  * Configurable agent preset prompts (per workspace).
  *
@@ -75,15 +119,6 @@ export function registerAgentPromptRoutes(app: FastifyInstance, service: Project
 
       const cfg = await readConfig(project.workspaceRoot, CONFIG_PATH).catch(() => null);
       const configured = cfg ? readConfiguredPresets(cfg.value) : null;
-      if (configured && configured.length > 0) {
-        return ok(request.requestId, {
-          presets: configured,
-          revision: cfg!.revision,
-          source: 'config',
-        });
-      }
-
-      // Fall back to the installed skills' defaults (not yet persisted).
       let defaults: PromptPreset[] = [];
       try {
         const adapter = new WorkspaceSkillAdapter(project.workspaceRoot);
@@ -91,6 +126,16 @@ export function registerAgentPromptRoutes(app: FastifyInstance, service: Project
       } catch {
         defaults = [];
       }
+      if (configured && configured.length > 0) {
+        const presets = migrateLegacyReportPresets(configured, defaults);
+        return ok(request.requestId, {
+          presets,
+          revision: cfg!.revision,
+          source: presets === configured ? 'config' : 'config-with-compatible-defaults',
+        });
+      }
+
+      // Fall back to the installed skills' defaults (not yet persisted).
       return ok(request.requestId, {
         presets: defaults,
         revision: cfg?.revision ?? null,

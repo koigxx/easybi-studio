@@ -155,7 +155,15 @@ export interface KnowledgeState {
 }
 
 export interface ReportState {
-  requirements: Array<{ id: string; name: string; fieldCount: number }>;
+  requirements: Array<{
+    id: string;
+    name: string;
+    fieldCount: number;
+    modelStatus: 'approved' | 'draft' | 'invalid' | 'missing';
+    modelRevision?: string;
+    modelStrategy?: string;
+    packageStatus: 'ready' | 'missing';
+  }>;
   plans: string[];
   reports: Array<{
     id: string;
@@ -372,6 +380,24 @@ export const workspaceApi = {
       dryRun,
     }),
   getReports: (id: string) => call<ReportState>('GET', `/api/easybi/projects/${id}/reports`),
+  getReportModel: (id: string, reportId: string) =>
+    call<ReportModelDetail>(
+      'GET',
+      `/api/easybi/projects/${id}/reports/model?reportId=${encodeURIComponent(reportId)}`,
+    ),
+  saveReportModel: (
+    id: string,
+    reportId: string,
+    expectedRevision: string,
+    sources: ReportModelEditSource[],
+    relationships: ReportModelRelationship[],
+  ) =>
+    call<ReportModelDetail>('PUT', `/api/easybi/projects/${id}/reports/model`, {
+      reportId,
+      expectedRevision,
+      sources,
+      relationships,
+    }),
   deleteReportPackage: (id: string, reportId: string, version: string) =>
     call<{ id: string; version: string; removedDir: boolean }>(
       'DELETE',
@@ -410,6 +436,48 @@ export const workspaceApi = {
   readFile: (id: string, path: string) =>
     call<FileContent>('GET', `/api/easybi/projects/${id}/file?path=${encodeURIComponent(path)}`),
 };
+
+export interface ReportModelField {
+  name: string;
+  label: string;
+  role: string;
+  selected: boolean;
+}
+export interface ReportModelSource {
+  id: string;
+  profileId: string;
+  database: string;
+  table: string;
+  alias: string;
+  purpose: string;
+  fields: ReportModelField[];
+}
+export interface ReportModelRelationship {
+  from: string;
+  to: string;
+  type: string;
+  cardinality: string;
+  grain?: string | null;
+  fanoutRisk?: boolean;
+}
+export interface ReportModelEditSource {
+  id: string;
+  fields: Array<{ name: string; role?: string }>;
+}
+export interface ReportModelDetail {
+  reportId: string;
+  reportName: string;
+  status: 'approved' | 'draft' | 'invalid';
+  revision: string;
+  modelHash: string | null;
+  strategy: string;
+  resultGrain: { description: string; keys: string[] };
+  sources: ReportModelSource[];
+  relationships: ReportModelRelationship[];
+  filters: Array<Record<string, unknown>>;
+  metrics: Array<Record<string, unknown>>;
+  errors: string[];
+}
 
 export interface ReportPackageFileEntry {
   path: string;
@@ -542,6 +610,8 @@ export type AgentActionType =
   | 'rescan-knowledge'
   | 'review-enums'
   | 'publish-knowledge'
+  | 'model-report'
+  | 'build-report-package'
   | 'create-report'
   | 'modify-report'
   | 'validate-report';
@@ -605,6 +675,51 @@ export interface AgentHealth {
   note?: string;
 }
 
+export interface ModelConfirmationOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+export interface ModelConfirmationQuestion {
+  id: string;
+  question: string;
+  options: ModelConfirmationOption[];
+  recommended: string | null;
+  required: boolean;
+  affected_metrics: string[];
+  category?: string;
+  impact?: string | null;
+}
+
+export interface ModelMetricHypothesis {
+  requirement_id?: string;
+  label?: string;
+  source?: string;
+  aggregation?: string;
+  condition?: unknown;
+  distinct_key?: string;
+  confidence?: number;
+  evidence?: string[];
+}
+
+export interface ModelConfirmationView {
+  confirmation_format_version: string;
+  report_id: string;
+  discovery_revision: string;
+  discovery_model_hash: string;
+  questions: ModelConfirmationQuestion[];
+  metric_hypotheses: ModelMetricHypothesis[];
+  relationship_hypotheses: unknown[];
+}
+
+export interface ModelConfirmationSubmission {
+  discovery_revision: string;
+  accept_recommended: boolean;
+  answers: Record<string, string>;
+  note: string;
+}
+
 export const agentApi = {
   health: () => call<AgentHealth>('GET', '/api/easybi/agent-health'),
 
@@ -620,11 +735,13 @@ export const agentApi = {
   reply: (
     taskId: string,
     reply: string,
-    intent: 'chat' | 'confirm_discovery' | 'approve_model' = 'chat',
+    intent: 'chat' | 'confirm_model' | 'confirm_discovery' | 'approve_model' = 'chat',
+    confirmation?: ModelConfirmationSubmission,
   ) =>
     call<{ accepted: boolean }>('POST', `/api/easybi/agent-tasks/${taskId}/messages`, {
       reply,
       intent,
+      ...(confirmation ? { confirmation } : {}),
     }),
 
   cancel: (taskId: string) =>

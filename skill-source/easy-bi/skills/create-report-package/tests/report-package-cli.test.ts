@@ -8,9 +8,11 @@ import {
   approvePlan,
   buildKnowledgeContext,
   buildPhaseContext,
+  createModelConfirmation,
   initializeReportModel,
   approveReportModel,
   approveStagedModel,
+  finalizeStagedModel,
   finalizeStagedPackage,
   validateStagedArtifacts,
   validateReportModelValue,
@@ -2238,6 +2240,280 @@ test("staged report model builds query/script context packs without leaking phys
   );
 });
 
+test("discovery context infers metric intent, resolves enums, and enforces the field/byte budget", async () => {
+  const fixture = await createFixture();
+  await addStatusEnumField(fixture);
+  const configPath = join(fixture.workspace, "config", "easy-bi.json");
+  const config = JSON.parse(await readFile(configPath, "utf8"));
+  config.knowledge.report_requirements[0].required_fields = [
+    {
+      label: "启用司机数量",
+      roles: ["output", "metric"],
+      aggregation: "count_distinct",
+      description: "按司机主键去重，状态为启用",
+    },
+  ];
+  await writeFile(configPath, JSON.stringify(config));
+  const driverPath = join(
+    fixture.knowledge,
+    "databases",
+    "mysql-main",
+    "transport",
+    "hot",
+    "tables",
+    "driver.json",
+  );
+  const driver = JSON.parse(await readFile(driverPath, "utf8"));
+  for (let index = 0; index < 180; index += 1) {
+    driver.physical_fields.push({
+      physical: {
+        name: `unused_${index}`,
+        data_type: "varchar",
+        native_type: "varchar(255)",
+        primary_key: false,
+        comment: `无关字段 ${index}`,
+      },
+      semantic: { name: `无关字段 ${index}`, status: "inferred", enum_ref: null },
+      filter: { enabled: false, role: "text", operators: [] },
+    });
+  }
+  await writeFile(driverPath, JSON.stringify(driver));
+  const plan = await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  assert.equal(plan.blockers[0].code, "METRIC_REQUIRES_MODELING");
+  const context = await buildPhaseContext({
+    phase: "discovery",
+    plan: fixture.plan,
+    out: join(fixture.workspace, "work", "discovery-context.json"),
+  });
+  const knowledge = context.payload.knowledge;
+  assert.equal(knowledge.requirement_intents[0].aggregation, "count_distinct");
+  assert.ok(knowledge.selected_field_count <= 80);
+  assert.ok(Buffer.byteLength(JSON.stringify(context, null, 2), "utf8") <= 100_000);
+  assert.ok(
+    knowledge.candidate_sets[0].candidates.some(
+      (candidate: any) => candidate.field === "status" && candidate.enum_ref === "driver_status",
+    ),
+  );
+  assert.ok(
+    knowledge.enum_dictionaries.some(
+      (dictionary: any) =>
+        dictionary.name === "driver_status" &&
+        dictionary.values.some((item: any) => item.label === "启用"),
+    ),
+  );
+});
+
+test("structured confirmation is revision-bound and becomes the only modeling approval input", async () => {
+  const fixture = await createFixture();
+  await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  const root = join(fixture.workspace, "work", "confirmation");
+  await mkdir(root, { recursive: true });
+  const modelPath = join(root, "discovery-model.json");
+  const model = await initializeReportModel({ plan: fixture.plan, out: modelPath });
+  model.result_grain.keys = ["code"];
+  model.recommended_strategy = "sql";
+  model.open_questions = [{
+    id: "grain",
+    question: "是否按司机编码去重？",
+    options: [
+      { value: "code", label: "司机编码" },
+      { value: "id", label: "司机主键" },
+    ],
+    recommended: "code",
+    required: true,
+    affected_metrics: ["司机数量"],
+  }];
+  await writeFile(modelPath, JSON.stringify(model, null, 2));
+  const inputPath = join(root, "confirmation-input.json");
+  const confirmationPath = join(root, "confirmation.json");
+  await writeFile(
+    inputPath,
+    JSON.stringify({ accept_recommended: true, answers: {}, note: "" }),
+  );
+  const confirmation = await createModelConfirmation({
+    model: modelPath,
+    input: inputPath,
+    out: confirmationPath,
+    reviewedBy: "reviewer",
+  });
+  assert.equal(confirmation.answers[0].value, "code");
+  const context = await buildPhaseContext({
+    phase: "modeling",
+    plan: fixture.plan,
+    model: modelPath,
+    confirmation: confirmationPath,
+    out: join(root, "modeling-context.json"),
+  });
+  assert.equal(context.payload.confirmation.status, "confirmed");
+  model.metrics.push({ id: "changed" });
+  await writeFile(modelPath, JSON.stringify(model, null, 2));
+  await assert.rejects(
+    buildPhaseContext({
+      phase: "modeling",
+      plan: fixture.plan,
+      model: modelPath,
+      confirmation: confirmationPath,
+      out: join(root, "stale-context.json"),
+    }),
+    /revision 已过期/,
+  );
+});
+
+test("discovery hypotheses may use selected_tables, keyless grain, and a recommended answer outside options", async () => {
+  const fixture = await createFixture();
+  await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  const root = join(fixture.workspace, "work", "report-model", "driver-detail", "hypothesis");
+  await mkdir(root, { recursive: true });
+  const modelPath = join(root, "discovery-model.json");
+  const model = await initializeReportModel({ plan: fixture.plan, out: modelPath });
+  const source = model.sources[0];
+  model.result_grain = {
+    description: "单行汇总，无分组维度",
+    keys: [],
+    status: "hypothesis",
+  };
+  model.metric_hypotheses = [{
+    id: "driver_count",
+    label: "司机数量",
+    aggregation: "COUNT(DISTINCT code)",
+    confidence: "medium",
+  }];
+  model.selected_tables = [{
+    table_id: `${source.profile_id}/${source.database}/${source.table}`,
+    entity: "司机",
+    selected_fields: source.fields.filter((field: any) => field.name === "code").map((field: any) => ({
+      physical_name: field.name,
+      role: "source",
+    })),
+  }];
+  model.sources = [{ ...source, fields: [] }];
+  model.query_contracts = [{
+    id: "driver_counts",
+    output: [{ column: "driver_count", label: "司机数量" }],
+    status: "draft",
+  }];
+  model.open_questions = [{
+    id: "count_scope",
+    question: "租户隔离是否使用 tenant_id？",
+    options: ["不使用租户隔离"],
+    recommended: "使用 tenant_id",
+    required: true,
+  }, {
+    id: "strategy",
+    question: "是否使用 group_queries？",
+    category: "execution_strategy",
+    options: ["group_queries", "script"],
+    recommended: "group_queries",
+    required: true,
+  }];
+  await writeFile(modelPath, JSON.stringify(model, null, 2));
+
+  const validation = await validateStagedArtifacts({
+    phase: "discovery",
+    plan: fixture.plan,
+    root,
+  });
+  assert.equal(validation.ok, true);
+  assert.ok(
+    validation.confirmation.questions[0].options.some(
+      (option: any) => option.value === "使用 tenant_id",
+    ),
+  );
+  assert.equal(validation.confirmation.questions.length, 1);
+
+  const inputPath = join(root, "confirmation-input.json");
+  const confirmationPath = join(root, "confirmation.json");
+  await writeFile(inputPath, JSON.stringify({ accept_recommended: true, answers: {}, note: "" }));
+  await createModelConfirmation({
+    model: modelPath,
+    input: inputPath,
+    out: confirmationPath,
+    reviewedBy: "reviewer",
+  });
+  const context = await buildPhaseContext({
+    phase: "modeling",
+    plan: fixture.plan,
+    model: modelPath,
+    confirmation: confirmationPath,
+    out: join(root, "modeling-context.json"),
+  });
+  assert.equal(context.payload.discovery_model.sources.length, 1);
+  assert.equal(context.payload.knowledge.tables.length, 1);
+  assert.deepEqual(
+    context.payload.discovery_model.sources[0].fields.map((field: any) => field.name).sort(),
+    ["code", "create_time", "name", "tenant_id"],
+  );
+  assert.deepEqual(
+    context.payload.knowledge.tables[0].fields.map((field: any) => field.physical.name).sort(),
+    ["code", "create_time", "name", "tenant_id"],
+  );
+});
+
+test("modeling gate canonicalizes alias sources and output_contract columns", async () => {
+  const fixture = await createFixture();
+  await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  const root = join(fixture.workspace, "work", "report-model", "driver-detail", "canonical");
+  await mkdir(root, { recursive: true });
+  const modelPath = join(root, "report-model.json");
+  const model = await initializeReportModel({ plan: fixture.plan, out: modelPath });
+  model.result_grain = { description: "按司机编码分组", keys: ["code"] };
+  model.recommended_strategy = "sql";
+  model.open_questions = [];
+  model.relationships = [{
+    type: "LEFT_JOIN",
+    on: `${model.sources[0].alias}.code = ${model.sources[0].alias}.name`,
+    cardinality: "1:N",
+  }];
+  model.query_contracts = [{
+    id: "drivers",
+    sources: [model.sources[0].alias],
+    result_grain: { description: "按司机编码分组", keys: ["code"] },
+    output_contract: [{ id: "code", label: "司机编码", type: "varchar" }],
+  }];
+  await writeFile(modelPath, JSON.stringify(model, null, 2));
+  await writeFile(
+    join(root, "semantic-plan.json"),
+    JSON.stringify({ result_grain: "按司机编码分组" }),
+  );
+  await writeFile(
+    join(root, "execution-plan.json"),
+    JSON.stringify({ strategy: "sql", steps: [{ id: "query" }] }),
+  );
+
+  const validation = await validateStagedArtifacts({
+    phase: "modeling",
+    plan: fixture.plan,
+    root,
+  });
+  assert.equal(validation.ok, true);
+  const canonical = JSON.parse(await readFile(modelPath, "utf8"));
+  assert.equal(canonical.query_contracts[0].sources[0].table, "driver");
+  assert.equal(canonical.query_contracts[0].output[0].name, "code");
+  assert.equal(canonical.relationships[0].from, `${model.sources[0].alias}.code`);
+  assert.equal(canonical.relationships[0].to, `${model.sources[0].alias}.name`);
+  assert.equal(canonical.relationships[0].fanout_risk, true);
+});
+
 test("staged artifacts are deterministically approved, assembled, generated, and validated", async () => {
   const fixture = await createFixture();
   await inspectReport({
@@ -2255,6 +2531,7 @@ test("staged artifacts are deterministically approved, assembled, generated, and
   model.open_questions = [];
   model.recommended_strategy = "script";
   await writeFile(join(root, "report-model.json"), JSON.stringify(model, null, 2));
+  await writeFile(join(root, "discovery-model.json"), JSON.stringify(model, null, 2));
   const initialPlan = JSON.parse(await readFile(fixture.plan, "utf8"));
   await writeFile(join(root, "semantic-plan.json"), JSON.stringify(initialPlan.semantic_plan, null, 2));
   await writeFile(join(root, "execution-plan.json"), JSON.stringify({
@@ -2305,7 +2582,93 @@ test("staged artifacts are deterministically approved, assembled, generated, and
   assert.equal(packageValidation.valid, true, packageValidation.errors.join("\n"));
 });
 
-test("staged declarative strategy publishes v2 atomically and restores the plan on a collision", async () => {
+test("a staged model is promoted as one minimal current model package", async () => {
+  const fixture = await createFixture();
+  await inspectReport({
+    workspace: fixture.workspace,
+    knowledge: fixture.knowledge,
+    reportId: "driver-detail",
+    out: fixture.plan,
+  });
+  const root = join(
+    fixture.workspace,
+    "work",
+    "report-model",
+    "driver-detail",
+    "revision-a",
+  );
+  await mkdir(join(root, "modeling"), { recursive: true });
+  const model = await initializeReportModel({
+    plan: fixture.plan,
+    out: join(root, "report-model.json"),
+  });
+  model.result_grain.keys = ["code"];
+  model.open_questions = [];
+  model.recommended_strategy = "script";
+  await writeFile(join(root, "report-model.json"), JSON.stringify(model, null, 2));
+  await writeFile(join(root, "discovery-model.json"), JSON.stringify(model, null, 2));
+  const plan = JSON.parse(await readFile(fixture.plan, "utf8"));
+  await writeFile(
+    join(root, "semantic-plan.json"),
+    JSON.stringify(plan.semantic_plan, null, 2),
+  );
+  await writeFile(
+    join(root, "execution-plan.json"),
+    JSON.stringify({ ...plan.execution_plan, strategy: "script" }, null, 2),
+  );
+  await writeFile(
+    join(root, "confirmation-input.json"),
+    JSON.stringify({ accept_recommended: true, answers: {}, note: "" }),
+  );
+  const stagedConfirmation = await createModelConfirmation({
+    model: join(root, "discovery-model.json"),
+    input: join(root, "confirmation-input.json"),
+    out: join(root, "confirmation.json"),
+    reviewedBy: "workflow-reviewer",
+  });
+  model.confirmation = {
+    discovery_revision: stagedConfirmation.discovery_revision,
+    confirmation_hash: stagedConfirmation.confirmation_hash,
+  };
+  await writeFile(join(root, "report-model.json"), JSON.stringify(model, null, 2));
+  await buildPhaseContext({
+    phase: "modeling",
+    plan: fixture.plan,
+    model: join(root, "discovery-model.json"),
+    confirmation: join(root, "confirmation.json"),
+    out: join(root, "modeling", "context.json"),
+  });
+
+  const out = join(fixture.workspace, "reports", "models", "driver-detail");
+  const finalized = await finalizeStagedModel({
+    plan: fixture.plan,
+    root,
+    out,
+    reviewedBy: "workflow-reviewer",
+  });
+  assert.equal(finalized.ok, true);
+  const files = (await import("node:fs/promises")).readdir(out);
+  assert.deepEqual(
+    (await files).sort(),
+    [
+      "checksums.sha256",
+      "execution-plan.json",
+      "model.manifest.json",
+      "report-model.json",
+      "semantic-plan.json",
+      "source.lock.json",
+    ],
+  );
+  const sourceLock = JSON.parse(await readFile(join(out, "source.lock.json"), "utf8"));
+  assert.equal(sourceLock.tables.length, 1);
+  assert.ok(sourceLock.tables[0].fields.length > 0);
+  assert.equal(sourceLock.tables[0].physical_fields, undefined);
+  const promotedPlan = JSON.parse(await readFile(fixture.plan, "utf8"));
+  assert.equal(promotedPlan.report_model.status, "approved");
+  assert.equal(promotedPlan.report_model.ref, "../models/driver-detail/report-model.json");
+});
+
+test("staged declarative strategy replaces one current development package but protects published output", async () => {
   const fixture = await createFixture();
   await inspectReport({ workspace: fixture.workspace, knowledge: fixture.knowledge, reportId: "driver-detail", out: fixture.plan });
   const root = join(fixture.workspace, "work", "report-build", "driver-detail", "revision-a");
@@ -2323,20 +2686,36 @@ test("staged declarative strategy publishes v2 atomically and restores the plan 
   }, null, 2));
   await approveStagedModel({ plan: fixture.plan, root, reviewedBy: "workflow-reviewer" });
 
-  const planBeforeCollision = await readFile(fixture.plan, "utf8");
   const finalRoot = join(fixture.workspace, "reports", "packages", "driver-detail", String(initialPlan.report.version));
   await mkdir(finalRoot, { recursive: true });
-  await assert.rejects(
-    finalizeStagedPackage({ workspace: fixture.workspace, plan: fixture.plan, root, reviewedBy: "workflow-reviewer" }),
-    /禁止原地覆盖/,
+  await writeFile(join(finalRoot, "old-marker.txt"), "old");
+  await mkdir(join(fixture.workspace, "reports"), { recursive: true });
+  await writeFile(
+    join(fixture.workspace, "reports", "index.json"),
+    JSON.stringify({
+      reports: [{
+        id: "driver-detail",
+        version: String(initialPlan.report.version),
+        path: `packages/driver-detail/${initialPlan.report.version}`,
+        development_only: true,
+      }],
+    }),
   );
-  assert.equal(await readFile(fixture.plan, "utf8"), planBeforeCollision);
-  await rm(finalRoot, { recursive: true, force: true });
-
   const finalized = await finalizeStagedPackage({ workspace: fixture.workspace, plan: fixture.plan, root, reviewedBy: "workflow-reviewer" });
   assert.equal(finalized.strategy, "sql");
+  await assert.rejects(readFile(join(finalRoot, "old-marker.txt"), "utf8"));
   const manifest = JSON.parse(await readFile(join(String(finalized.package), "report.manifest.json"), "utf8"));
   assert.equal(manifest.report_package_format_version, "2");
+
+  const protectedIndex = JSON.parse(await readFile(join(fixture.workspace, "reports", "index.json"), "utf8"));
+  protectedIndex.reports[0].development_only = false;
+  await writeFile(join(fixture.workspace, "reports", "index.json"), JSON.stringify(protectedIndex));
+  const planBeforeCollision = await readFile(fixture.plan, "utf8");
+  await assert.rejects(
+    finalizeStagedPackage({ workspace: fixture.workspace, plan: fixture.plan, root, reviewedBy: "workflow-reviewer" }),
+    /已发布或来源不明/,
+  );
+  assert.equal(await readFile(fixture.plan, "utf8"), planBeforeCollision);
   const index = JSON.parse(await readFile(join(fixture.workspace, "reports", "index.json"), "utf8"));
   assert.match(String(index.reports[0].path), /^packages\/driver-detail\//);
 });

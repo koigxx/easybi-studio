@@ -5,7 +5,11 @@
  * and folds them into a render model. Keeping this pure makes the event→UI mapping
  * unit-testable and independent of React or the underlying provider (Claude/Innos).
  */
-import type { AgentTaskStatus, JobEvent } from '../api.js';
+import type {
+  AgentTaskStatus,
+  JobEvent,
+  ModelConfirmationView,
+} from '../api.js';
 
 export interface ChatToolLine {
   kind: 'tool';
@@ -50,6 +54,8 @@ export interface ChatModel {
   eventCount: number;
   /** Logical report workflow phase; provider session switches stay hidden. */
   phase?: string;
+  /** Structured one-shot confirmation produced by deterministic discovery validation. */
+  modelConfirmation?: ModelConfirmationView;
 }
 
 export function emptyChat(status: AgentTaskStatus = 'QUEUED'): ChatModel {
@@ -59,6 +65,65 @@ export function emptyChat(status: AgentTaskStatus = 'QUEUED'): ChatModel {
 function str(payload: Record<string, unknown> | undefined, key: string): string | undefined {
   const v = payload?.[key];
   return typeof v === 'string' ? v : undefined;
+}
+
+function modelConfirmation(
+  payload: Record<string, unknown> | undefined,
+): ModelConfirmationView | undefined {
+  const details =
+    payload?.details && typeof payload.details === 'object'
+      ? (payload.details as Record<string, unknown>)
+      : undefined;
+  const raw =
+    details?.model_confirmation && typeof details.model_confirmation === 'object'
+      ? (details.model_confirmation as Record<string, unknown>)
+      : undefined;
+  if (!raw || typeof raw.discovery_revision !== 'string') return undefined;
+  const questions = Array.isArray(raw.questions)
+    ? raw.questions
+        .filter((value): value is Record<string, unknown> =>
+          Boolean(value && typeof value === 'object'),
+        )
+        .map((question) => ({
+          id: String(question.id ?? ''),
+          question: String(question.question ?? ''),
+          options: Array.isArray(question.options)
+            ? question.options
+                .filter((value): value is Record<string, unknown> =>
+                  Boolean(value && typeof value === 'object'),
+                )
+                .map((option) => ({
+                  value: String(option.value ?? ''),
+                  label: String(option.label ?? option.value ?? ''),
+                  ...(option.description
+                    ? { description: String(option.description) }
+                    : {}),
+                }))
+                .filter((option) => option.value.length > 0)
+            : [],
+          recommended:
+            question.recommended == null ? null : String(question.recommended),
+          required: question.required !== false,
+          affected_metrics: Array.isArray(question.affected_metrics)
+            ? question.affected_metrics.map(String)
+            : [],
+          ...(question.category ? { category: String(question.category) } : {}),
+          ...(question.impact == null ? {} : { impact: String(question.impact) }),
+        }))
+    : [];
+  return {
+    confirmation_format_version: String(raw.confirmation_format_version ?? '1'),
+    report_id: String(raw.report_id ?? ''),
+    discovery_revision: raw.discovery_revision,
+    discovery_model_hash: String(raw.discovery_model_hash ?? ''),
+    questions,
+    metric_hypotheses: Array.isArray(raw.metric_hypotheses)
+      ? (raw.metric_hypotheses as ModelConfirmationView['metric_hypotheses'])
+      : [],
+    relationship_hypotheses: Array.isArray(raw.relationship_hypotheses)
+      ? raw.relationship_hypotheses
+      : [],
+  };
 }
 
 /**
@@ -99,15 +164,21 @@ function foldEvent(model: ChatModel, e: JobEvent): ChatModel {
       const phase = str(e.payload, 'phase');
       const label = str(e.payload, 'label');
       const contextReset = e.payload?.contextReset === true;
+      const validationFailed = e.payload?.validationFailed === true;
+      const validationError = str(e.payload, 'error');
       if (!phase) return model;
-      const text = contextReset
-        ? `进入「${label ?? phase}」：已启动干净的 Agent 上下文。`
-        : label
-          ? `当前阶段：${label}`
-          : undefined;
+      const text = validationFailed
+        ? `阶段产物未通过校验：${validationError ?? label ?? phase}`
+        : contextReset
+          ? `进入「${label ?? phase}」：已启动干净的 Agent 上下文。`
+          : label
+            ? `当前阶段：${label}`
+            : undefined;
+      const confirmation = modelConfirmation(e.payload);
       return {
         ...model,
         phase,
+        ...(confirmation ? { modelConfirmation: confirmation } : {}),
         lines: text ? [...lines, { kind: 'notice', text }] : lines,
       };
     }
@@ -264,7 +335,11 @@ export const KNOWLEDGE_ACTION_VERBS: string[] = [
   'publish-knowledge',
 ];
 
-export const REPORT_ACTION_VERBS: string[] = ['create-report', 'modify-report', 'validate-report'];
+export const REPORT_ACTION_VERBS: string[] = [
+  'model-report',
+  'build-report-package',
+  'validate-report',
+];
 
 /** Fallback labels for action verbs (used for history titles when no preset). */
 const ACTION_LABELS: Record<string, string> = {
@@ -273,6 +348,8 @@ const ACTION_LABELS: Record<string, string> = {
   'rescan-knowledge': '重新扫描',
   'review-enums': '审阅枚举映射',
   'publish-knowledge': '发布知识库版本',
+  'model-report': '构建报表建模',
+  'build-report-package': '生成报表',
   'create-report': '构建报表',
   'modify-report': '修改报表',
   'validate-report': '静态校验报表',

@@ -47,7 +47,7 @@ describe('create-or-open workspace (source -> cache -> install -> lock -> bootst
 
     expect(result.installed).toBe(true);
     expect(result.cacheReused).toBe(false);
-    expect(result.bundleVersion).toBe('1.29.5');
+    expect(result.bundleVersion).toBe('1.31.8');
     expect(result.bootstrap.ok).toBe(true);
 
     // Skills installed, lock + manifest present.

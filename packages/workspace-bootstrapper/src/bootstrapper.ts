@@ -51,6 +51,7 @@ const DIRECTORY_PATH_KEYS = new Set([
   'knowledge_drafts',
   'knowledge_versions',
   'report_plans',
+  'report_models',
   'report_packages',
   'output_files',
   'work',

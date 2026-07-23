@@ -92,7 +92,7 @@ export function PromptsEditor({ project }: { project: Project }): JSX.Element {
                   <input
                     className="ide-input"
                     value={p.action}
-                    placeholder="如 initialize-knowledge / create-report"
+                    placeholder="如 initialize-knowledge / model-report / build-report-package"
                     onChange={(e) => update(i, { action: e.target.value })}
                   />
                 </label>

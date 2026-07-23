@@ -89,6 +89,58 @@ describe('agent-chat reducer', () => {
     ]);
   });
 
+  it('shows the deterministic stage validation error instead of a generic phase label', () => {
+    const m = reduceEvent(
+      emptyChat('SUCCEEDED'),
+      ev('phase_changed', {
+        phase: 'DISCOVERY',
+        label: '基础建模（产物需修复）',
+        validationFailed: true,
+        error: '基础模型必须描述结果粒度假设',
+      }),
+    );
+    expect(m.lines.at(-1)).toEqual({
+      kind: 'notice',
+      text: '阶段产物未通过校验：基础模型必须描述结果粒度假设',
+    });
+  });
+
+  it('captures the structured one-shot model confirmation from the phase gate', () => {
+    const m = reduceEvent(
+      emptyChat('SUCCEEDED'),
+      ev('phase_changed', {
+        phase: 'AWAITING_MODEL_CONFIRMATION',
+        label: '等待统一确认模型',
+        details: {
+          model_confirmation: {
+            confirmation_format_version: '1',
+            report_id: 'r1',
+            discovery_revision: 'rev-1',
+            discovery_model_hash: 'hash-1',
+            questions: [
+              {
+                id: 'grain',
+                question: '按哪个字段去重？',
+                options: [
+                  { value: 'id', label: '主键' },
+                  { value: 'code', label: '业务编码' },
+                ],
+                recommended: 'id',
+                required: true,
+                affected_metrics: ['订单数量'],
+              },
+            ],
+            metric_hypotheses: [{ label: '订单数量', aggregation: 'count_distinct' }],
+            relationship_hypotheses: [],
+          },
+        },
+      }),
+    );
+    expect(m.modelConfirmation?.discovery_revision).toBe('rev-1');
+    expect(m.modelConfirmation?.questions[0]?.recommended).toBe('id');
+    expect(m.modelConfirmation?.metric_hypotheses[0]?.aggregation).toBe('count_distinct');
+  });
+
   it('completes with summary and clears waiting', () => {
     let m: ChatModel = { ...emptyChat('WAITING_FOR_USER'), waitingQuestion: 'q' };
     m = reduceEvent(m, ev('job_completed', { summary: '生成了 3 张表' }));

@@ -14,18 +14,28 @@ export declare function buildKnowledgeContext(options: {
     out: string;
     include?: string[];
     maxTables?: number;
+    maxFields?: number;
+    maxBytes?: number;
 }): Promise<JsonRecord>;
 export declare function initializeReportModel(options: {
     plan: string;
     out: string;
 }): Promise<JsonRecord>;
+export declare function validateDiscoveryReportModelValue(model: JsonRecord): string[];
 export declare function validateReportModelValue(model: JsonRecord, requireApproved?: boolean): string[];
 export declare function approveReportModel(modelPath: string, reviewedBy: string, planPathValue?: string): Promise<JsonRecord>;
+export declare function createModelConfirmation(options: {
+    model: string;
+    input: string;
+    out: string;
+    reviewedBy: string;
+}): Promise<JsonRecord>;
 export declare function buildPhaseContext(options: {
     phase: "discovery" | "modeling" | "query" | "script" | "repair";
     plan: string;
     out: string;
     model?: string;
+    confirmation?: string;
     queryId?: string;
     failure?: string;
     queryOutputs?: string;
@@ -41,6 +51,19 @@ export declare function validateStagedArtifacts(options: {
 export declare function approveStagedModel(options: {
     plan: string;
     root: string;
+    reviewedBy: string;
+}): Promise<JsonRecord>;
+/**
+ * Validate and approve a staged model, then atomically replace the one current
+ * model package owned by the report. Discovery/chat/context files remain work
+ * artifacts and are deliberately excluded; the model package carries only the
+ * approved model, semantic/execution plans, optional declarative configuration,
+ * and the compact physical source slice needed by later query compilation.
+ */
+export declare function finalizeStagedModel(options: {
+    plan: string;
+    root: string;
+    out: string;
     reviewedBy: string;
 }): Promise<JsonRecord>;
 export declare function finalizeStagedPackage(options: {

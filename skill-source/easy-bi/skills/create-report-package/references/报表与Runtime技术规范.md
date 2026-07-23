@@ -504,14 +504,14 @@ v2 继续承载单 SQL、JOIN、enrichment 和 `group_queries`；v3 只用于必
 
 Studio 对用户保持一个逻辑对话，但复杂报表在 Provider 层拆成彼此不共享聊天历史的运行：
 
-1. `discovery`：基于需求与初始按需知识切片，产出结果粒度、来源字段白名单、关系基数、指标去重键、时间/排除口径、策略建议和一个合并问题；禁止 SQL 和脚本。
-2. `modeling`：只读取 discovery model、用户确认和模型所列字段，产出 `report-model.json`、语义计划、执行计划与逐查询契约；清空待确认问题后由用户批准并写入模型 hash。
-3. `query`：每条查询只读取自己的契约、方言和精确字段/关系切片，默认最多三张表和四十个字段；只产出参数化 SQL 与查询输出契约。
+1. `discovery`：基于需求与初始按需知识切片，产出结果粒度、来源字段白名单、关系基数、指标去重键、时间/排除口径、策略建议和一个合并问题；禁止 SQL 和脚本，也禁止直接发起交互式提问。Agent 写完产物后结束，由 Studio 统一展示。
+2. `modeling`：用户只确认一次。全新 Agent 只读取 discovery model、该次统一确认和模型所列字段，产出 `report-model.json`、语义计划、执行计划与逐查询契约；清空待确认问题后由 Studio 确定性批准、写入模型 hash，并原子替换 `reports/models/<report-id>/` 唯一当前模型。
+3. `query`：属于之后独立的“生成报表”动作。每条查询只读取当前模型包内自己的契约、方言、`source.lock.json` 精确字段/关系切片，默认最多三张表和四十个字段；只产出参数化 SQL 与查询输出契约，不读取完整知识库。
 4. `script`：只读取批准计划和实际查询输出契约，不读取物理知识库；只编排 `queryStream/loadIndex/batchLookup/emit`。
 5. `repair`：根据 `MODEL_*`、`QUERY_*`、`SCRIPT_*` 或 Runtime 失败类型定向返回对应组件，不重放完整流程。
 
 `report-model.json` 的 hash 排除审批时间等元数据，批准后任何业务内容变化都会使校验失败。查询契约与最终脚本配置必须同时满足表白名单和字段白名单；缺表/缺字段必须显式回到建模阶段扩展。每个 Context Pack 包含 `fresh_session`、允许/禁止输入、表/字段/字节预算和预期产物，超过预算直接失败，不静默扩大上下文。
 
-所有阶段产物固定放在 `work/report-build/<report-id>/<revision>/`。`validate-stage` 是阶段完成门禁；Provider 的 `completed` 事件本身不代表阶段成功。用户批准模型时由 `approve-staged-model` 把语义/执行计划写回 plan 并记录模型 hash。v3 每个查询契约由独立 fresh Agent 编译，外层 SELECT 别名必须按顺序匹配输出契约；声明式策略只复核 `declarative-configuration.json`。`finalize-staged` 先在 revision 内生成并校验候选包，再发布最终目录和索引，失败时回滚；只有 script 策略构造 `configuration.script_report`。Agent 不得直接编辑 `plan.script_report`。
+建模阶段产物固定放在 `work/report-model/<report-id>/<revision>/`，生成阶段产物固定放在 `work/report-build/<report-id>/<revision>/`，二者不得混用。`validate-stage` 是阶段完成门禁；Provider 的 `completed` 事件本身不代表阶段成功。`finalize-staged-model` 使用唯一一次用户确认结果批准模型，生成最小 `source.lock.json`、manifest 和 checksums 后原子替换当前模型。Studio 的模型编辑器只允许修改字段白名单与关联关系，保存时重新校验字段、同步查询契约/最小 source lock、更新 plan 引用并重新封存。v3 每个查询契约由独立 fresh Agent 编译，外层 SELECT 别名必须按顺序匹配输出契约；声明式策略只复核 `declarative-configuration.json`。`finalize-staged` 先在 revision 内生成并校验候选包，再原子替换唯一当前开发包和索引；已发布包不可覆盖。只有 script 策略构造 `configuration.script_report`。Agent 不得直接编辑 `plan.script_report`。
 
 查询输出契约必须与模型逐列匹配名称、顺序及双方都声明的类型；缺文件、额外/遗漏列、模型 hash 漂移、SQL/脚本安全失败、表字段白名单越界或最终包静态校验失败都会阻止阶段前进。Studio 的 SSE 游标计入 `run_started/run_completed/user_message` 等所有持久化事件，跨阶段重新订阅不得跳过或重放旧的 `job_completed`。

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, FileBarChart, Trash2, Pencil } from 'lucide-react';
+import { RefreshCw, FileBarChart, Trash2, Pencil, Boxes } from 'lucide-react';
 import { workspaceApi, type Project, type ReportState } from '../api.js';
 import {
   TopBar,
@@ -15,6 +15,7 @@ import { AgentQuickStart } from './AgentQuickStart.js';
 import { REPORT_ACTION_VERBS } from './agent-chat.js';
 import { PackageEditor } from './PackageEditor.js';
 import { RequirementEditor } from './RequirementEditor.js';
+import { ReportModelEditor } from './ReportModelEditor.js';
 import { useAgentRefresh } from '../AgentDrawer.js';
 
 export function ReportsPanel({ project }: { project: Project }): JSX.Element {
@@ -27,6 +28,7 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
   // The report requirement selected for AI build; and the one being edited.
   const [selectedReqId, setSelectedReqId] = useState<string | null>(null);
   const [editingReq, setEditingReq] = useState<string | null>(null);
+  const [editingModel, setEditingModel] = useState<string | null>(null);
   const refreshNonce = useAgentRefresh();
 
   const load = useCallback(async () => {
@@ -95,7 +97,13 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
               projectId={project.id}
               actions={REPORT_ACTION_VERBS}
               selectedReport={selectedReport}
-              gateActions={['create-report', 'modify-report']}
+              gateActions={['model-report', 'build-report-package']}
+              disabledReasons={{
+                'build-report-package':
+                  selectedRequirement && selectedRequirement.modelStatus !== 'approved'
+                    ? '请先构建并确认该报表的模型'
+                    : undefined,
+              }}
             />
           </>
         }
@@ -129,7 +137,7 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
                       marginBottom: 6,
                     }}
                   >
-                    点击选择一张报表后，可点右上「AI 助手 → 构建报表」为其生成报表包；点铅笔可编辑该报表需求。
+                    先选择报表并用「构建报表建模」生成唯一当前模型；确认或人工调整模型后，再用「生成报表」构建报表包。
                   </div>
                   <div className="ide-card" style={{ padding: 0, overflow: 'hidden' }}>
                     <table className="ide-table">
@@ -139,7 +147,9 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
                           <th>报表</th>
                           <th>ID</th>
                           <th style={{ textAlign: 'right' }}>字段数</th>
-                          <th style={{ width: 48, textAlign: 'right' }}>编辑</th>
+                          <th>模型</th>
+                          <th>报表包</th>
+                          <th style={{ width: 86, textAlign: 'right' }}>编辑</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -173,17 +183,57 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
                               <td className="ide-num" style={{ textAlign: 'right' }}>
                                 {r.fieldCount}
                               </td>
-                              <td style={{ textAlign: 'right' }}>
-                                <button
-                                  className="ide-btn ide-btn-sm ide-btn-ghost"
-                                  title="编辑该报表需求（名称/说明/字段/角色/绑定）"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setEditingReq(r.id);
-                                  }}
+                              <td>
+                                <Badge
+                                  kind={
+                                    r.modelStatus === 'approved'
+                                      ? 'success'
+                                      : r.modelStatus === 'invalid'
+                                        ? 'error'
+                                        : r.modelStatus === 'draft'
+                                          ? 'warning'
+                                          : 'neutral'
+                                  }
+                                  dot
                                 >
-                                  <Pencil className="w-3.5 h-3.5" />
-                                </button>
+                                  {r.modelStatus === 'approved'
+                                    ? '已确认'
+                                    : r.modelStatus === 'invalid'
+                                      ? '需修正'
+                                      : r.modelStatus === 'draft'
+                                        ? '待确认'
+                                        : '未建模'}
+                                </Badge>
+                              </td>
+                              <td>
+                                <Badge kind={r.packageStatus === 'ready' ? 'success' : 'neutral'} dot>
+                                  {r.packageStatus === 'ready' ? '已生成' : '未生成'}
+                                </Badge>
+                              </td>
+                              <td style={{ textAlign: 'right' }}>
+                                <div style={{ display: 'inline-flex', gap: 3 }}>
+                                  <button
+                                    className="ide-btn ide-btn-sm ide-btn-ghost"
+                                    disabled={r.modelStatus === 'missing'}
+                                    title={r.modelStatus === 'missing' ? '请先构建报表建模' : '编辑表字段与关联关系'}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setEditingModel(r.id);
+                                    }}
+                                  >
+                                    <Boxes className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    className="ide-btn ide-btn-sm ide-btn-ghost"
+                                    title="编辑该报表需求（名称/说明/字段/角色/绑定）"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setEditingReq(r.id);
+                                    }}
+                                  >
+                                    <Pencil className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                           );
@@ -276,9 +326,9 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
                   style={{ color: 'var(--ide-text-tertiary)', marginTop: 2 }}
                 />
                 <div style={{ fontSize: 12.5, color: 'var(--ide-text-secondary)', lineHeight: 1.6 }}>
-                  报表需求可在本页点铅笔就地编辑，也可在「配置」页的「报表」页签批量编辑/导入（都写回
-                  config/easy-bi.json）。选中一张报表后点「AI 助手 → 构建报表」，AI 只为这一张生成报表计划与报表包；生成后到「测试」页启动
-                  Runtime、填写筛选并导出 Excel。
+                  一个报表需求只对应一个当前模型和一个当前报表包。先构建模型，建模过程中只进行一次统一确认；
+                  模型生成后可在本页调整表字段与关联关系。只有模型处于「已确认」状态时，才能执行「生成报表」。
+                  生成完成后到「测试」页启动 Runtime、填写筛选并导出 Excel。
                 </div>
               </div>
             </Card>
@@ -303,6 +353,16 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
           requirementId={editingReq}
           onClose={(changed) => {
             setEditingReq(null);
+            if (changed) void load();
+          }}
+        />
+      )}
+      {editingModel && (
+        <ReportModelEditor
+          projectId={project.id}
+          reportId={editingModel}
+          onClose={(changed) => {
+            setEditingModel(null);
             if (changed) void load();
           }}
         />

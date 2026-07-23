@@ -10,8 +10,16 @@
  * without dropping the `field` binding or other keys the skill may add.
  */
 /** What a field is used for in the report. A field may play several roles. */
-export type FieldRole = 'output' | 'filter' | 'group';
-export const FIELD_ROLES: FieldRole[] = ['output', 'filter', 'group'];
+export type FieldRole = 'output' | 'filter' | 'group' | 'metric';
+export const FIELD_ROLES: FieldRole[] = ['output', 'filter', 'group', 'metric'];
+export type MetricAggregation = 'count' | 'count_distinct' | 'sum' | 'avg' | 'ratio';
+export const METRIC_AGGREGATIONS: MetricAggregation[] = [
+  'count',
+  'count_distinct',
+  'sum',
+  'avg',
+  'ratio',
+];
 
 export interface ReportFieldDraft {
   /** The human-editable display text (a plain string, or an object's label/field). */
@@ -24,6 +32,8 @@ export interface ReportFieldDraft {
    * Absent/empty means no description. Persisted only when non-empty.
    */
   description?: string;
+  /** Optional metric aggregation. Used only when the metric role is selected. */
+  aggregation?: MetricAggregation;
   /** Present when the original entry was an object; preserved on merge. */
   raw?: Record<string, unknown>;
 }
@@ -73,6 +83,9 @@ function toFieldDraft(entry: unknown): ReportFieldDraft {
       text,
       roles: normalizeRoles(rec.roles),
       description: typeof rec.description === 'string' ? rec.description : '',
+      aggregation: METRIC_AGGREGATIONS.includes(rec.aggregation as MetricAggregation)
+        ? (rec.aggregation as MetricAggregation)
+        : undefined,
       raw: rec,
     };
   }
@@ -97,6 +110,8 @@ function fromFieldDraft(f: ReportFieldDraft): string | Record<string, unknown> {
     else delete out.roles;
     if (description) out.description = description;
     else delete out.description;
+    if (roles.includes('metric') && f.aggregation) out.aggregation = f.aggregation;
+    else delete out.aggregation;
     return out;
   }
   // No original object: only upgrade to an object when roles or a description
@@ -104,6 +119,7 @@ function fromFieldDraft(f: ReportFieldDraft): string | Record<string, unknown> {
   if (nonOutputRoles || meaningfulRoles.length || description) {
     const out: Record<string, unknown> = { label: text, roles };
     if (description) out.description = description;
+    if (roles.includes('metric') && f.aggregation) out.aggregation = f.aggregation;
     return out;
   }
   return text;
@@ -195,18 +211,21 @@ export function upsertRequirementIntoConfig(
 }
 
 /**
- * Append a "build only this one report" scope to a create-report preset prompt,
- * so the AI generates a package for the selected requirement instead of scanning
- * every report_requirements entry.
+ * Append a one-report scope to either the modeling or package-generation preset.
  */
 export function buildScopedReportPrompt(
   basePrompt: string,
   report: { id: string; name: string },
+  action = 'model-report',
 ): string {
   const id = report.id.trim();
   const name = report.name.trim();
   const label = name && name !== id ? `${id}（${name}）` : id;
-  const scope = `\n\n本次仅处理报表 ${label}，忽略 config 中的其它 report_requirements；当前首轮只执行基础建模并等待用户确认，不得提前生成 SQL、脚本或报表包。`;
+  const instruction =
+    action === 'build-report-package'
+      ? '只使用该报表已确认的当前模型生成报表包，不得重新建模、读取完整知识库或再次确认业务口径。'
+      : '只执行基础建模，把不清晰事项整理为一次统一确认，不得提前生成 SQL、脚本或报表包。';
+  const scope = `\n\n本次仅处理报表 ${label}，忽略 config 中的其它 report_requirements；${instruction}`;
   return `${basePrompt}${scope}`;
 }
 
@@ -230,7 +249,14 @@ export function toggleRole(f: ReportFieldDraft, role: FieldRole): ReportFieldDra
   else set.add(role);
   // Never end up with an empty set — fall back to output-only.
   const roles = FIELD_ROLES.filter((r) => set.has(r));
-  return { ...f, roles: roles.length ? roles : ['output'] };
+  const nextRoles: FieldRole[] = roles.length ? roles : ['output'];
+  return {
+    ...f,
+    roles: nextRoles,
+    ...(nextRoles.includes('metric')
+      ? { aggregation: f.aggregation ?? 'count_distinct' }
+      : { aggregation: undefined }),
+  };
 }
 
 /** Read the optional field binding (db.table.column) from a draft field. */
@@ -249,7 +275,10 @@ export function setFieldBinding(f: ReportFieldDraft, binding: string): ReportFie
   // Only carry `description` when it holds content, so callers comparing plain
   // (text, roles) drafts by value keep matching.
   const desc = (f.description ?? '').trim();
-  const carry = desc ? { description: f.description } : {};
+  const carry = {
+    ...(desc ? { description: f.description } : {}),
+    ...(f.aggregation ? { aggregation: f.aggregation } : {}),
+  };
   if (!trimmed) return { text: f.text, roles, ...carry };
   return {
     text: f.text,

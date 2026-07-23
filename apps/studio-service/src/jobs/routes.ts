@@ -13,9 +13,10 @@ interface AgentActionBody {
 
 interface ReplyBody {
   reply?: string;
-  intent?: 'chat' | 'confirm_discovery' | 'approve_model';
+  intent?: 'chat' | 'confirm_model' | 'confirm_discovery' | 'approve_model';
   modelRevision?: string;
   modelHash?: string;
+  confirmation?: Record<string, unknown>;
 }
 
 export function registerJobRoutes(
@@ -38,7 +39,12 @@ export function registerJobRoutes(
         return reply.code(400).send(fail(request.requestId, 'VALIDATION_FAILED', '自由对话需要输入内容'));
       }
       if (
-        (body.action === 'create-report' || body.action === 'modify-report') &&
+        (
+          body.action === 'model-report' ||
+          body.action === 'build-report-package' ||
+          body.action === 'create-report' ||
+          body.action === 'modify-report'
+        ) &&
         !body.reportId?.trim()
       ) {
         return reply.code(400).send(fail(request.requestId, 'VALIDATION_FAILED', '分阶段报表任务缺少 reportId'));
@@ -63,7 +69,12 @@ export function registerJobRoutes(
         if (err instanceof WriteTaskConflictError) {
           return reply.code(409).send(fail(request.requestId, err.code, err.message));
         }
-        if (body.action === 'create-report' || body.action === 'modify-report') {
+        if (
+          body.action === 'model-report' ||
+          body.action === 'build-report-package' ||
+          body.action === 'create-report' ||
+          body.action === 'modify-report'
+        ) {
           return reply.code(400).send(fail(request.requestId, 'REPORT_WORKFLOW_UNAVAILABLE', String((err as Error).message)));
         }
         throw err;
@@ -114,11 +125,17 @@ export function registerJobRoutes(
       const project = service.get(persisted.projectId);
       if (project) jobs.reopenJob(request.params.taskId, project.workspaceRoot);
       try {
-        if (body.intent === 'confirm_discovery') {
+        if (body.intent === 'confirm_model' || body.intent === 'confirm_discovery') {
+          const reviewerHeader = request.headers['x-easybi-user'];
+          const reviewedBy =
+            (Array.isArray(reviewerHeader) ? reviewerHeader[0] : reviewerHeader)?.trim() ||
+            'local-user';
           const run = await jobs.startFreshPhase({
             jobId: request.params.taskId,
             phase: 'MODELING',
             userMessage: body.reply,
+            reviewedBy,
+            ...(body.confirmation ? { modelConfirmation: body.confirmation } : {}),
             ...(body.modelRevision ? { modelRevision: body.modelRevision } : {}),
             ...(body.modelHash ? { modelHash: body.modelHash } : {}),
           });

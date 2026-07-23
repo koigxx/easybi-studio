@@ -29,7 +29,7 @@
 
 ### 当前版本
 
-- Bundle `1.29.5`、知识库 Skill `0.16.0`、报表 Skill `2.26.5`（开发版）。
+- Bundle `1.31.8`、知识库 Skill `0.16.0`、报表 Skill `2.28.8`（开发版）。
 - 数据库支持：MySQL（默认）与 PostgreSQL，经方言层分派；连接类型在配置页可选。
 - 每个 Skill 含面向开发者/管理员的 `使用说明.md`；报表计划为 v2，报表包支持 v2 声明式和 v3 隔离脚本（v1 不读取、不迁移、不执行）；Runtime HTTP API 仍为 v1。
 - 每次同步生成新的不可变版本缓存与 `vendor/easybi-bundle` 快照，不覆盖旧缓存。
@@ -40,11 +40,44 @@
 2. **OSS 与业务任务接口配置**：用于异步导出真实联调（无配置时正确返回 `OSS_PROFILE_UNAVAILABLE`）。
 3. **业务语义确认**：热温冷分层、枚举中文映射、报表计划语义——由 Claude 提出、用户确认。
 
-以上均为“外部输入”，不阻塞已完成的全部非 DB 能力。旧工作区策略：不迁移、不备份 v1 报表资产；用户明确升级后才删除 v1 索引/计划/报表包重生成 v2。`transport-test` 尚未被修改。
+以上均为“外部输入”，不阻塞已完成的全部非 DB 能力。旧工作区策略：不迁移、不备份 v1 报表资产；用户明确升级后才删除 v1 索引/计划/报表包重生成 v2。已按用户要求把登记工作区 `transport-test` 显式升级到 Bundle 1.31.8；未登记工作区保持不变。
 
 ---
 
 ## ② 变更历史（倒序）
+
+### 清晰需求直达模型、技术错误自动修复（bundle 1.31.8）（2026-07-23）
+
+- **直达确定模型**：discovery 没有未决业务问题时，Studio 自动生成 revision-bound `confirmation.json` 并启动 fresh MODELING，不再要求用户做无意义的二次点击；存在业务歧义时仍只展示一次统一确认，确认后直接生成、批准并原子发布唯一当前模型。
+- **技术问题不再问用户**：字段是否存在、Context 扩展和执行策略不进入用户确认 UI；建模 Context 会从 discovery/confirmation 中提取实际引用的物理字段并与知识库求交集，只携带最终需要的最小字段切片。
+- **阶段自动修复**：DISCOVERY、MODELING、QUERY 和 SCRIPT 的确定性门禁失败后，Studio 在同一业务阶段最多启动两次 provider-fresh 技术修复 run，携带精确校验错误且保持已确认口径；重试耗尽后才显示失败。格式修复不会回退到业务确认，也不会把“文件已写入”当成完成。
+- **Agent 实际输出兼容**：discovery 同时兼容 `sources/selected_tables`、`selected_fields/fields` 和缺省 source id；最终建模会把 alias 型查询来源、`output_contract` 列和 `on` 表达式关系确定性规范化为正式模型契约，再计算批准 hash、source lock 与 checksums。
+- **真实任务恢复**：`transport-test/test722` 已完成 `DISCOVERY → MODELING → COMPLETED`，正式模型状态为 `approved`；包含 3 张来源表、2 条关系、25 个选中字段、12 个指标和 2 个 query contracts，策略为 `group_queries`，模型 hash 为 `cf398fe6…`。报表页面 API 已返回 `modelStatus=approved`。
+- **测试与分发**：报表 Skill 90/90、JobManager 17/17、Studio Web 95/95、Workspace SDK 57/57、Studio Service 52 通过（2 个可选 Runtime 测试跳过），全仓 `test`、`typecheck`、`build` 通过。Bundle 1.31.8 已同步到不可变缓存与 vendor（SHA-256 `15cb932f…`），`transport-test` 已显式升级并通过 `doctor` 与已批准模型校验。
+- **已知问题与下一步**：当前只完成建模，`test722` 报表包仍为 missing；下一步应由独立“生成报表”动作消费该已批准模型。真实数据库 preview/Excel 结果仍需业务数据验收。
+
+### 需求驱动知识检索、结构化统一确认与预算门禁（bundle 1.31.2）（2026-07-23）
+
+- **指标语义先行**：报表配置支持显式 `metric` 角色和聚合方式；`inspect` 会把“订单数量/状态数量/合计”等自然语言项转换为 `METRIC_REQUIRES_MODELING`，携带实体和 `count_distinct` 等聚合意图，不再把业务指标错误当成缺失物理字段。
+- **有界知识召回**：discovery 根据实体、字段语义、状态/枚举、主键、关系键、系统条件和报表描述评分，只携带候选字段、引用枚举、关系目录与必要表切片。默认最多 6 张表、80 个字段、64 KB 知识切片，最终阶段上下文继续执行 100 KB 硬门禁；低优先级字段会确定性裁剪。
+- **结构化一次确认**：discovery 输出 `metric_hypotheses`、`relationship_hypotheses` 和带候选/推荐项的结构化 `open_questions`；AI 抽屉用单选 UI 一次展示并提交。Studio 通过 `confirm-discovery` 固化独立 `confirmation.json`，同时绑定报表、discovery revision 与模型 hash；modeling 只读取该制品和精确字段切片，最终模型必须回填 revision/hash，过期或错配会被确定性拒绝。
+- **基础/最终模型门禁分离**：discovery 允许单行汇总的空稳定键、`selected_tables`、指标/关系假设和未完成查询契约；Studio 会在进入 modeling 前把候选表规范化为精确 `sources`。候选字段兼容字符串、`name/field` 对象和 Agent 实际产出的 `physical_name` 对象，并在同时存在空 `sources` 时按表合并回填。完整来源、粒度和输出契约仍只在最终模型阶段强校验。推荐答案若不是候选值会被规范化为可选项；阶段校验失败会在对话中直接显示具体原因。
+- **动作和模型职责**：默认提示词仍严格拆成“构建报表建模”和“生成报表”；前者完成知识检索、统一确认、模型生成及人工字段/关系修正，后者只消费唯一当前模型包和最小依赖，不重新探索知识库或再次确认。
+- **真实配置回归**：`transport-test/test722` 原阶段上下文约 665 KB、11 张表、569 个字段；新流程输出 76,277 字节、4 张候选表、36 个字段，并识别全部 12 个状态数量指标。已显式升级该登记工作区到 Bundle 1.31.0，保留旧 Skill/toolkit 可恢复备份；Runtime 配置 hash 保持一致。
+- **测试与分发**：报表 Skill 89/89；Studio Web 95/95；Workspace SDK 57/57；JobManager 15/15；Studio Service 52 通过、2 个可选 Runtime 测试跳过；全仓 `build`、`typecheck`、`test` 与 integration 通过，本次触及的产品 TypeScript/TSX 文件通过 ESLint。Bundle 1.31.2 已同步到不可变缓存与 vendor（SHA-256 `83a3f888…`），工作区 `doctor` 验证 staged workflow v3，两个 Skill 的生产依赖完整。
+- **已知问题与下一步**：真实数据下各状态对应的枚举值、订单/派车单去重键和二者关系仍需要用户在新的统一确认 UI 中确认；模型确定后再做 SQL、preview 与 Excel 业务结果验收。全仓 lint 仍有 Skill 源码既有规则债务。
+
+### 独立报表模型、一次确认与模型编辑器（bundle 1.30.1）（2026-07-23）
+
+- **两个独立动作**：默认提示词从旧“构建报表”拆为“构建报表建模”和“生成报表”；旧工作区配置中的 `create-report/modify-report` 在读取时兼容映射到两个新默认项。建模 Job 为 `DISCOVERY → 一次统一确认 → MODELING → COMPLETED`，生成 Job 从已批准模型直接进入查询/脚本编译，不再混在一个任务里。
+- **一个报表一个当前模型**：Manifest 新增 `report_models → reports/models`。建模阶段使用 `work/report-model/<report-id>/<revision>`；`finalize-staged-model` 校验并批准模型，生成只含模型、语义/执行计划、可选声明式配置、最小 `source.lock.json`、manifest 和 checksums 的候选，再原子替换 `reports/models/<report-id>`。查询生成只复制这个模型包，不再读取完整知识库。
+- **一次统一确认**：discovery Agent 只把全部不清晰项写入基础模型并结束，不直接调用交互式提问；Studio 统一展示一次。确认后的 fresh modeling Agent 不得提出第二轮问题，成功后由确定性门禁直接发布模型。
+- **模型读取与人工修正**：Workspace SDK / Service 新增带 revision 乐观锁的模型 GET/PUT。报表页展示每个需求的模型/报表包状态；模型编辑器可勾选表字段、增删关联、调整 JOIN 类型和关系基数，并只读展示粒度、策略、筛选与指标摘要。保存时校验字段确属知识库、同步 query contracts 与最小 source lock、更新 plan 引用和 model hash、重新封存 checksums；进行中的写任务会阻止并发模型编辑。
+- **当前开发包原子替换**：`finalize-staged` 允许同一路径的 development-only 当前包在候选完整校验后原子替换，失败恢复旧包/计划/索引；已发布或来源不明目标继续拒绝覆盖。
+- **兼容与失败处理**：无模型、模型失效或旧 Bundle 时“生成报表”禁用/明确失败；模型编辑支持 404、revision 冲突、非法字段/关系、并发写冲突和空状态。取消或失败只留下 revision 工作产物，不会替换当前模型/报表包。
+- **改动文件**：Contracts/JobManager；Studio staged workflow、任务/提示词/模型 API；报表页动作门控和 `ReportModelEditor`；Workspace SDK 模型存取；报表 Skill CLI、测试、文档、提示词、编译产物；Bundle/Workspace 目录契约和架构文档。
+- **测试与分发**：报表 Skill 86/86；Studio Web 92/92；Workspace SDK 57/57；JobManager 15/15；Studio Service 52 通过、2 个既有可选 Runtime 测试跳过；Bundle Source 6 通过、5 个可选源测试跳过；Workspace Bootstrapper 6/6；真实 Claude Skill 引导测试通过。全仓 `build`、`typecheck`、`test`（含 integration）通过，本次触及的产品 TypeScript/TSX 文件通过 ESLint；全仓 lint 仍被 Skill 源码内既有规则债务阻断。浏览器实测报表页无横向溢出，并发现/修复旧 Skill 工作区迁移后提示词菜单为空的问题。Bundle 1.30.1 已同步到不可变缓存与 vendor（SHA-256 `12219f45…`），vendor 已验证 `report_models`、两个提示词和 `finalize-staged-model`。
+- **已知问题与下一步**：真实数据库的多表字段/关系编辑后 SQL、preview 和 Excel 结果仍需业务数据验收；旧工作区不静默升级，需用户显式升级到 Bundle 1.30.1 后才能执行新建模流程。结构化 `failure.json` 自动回到模型编辑器仍可继续增强。
 
 ### 策略分流、逐查询 Agent 与原子发布（bundle 1.29.5）（2026-07-23）
 

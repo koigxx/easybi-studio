@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { stripTypeScriptTypes } from 'node:module';
 import { join, relative } from 'node:path';
 import { normalizeAbsolute, resolveWithinWorkspace } from './paths.js';
+import { readReportModel } from './report-model.js';
 
 /**
  * Transpile the TypeScript transform source into the runtime `.mjs` by stripping
@@ -30,7 +31,15 @@ export interface ReportSummary {
 
 export interface ReportState {
   /** Report requirements declared in config (names only for the page). */
-  requirements: Array<{ id: string; name: string; fieldCount: number }>;
+  requirements: Array<{
+    id: string;
+    name: string;
+    fieldCount: number;
+    modelStatus: 'approved' | 'draft' | 'invalid' | 'missing';
+    modelRevision?: string;
+    modelStrategy?: string;
+    packageStatus: 'ready' | 'missing';
+  }>;
   plans: string[];
   reports: ReportSummary[];
   notes: string[];
@@ -62,7 +71,7 @@ export async function readReportState(workspaceRoot: string): Promise<ReportStat
     | { knowledge?: { report_requirements?: Array<Record<string, unknown>> } }
     | null;
   const reqs = cfg?.knowledge?.report_requirements ?? [];
-  const requirements = reqs.map((r, i) => {
+  const baseRequirements = reqs.map((r, i) => {
     const rf = r.required_fields;
     return {
       id: String(r.id ?? `req-${i}`),
@@ -86,6 +95,27 @@ export async function readReportState(workspaceRoot: string): Promise<ReportStat
     if (r.path !== undefined) s.path = String(r.path);
     return s;
   });
+  const requirements = await Promise.all(
+    baseRequirements.map(async (requirement) => {
+      const report = reports.find((item) => item.id === requirement.id);
+      try {
+        const model = await readReportModel(root, requirement.id);
+        return {
+          ...requirement,
+          modelStatus: model.status,
+          modelRevision: model.revision,
+          modelStrategy: model.strategy,
+          packageStatus: report ? ('ready' as const) : ('missing' as const),
+        };
+      } catch {
+        return {
+          ...requirement,
+          modelStatus: 'missing' as const,
+          packageStatus: report ? ('ready' as const) : ('missing' as const),
+        };
+      }
+    }),
+  );
 
   if (requirements.length === 0) notes.push('构建配置未声明报表需求');
   if (reports.length === 0) notes.push('尚未生成任何报表包');

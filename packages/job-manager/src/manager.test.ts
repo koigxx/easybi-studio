@@ -158,46 +158,86 @@ describe('JobManager with FakeAgentBridge', () => {
     expect(second.id).toBeTruthy();
   });
 
-  it('keeps one logical conversation while report phases use fresh provider runs', async () => {
+  it('separates one-confirmation modeling from provider-fresh report generation', async () => {
     const bridge = new TurnByTurnBridge();
     const store = new MemEventStore();
     const completedPhases: string[] = [];
+    const preparedConfirmations: Array<Record<string, unknown> | undefined> = [];
     const jm = new JobManager({
       bridge,
       events: store,
       buildReportPhasePrompt: (phase, context) => `fresh ${phase} ${context.reportId}`,
-      prepareReportPhase: async ({ phase }) => phase === 'QUERY_COMPILATION'
+      prepareInitialReport: async ({ phase }) => phase === 'QUERY_COMPILATION'
         ? { ok: true, details: { strategy: 'script', query_ids: ['orders', 'waybills'] } }
         : { ok: true },
+      prepareReportPhase: async ({ modelConfirmation }) => {
+        preparedConfirmations.push(modelConfirmation);
+        return { ok: true };
+      },
       completeReportPhase: async ({ phase }) => {
         completedPhases.push(phase);
-        return { ok: true };
+        return phase === 'DISCOVERY'
+          ? {
+              ok: true,
+              details: {
+                model_confirmation: {
+                  discovery_revision: 'revision-1',
+                  questions: [{ id: 'grain', required: true }],
+                },
+              },
+            }
+          : phase === 'MODELING'
+          ? { ok: true, details: { workflow_complete: true } }
+          : { ok: true };
       },
       onJobChange: (job) => store.jobs.set(job.id, { ...job }),
     });
     const job = await jm.startAgentJob({
       projectId: 'p1',
       workspaceRoot: '/tmp/ws-phases',
-      action: 'create-report',
+      action: 'model-report',
       prompt: 'discover',
       reportId: 'customer-volume',
     });
-    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_DISCOVERY_CONFIRMATION');
-    await jm.startFreshPhase({ jobId: job.id, phase: 'MODELING', userMessage: '确认关系' });
-    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_MODEL_APPROVAL');
-    await jm.startFreshPhase({ jobId: job.id, phase: 'QUERY_COMPILATION', userMessage: '批准模型' });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_MODEL_CONFIRMATION');
+    await jm.startFreshPhase({
+      jobId: job.id,
+      phase: 'MODELING',
+      userMessage: '确认关系',
+      modelConfirmation: { discovery_revision: 'revision-1', answers: {} },
+    });
     await waitFor(() => jm.getJob(job.id)?.phase === 'COMPLETED');
 
-    const runs = store.listRuns(job.id);
+    expect(store.listRuns(job.id).map((run) => run.phase)).toEqual(['DISCOVERY', 'MODELING']);
+    expect(preparedConfirmations[0]).toEqual({
+      discovery_revision: 'revision-1',
+      answers: {},
+    });
+    expect(
+      jm.getEvents(job.id).some(
+        (event) =>
+          event.type === JobEventTypes.PHASE_CHANGED &&
+          (event.payload?.details as Record<string, unknown> | undefined)
+            ?.model_confirmation !== undefined,
+      ),
+    ).toBe(true);
+
+    const build = await jm.startAgentJob({
+      projectId: 'p1',
+      workspaceRoot: '/tmp/ws-phases',
+      action: 'build-report-package',
+      prompt: 'build',
+      reportId: 'customer-volume',
+    });
+    await waitFor(() => jm.getJob(build.id)?.phase === 'COMPLETED');
+    const runs = store.listRuns(build.id);
     expect(runs.map((run) => run.phase)).toEqual([
-      'DISCOVERY',
-      'MODELING',
       'QUERY_COMPILATION',
       'QUERY_COMPILATION',
       'SCRIPT_COMPILATION',
     ]);
     expect(runs.filter((run) => run.phase === 'QUERY_COMPILATION').map((run) => run.unitId)).toEqual(['orders', 'waybills']);
-    expect(new Set(runs.map((run) => run.providerTaskId)).size).toBe(5);
+    expect(new Set(runs.map((run) => run.providerTaskId)).size).toBe(3);
     expect(completedPhases).toEqual(['DISCOVERY', 'MODELING', 'QUERY_COMPILATION', 'QUERY_COMPILATION', 'SCRIPT_COMPILATION']);
     expect(jm.getEvents(job.id).filter((event) => event.type === JobEventTypes.JOB_STARTED)).toHaveLength(1);
     expect(
@@ -232,6 +272,102 @@ describe('JobManager with FakeAgentBridge', () => {
     }));
   });
 
+  it('repairs a technical stage-contract failure internally before asking for business confirmation', async () => {
+    const bridge = new TurnByTurnBridge();
+    const store = new MemEventStore();
+    let attempts = 0;
+    const jm = new JobManager({
+      bridge,
+      events: store,
+      buildReportPhasePrompt: (phase) => `strict ${phase} contract`,
+      prepareInitialReport: async () => ({ ok: true }),
+      completeReportPhase: async ({ phase }) => {
+        attempts += 1;
+        return attempts === 1
+          ? { ok: false, error: 'model_format_version 必须为 1' }
+          : {
+              ok: true,
+              details: {
+                model_confirmation: {
+                  discovery_revision: 'revision-1',
+                  questions: [{ id: 'grain', required: true }],
+                },
+              },
+            };
+      },
+      onJobChange: (job) => store.jobs.set(job.id, { ...job }),
+    });
+
+    const job = await jm.startAgentJob({
+      projectId: 'p1',
+      workspaceRoot: '/tmp/ws-auto-repair',
+      action: 'model-report',
+      prompt: 'discover',
+      reportId: 'customer-volume',
+    });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_MODEL_CONFIRMATION');
+
+    expect(attempts).toBe(2);
+    expect(store.listRuns(job.id).map((run) => run.phase)).toEqual(['DISCOVERY', 'DISCOVERY']);
+    expect(store.listRuns(job.id).map((run) => run.status)).toEqual(['FAILED', 'SUCCEEDED']);
+    expect(
+      jm.getEvents(job.id).some(
+        (event) =>
+          event.type === JobEventTypes.PHASE_CHANGED &&
+          event.payload?.autoRepair === true &&
+          event.payload?.repairAttempt === 1,
+      ),
+    ).toBe(true);
+  });
+
+  it('goes straight from clear discovery to a finalized model without another user action', async () => {
+    const bridge = new TurnByTurnBridge();
+    const store = new MemEventStore();
+    const preparedPhases: string[] = [];
+    const jm = new JobManager({
+      bridge,
+      events: store,
+      buildReportPhasePrompt: (phase) => `fresh ${phase}`,
+      prepareInitialReport: async () => ({ ok: true }),
+      prepareReportPhase: async ({ phase }) => {
+        preparedPhases.push(phase);
+        return { ok: true };
+      },
+      completeReportPhase: async ({ phase }) =>
+        phase === 'DISCOVERY'
+          ? {
+              ok: true,
+              details: {
+                model_confirmation: {
+                  discovery_revision: 'revision-1',
+                  questions: [],
+                },
+              },
+            }
+          : { ok: true, details: { workflow_complete: true } },
+      onJobChange: (job) => store.jobs.set(job.id, { ...job }),
+    });
+
+    const job = await jm.startAgentJob({
+      projectId: 'p1',
+      workspaceRoot: '/tmp/ws-clear-model',
+      action: 'model-report',
+      prompt: 'discover',
+      reportId: 'customer-volume',
+    });
+    await waitFor(() => jm.getJob(job.id)?.phase === 'COMPLETED');
+
+    expect(store.listRuns(job.id).map((run) => run.phase)).toEqual(['DISCOVERY', 'MODELING']);
+    expect(preparedPhases).toEqual(['MODELING']);
+    expect(
+      jm.getEvents(job.id).some(
+        (event) =>
+          event.type === JobEventTypes.PHASE_CHANGED &&
+          event.payload?.phase === 'AWAITING_MODEL_CONFIRMATION',
+      ),
+    ).toBe(false);
+  });
+
   it('finishes a declarative report after configuration compilation without a script run', async () => {
     const bridge = new TurnByTurnBridge();
     const store = new MemEventStore();
@@ -239,7 +375,7 @@ describe('JobManager with FakeAgentBridge', () => {
       bridge,
       events: store,
       buildReportPhasePrompt: (phase, context) => `${phase}:${context.unitId ?? ''}:${context.strategy ?? ''}`,
-      prepareReportPhase: async ({ phase }) => phase === 'QUERY_COMPILATION'
+      prepareInitialReport: async ({ phase }) => phase === 'QUERY_COMPILATION'
         ? { ok: true, details: { strategy: 'group_queries', query_ids: ['declarative'] } }
         : { ok: true },
       completeReportPhase: async ({ phase }) => phase === 'QUERY_COMPILATION'
@@ -247,14 +383,10 @@ describe('JobManager with FakeAgentBridge', () => {
         : { ok: true },
       onJobChange: (job) => store.jobs.set(job.id, { ...job }),
     });
-    const job = await jm.startAgentJob({ projectId: 'p1', workspaceRoot: '/tmp/ws-v2', action: 'create-report', prompt: 'discover', reportId: 'v2-report' });
-    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_DISCOVERY_CONFIRMATION');
-    await jm.startFreshPhase({ jobId: job.id, phase: 'MODELING', userMessage: '确认' });
-    await waitFor(() => jm.getJob(job.id)?.phase === 'AWAITING_MODEL_APPROVAL');
-    await jm.startFreshPhase({ jobId: job.id, phase: 'QUERY_COMPILATION', userMessage: '批准' });
+    const job = await jm.startAgentJob({ projectId: 'p1', workspaceRoot: '/tmp/ws-v2', action: 'build-report-package', prompt: 'build', reportId: 'v2-report' });
     await waitFor(() => jm.getJob(job.id)?.phase === 'COMPLETED');
-    expect(store.listRuns(job.id).map((run) => run.phase)).toEqual(['DISCOVERY', 'MODELING', 'QUERY_COMPILATION']);
-    expect(store.listRuns(job.id)[2]?.unitId).toBe('declarative');
+    expect(store.listRuns(job.id).map((run) => run.phase)).toEqual(['QUERY_COMPILATION']);
+    expect(store.listRuns(job.id)[0]?.unitId).toBe('declarative');
   });
 
   it('re-subscribe after a finished turn streams the resumed turn, not the old completion (since cursor)', async () => {

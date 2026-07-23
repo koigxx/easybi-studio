@@ -705,12 +705,18 @@ export async function inspectReport(options) {
     const warnings = [];
     const resolvedFields = [];
     for (const [index, requestedField] of (requirement.required_fields ?? []).entries()) {
+        const requestedObject = typeof requestedField === "object" && requestedField !== null
+            ? requestedField
+            : null;
+        const explicitBinding = requestedObject !== null &&
+            typeof requestedObject.field === "string" &&
+            requestedObject.field.trim().length > 0;
         const raw = typeof requestedField === "string"
             ? requestedField
-            : requestedField.field;
+            : requestedField.field ?? requestedField.label;
         const label = typeof requestedField === "string"
             ? requestedField
-            : requestedField.label;
+            : requestedField.label ?? requestedField.field;
         // Optional per-field business description / 口径 authored in the config, to
         // help the AI understand exactly what the field means when generating the
         // package (e.g. 订单数总和 → "订单数量的总和"). Empty when absent.
@@ -719,19 +725,56 @@ export async function inspectReport(options) {
             typeof requestedField.description === "string"
             ? requestedField.description.trim()
             : "";
-        // Roles declared in the report config (output/filter/group). Empty ⇒
+        // Roles declared in the report config (output/filter/group/metric). Empty ⇒
         // output-only. Recorded onto the resolved field as a hint for generation.
         const roles = typeof requestedField === "object" &&
             requestedField !== null &&
             Array.isArray(requestedField.roles)
             ? requestedField.roles
                 .map((r) => String(r))
-                .filter((r) => ["output", "filter", "group"].includes(r))
+                .filter((r) => ["output", "filter", "group", "metric"].includes(r))
             : [];
         if (!raw) {
             blockers.push({
                 code: "INVALID_REQUIRED_FIELD",
                 message: `第 ${index + 1} 个报表字段没有 field`,
+            });
+            continue;
+        }
+        const inferredMetric = roles.includes("metric") ||
+            (!explicitBinding &&
+                /数量|总数|合计|金额|总额|比例|比率|率$|均值|平均/u.test(String(label ?? raw)));
+        if (inferredMetric && !explicitBinding) {
+            const fieldId = stableId(String(label ?? raw)).replaceAll("-", "_");
+            const aggregation = typeof requestedObject?.aggregation === "string"
+                ? requestedObject.aggregation
+                : /比例|比率|率$/u.test(String(label ?? raw))
+                    ? "ratio"
+                    : /数量|总数|数$/u.test(String(label ?? raw))
+                        ? "count_distinct"
+                        : /金额|总额|合计/u.test(String(label ?? raw))
+                            ? "sum"
+                            : /均值|平均/u.test(String(label ?? raw))
+                                ? "avg"
+                                : "count_distinct";
+            blockers.push({
+                code: "METRIC_REQUIRES_MODELING",
+                field: raw,
+                field_id: fieldId,
+                label: label ?? raw,
+                description: fieldDescription,
+                roles: roles.length ? roles : ["metric", "output"],
+                metric_intent: {
+                    aggregation,
+                    entity: String(label ?? raw).includes("派车单")
+                        ? "派车单"
+                        : String(label ?? raw).includes("运单")
+                            ? "运单"
+                            : String(label ?? raw).includes("订单")
+                                ? "订单"
+                                : null,
+                },
+                message: `指标「${String(label ?? raw)}」需要在建模阶段确认来源字段、聚合方式、去重键和条件口径`,
             });
             continue;
         }
@@ -998,7 +1041,7 @@ export async function inspectReport(options) {
                     .filter((field) => !(field.roles ?? []).includes("group"))
                     .map((field) => ({ id: field.id, label: field.label, definition: field.description ?? "" })),
                 ...blockers
-                    .filter((blocker) => blocker.code === "FIELD_NOT_FOUND")
+                    .filter((blocker) => ["FIELD_NOT_FOUND", "METRIC_REQUIRES_MODELING"].includes(String(blocker.code)))
                     .map((blocker) => ({
                     id: blocker.field_id,
                     label: blocker.label ?? blocker.field,
@@ -2112,7 +2155,11 @@ export async function buildKnowledgeContext(options) {
     if (!plan.knowledge?.source_dir)
         throw new Error("计划缺少 knowledge.source_dir");
     const allTables = await loadKnowledgeTables(knowledgeRoot);
+    const maxTables = options.maxTables ?? 6;
+    const maxFields = options.maxFields ?? 80;
+    const maxBytes = options.maxBytes ?? 64_000;
     const requested = new Set();
+    const explicitFields = new Set();
     const addSource = (source) => {
         if (source?.table_id)
             requested.add(String(source.table_id));
@@ -2130,45 +2177,411 @@ export async function buildKnowledgeContext(options) {
         requested.add(String(value));
     for (const blocker of plan.blockers ?? []) {
         for (const suggestion of blocker.suggestions ?? []) {
-            requested.add(String(suggestion).split(".").slice(0, -1).join("."));
+            const value = String(suggestion);
+            requested.add(value.split(".").slice(0, -1).join("."));
+            explicitFields.add(value);
         }
     }
-    const selected = allTables.filter((table) => {
-        const physical = table.physical ?? {};
-        return requested.has(String(table.table_id)) ||
-            requested.has(`${physical.profile_id}/${physical.database}/${physical.table}`) ||
-            requested.has(`${physical.database}.${physical.table}`) ||
-            requested.has(String(physical.table));
+    const requirementIntents = (plan.semantic_plan?.metrics ?? []).map((metric, index) => {
+        const label = String(metric.label ?? metric.id ?? `metric-${index + 1}`);
+        const description = String(metric.definition ?? "");
+        const isMetric = /数量|总数|合计|金额|总额|比例|比率|率$|均值|平均/.test(label) ||
+            String(metric.kind ?? "") === "metric";
+        const aggregation = /比例|比率|率$/.test(label)
+            ? "ratio"
+            : /数量|总数|数$/.test(label)
+                ? "count_distinct"
+                : /金额|总额|合计/.test(label)
+                    ? "sum"
+                    : /平均|均值/.test(label)
+                        ? "avg"
+                        : isMetric
+                            ? "count_distinct"
+                            : "value";
+        const rawStatusSemantic = label
+            .replace(/的?(订单|运单|派车单)?(数量|总数|数|合计)$/u, "")
+            .trim();
+        const statusSemantic = /^(合计|总计|全部|所有)$/u.test(rawStatusSemantic)
+            ? ""
+            : rawStatusSemantic;
+        const entity = label.includes("派车单")
+            ? "派车单"
+            : label.includes("运单")
+                ? "运单"
+                : label.includes("订单")
+                    ? "订单"
+                    : "";
+        return {
+            id: String(metric.id ?? `metric-${index + 1}`),
+            label,
+            description,
+            kind: isMetric ? "metric" : "value",
+            aggregation,
+            entity,
+            status_semantic: statusSemantic && statusSemantic !== label ? statusSemantic : null,
+        };
     });
-    const maxTables = options.maxTables ?? 12;
-    if (selected.length > maxTables) {
-        throw new Error(`按需上下文命中 ${selected.length} 张表，超过上限 ${maxTables}；请缩小 --include`);
+    let enumCatalog = { dictionaries: [], bindings: [] };
+    try {
+        enumCatalog = await readJson(join(knowledgeRoot, "global", "enums.json"));
     }
+    catch {
+        // A catalog may legitimately have no enum dictionary.
+    }
+    const dictionaries = new Map((enumCatalog.dictionaries ?? []).map((item) => [String(item.name), item]));
+    const bindings = new Map((enumCatalog.bindings ?? []).map((item) => [
+        `${item.table_id}.${item.field}`,
+        String(item.dictionary_name ?? ""),
+    ]));
+    const normalized = (value) => String(value ?? "").toLowerCase().replaceAll(/[\s_\-—–·，。；：、（）()【】[\]]/gu, "");
+    const tableIdentity = (table) => {
+        const physical = table.physical ?? {};
+        return `${physical.profile_id}/${physical.database}/${physical.table}`;
+    };
+    const fieldIdentity = (table, field) => `${table.physical?.table}.${field.physical?.name}`;
+    const tableText = (table) => normalized([
+        table.physical?.database,
+        table.physical?.table,
+        table.semantic?.name,
+        table.business?.entity_id,
+        table.business?.name,
+        table.comment,
+    ].filter(Boolean).join(" "));
+    const dictionaryFor = (table, field) => {
+        const ref = field.semantic?.enum_ref ??
+            bindings.get(`${table.table_id}.${field.physical?.name}`);
+        return ref ? dictionaries.get(String(ref)) : undefined;
+    };
+    const fieldText = (table, field) => {
+        const dictionary = dictionaryFor(table, field);
+        return normalized([
+            field.physical?.name,
+            field.physical?.comment,
+            field.semantic?.name,
+            field.semantic?.description,
+            field.filter?.role,
+            ...(dictionary?.values ?? []).flatMap((item) => [
+                item.value,
+                item.label,
+                item.description,
+            ]),
+        ].filter(Boolean).join(" "));
+    };
+    const entityScore = (entity, table) => {
+        const text = tableText(table);
+        const physical = normalized(table.physical?.table);
+        const auxiliary = /draft|photo|proof|detail|history|log|item|product|relation|mapping/u.test(physical);
+        if (entity === "派车单" && /(派车|shippingorder|dispatch)/u.test(text)) {
+            if (physical === "shippingorder" || physical === "dispatch")
+                return 110;
+            return auxiliary ? 15 : 65;
+        }
+        if (entity === "运单" && /(运单|waybill)/u.test(text)) {
+            if (physical === "omswaybill" || physical === "waybill")
+                return 110;
+            return auxiliary ? 15 : 65;
+        }
+        if (entity === "订单" && /(订单|order)/u.test(text) && !/(派车|shipping)/u.test(text)) {
+            if (["omsmainordersimple", "omsmainorder", "order"].includes(physical))
+                return 90;
+            return auxiliary ? 10 : 45;
+        }
+        return 0;
+    };
+    const candidatesByIntent = requirementIntents.map((intent) => {
+        const scored = [];
+        for (const table of allTables) {
+            const physical = table.physical ?? {};
+            const selectedExplicitly = requested.has(String(table.table_id)) ||
+                requested.has(tableIdentity(table)) ||
+                requested.has(`${physical.database}.${physical.table}`) ||
+                requested.has(String(physical.table));
+            for (const field of table.physical_fields ?? []) {
+                const text = fieldText(table, field);
+                const label = normalized(intent.label);
+                const status = normalized(intent.status_semantic);
+                const physicalName = String(field.physical?.name ?? "");
+                let score = selectedExplicitly ? 15 : 0;
+                const reasons = [];
+                if (explicitFields.has(fieldIdentity(table, field))) {
+                    score += 100;
+                    reasons.push("inspect 候选");
+                }
+                const entity = entityScore(String(intent.entity ?? ""), table);
+                if (entity) {
+                    score += entity;
+                    reasons.push("实体匹配");
+                }
+                if (label && text.includes(label)) {
+                    score += 90;
+                    reasons.push("字段语义精确匹配");
+                }
+                if (status && text.includes(status)) {
+                    score += 80;
+                    reasons.push("状态语义匹配");
+                }
+                if (intent.kind === "metric" &&
+                    /(status|state|状态)/iu.test(`${physicalName} ${field.semantic?.name ?? ""} ${field.physical?.comment ?? ""}`)) {
+                    score += 35;
+                    reasons.push("状态字段");
+                }
+                if (field.physical?.primary_key === true) {
+                    score += intent.aggregation === "count_distinct" ? 28 : 8;
+                    reasons.push("去重键候选");
+                }
+                if (score < 35)
+                    continue;
+                const dictionary = dictionaryFor(table, field);
+                scored.push({
+                    table_id: table.table_id,
+                    profile_id: physical.profile_id,
+                    database: physical.database,
+                    table: physical.table,
+                    field: physicalName,
+                    semantic_name: field.semantic?.name ?? field.physical?.comment ?? physicalName,
+                    score,
+                    reasons,
+                    ...(dictionary ? { enum_ref: dictionary.name } : {}),
+                });
+            }
+        }
+        return {
+            requirement_id: intent.id,
+            label: intent.label,
+            kind: intent.kind,
+            aggregation: intent.aggregation,
+            entity: intent.entity,
+            status_semantic: intent.status_semantic,
+            candidates: scored
+                .sort((left, right) => Number(right.score) - Number(left.score) ||
+                `${left.table}.${left.field}`.localeCompare(`${right.table}.${right.field}`))
+                .slice(0, 4),
+        };
+    });
+    const tableScores = new Map();
+    for (const table of allTables) {
+        const identity = tableIdentity(table);
+        const physical = table.physical ?? {};
+        if (requested.has(String(table.table_id)) ||
+            requested.has(identity) ||
+            requested.has(`${physical.database}.${physical.table}`) ||
+            requested.has(String(physical.table))) {
+            tableScores.set(identity, 120);
+        }
+    }
+    for (const set of candidatesByIntent) {
+        for (const candidate of set.candidates ?? []) {
+            const identity = `${candidate.profile_id}/${candidate.database}/${candidate.table}`;
+            tableScores.set(identity, (tableScores.get(identity) ?? 0) + Number(candidate.score ?? 0));
+        }
+    }
+    const selected = allTables
+        .filter((table) => tableScores.has(tableIdentity(table)))
+        .sort((left, right) => (tableScores.get(tableIdentity(right)) ?? 0) -
+        (tableScores.get(tableIdentity(left)) ?? 0) ||
+        tableIdentity(left).localeCompare(tableIdentity(right)))
+        .slice(0, maxTables);
+    const selectedIdentities = new Set(selected.map(tableIdentity));
+    const selectedTableIds = new Set(selected.map((table) => String(table.table_id)));
+    const relationshipItems = [];
+    const relationshipCandidates = [];
+    const visitRelationships = async (directory) => {
+        for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+            const child = join(directory, entry.name);
+            if (entry.isDirectory()) {
+                await visitRelationships(child);
+            }
+            else if (entry.isFile() && entry.name === "relationships.json") {
+                const catalog = await readJson(child).catch(() => null);
+                if (!catalog)
+                    continue;
+                relationshipItems.push(...(catalog.relationships ?? []));
+                relationshipCandidates.push(...(catalog.candidates ?? []));
+            }
+        }
+    };
+    await visitRelationships(join(knowledgeRoot, "databases"));
+    const relevantRelationship = (relationship) => selectedTableIds.has(String(relationship.source_table_id ?? "")) &&
+        selectedTableIds.has(String(relationship.target_table_id ?? ""));
+    const relationships = relationshipItems.filter(relevantRelationship);
+    const candidateRelationships = relationshipCandidates.filter(relevantRelationship);
+    const priorities = new Map();
+    const raisePriority = (table, fieldName, value) => {
+        const name = String(fieldName ?? "");
+        if (!name)
+            return;
+        const key = `${tableIdentity(table)}.${name}`;
+        priorities.set(key, Math.max(priorities.get(key) ?? 0, value));
+    };
+    for (const table of selected) {
+        for (const field of table.physical_fields ?? []) {
+            if (field.physical?.primary_key)
+                raisePriority(table, field.physical.name, 100);
+            if (/(status|state|状态|time|date|时间|日期)/iu.test(`${field.physical?.name ?? ""} ${field.semantic?.name ?? ""}`)) {
+                raisePriority(table, field.physical?.name, 45);
+            }
+            if (/拆分|split/iu.test(String(plan.report?.description ?? "")) &&
+                /拆分|split/iu.test(`${field.physical?.name ?? ""} ${field.semantic?.name ?? ""} ${field.physical?.comment ?? ""}`)) {
+                raisePriority(table, field.physical?.name, 190);
+            }
+        }
+        for (const condition of table.system_conditions ?? []) {
+            raisePriority(table, condition.field, 95);
+        }
+        for (const foreignKey of table.foreign_keys ?? []) {
+            for (const value of [
+                foreignKey.field,
+                foreignKey.column,
+                foreignKey.local_field,
+                ...(foreignKey.fields ?? []),
+                ...(foreignKey.columns ?? []),
+            ]) {
+                raisePriority(table, value, 90);
+            }
+        }
+    }
+    for (const relationship of [...relationships, ...candidateRelationships]) {
+        const source = selected.find((table) => String(table.table_id) === String(relationship.source_table_id));
+        const target = selected.find((table) => String(table.table_id) === String(relationship.target_table_id));
+        for (const field of relationship.source_columns ?? []) {
+            if (source)
+                raisePriority(source, field, 180);
+        }
+        for (const field of relationship.target_columns ?? []) {
+            if (target)
+                raisePriority(target, field, 180);
+        }
+    }
+    for (const set of candidatesByIntent) {
+        for (const candidate of set.candidates ?? []) {
+            const identity = `${candidate.profile_id}/${candidate.database}/${candidate.table}`;
+            const table = selected.find((item) => tableIdentity(item) === identity);
+            if (table)
+                raisePriority(table, candidate.field, 200 + Number(candidate.score ?? 0));
+        }
+    }
+    for (const field of plan.fields ?? []) {
+        const source = field.source ?? {};
+        const table = selected.find((item) => item.physical?.profile_id === source.profile_id &&
+            item.physical?.database === source.database &&
+            item.physical?.table === source.table);
+        if (table)
+            raisePriority(table, source.field, 400);
+    }
+    const fieldRows = selected.flatMap((table) => (table.physical_fields ?? []).map((field) => ({
+        table,
+        field,
+        priority: priorities.get(`${tableIdentity(table)}.${field.physical?.name}`) ?? 0,
+    })));
+    const chosenRows = fieldRows
+        .filter((item) => item.priority > 0)
+        .sort((left, right) => right.priority - left.priority ||
+        `${tableIdentity(left.table)}.${left.field.physical?.name}`.localeCompare(`${tableIdentity(right.table)}.${right.field.physical?.name}`))
+        .slice(0, maxFields);
+    const chosenKeys = new Set(chosenRows.map((item) => `${tableIdentity(item.table)}.${item.field.physical?.name}`));
+    const compactField = (table, field) => {
+        const dictionary = dictionaryFor(table, field);
+        return {
+            physical: {
+                name: field.physical?.name,
+                data_type: field.physical?.data_type,
+                native_type: field.physical?.native_type,
+                nullable: field.physical?.nullable,
+                primary_key: field.physical?.primary_key === true,
+                comment: field.physical?.comment,
+            },
+            semantic: {
+                name: field.semantic?.name,
+                description: field.semantic?.description,
+                status: field.semantic?.status,
+                enum_ref: field.semantic?.enum_ref,
+            },
+            filter: field.filter
+                ? {
+                    enabled: field.filter.enabled,
+                    role: field.filter.role,
+                    operators: field.filter.operators,
+                    default_operator: field.filter.default_operator,
+                }
+                : null,
+            ...(dictionary ? { enum_ref: dictionary.name } : {}),
+        };
+    };
+    const buildTables = () => selected.map((table) => ({
+        table_id: table.table_id,
+        tier: table.tier,
+        physical: table.physical,
+        semantic: table.semantic,
+        business: table.business,
+        fields: (table.physical_fields ?? [])
+            .filter((field) => chosenKeys.has(`${tableIdentity(table)}.${field.physical?.name}`))
+            .map((field) => compactField(table, field)),
+        indexes: (table.indexes ?? []).filter((index) => (index.fields ?? index.columns ?? []).some((field) => chosenKeys.has(`${tableIdentity(table)}.${String(field)}`))),
+        foreign_keys: table.foreign_keys ?? [],
+        system_conditions: table.system_conditions ?? [],
+        security: table.security
+            ? { tenant_field: table.security.tenant_field ?? null }
+            : null,
+    }));
     const context = {
         context_format_version: "1",
         generated_at: new Date().toISOString(),
         report: plan.report,
-        semantic_plan: plan.semantic_plan,
-        selected_table_count: selected.length,
-        tables: selected.map((table) => ({
-            table_id: table.table_id,
-            physical: table.physical,
-            semantic: table.semantic,
-            fields: (table.physical_fields ?? []).map((field) => ({
-                physical: field.physical,
-                semantic: field.semantic,
-                filter: field.filter,
-            })),
-            indexes: table.indexes ?? [],
-            foreign_keys: table.foreign_keys ?? [],
-            system_conditions: table.system_conditions ?? [],
-            security: table.security ?? null,
+        requirement_intents: requirementIntents,
+        candidate_sets: candidatesByIntent.map((set) => ({
+            ...set,
+            candidates: (set.candidates ?? []).filter((candidate) => selectedIdentities.has(`${candidate.profile_id}/${candidate.database}/${candidate.table}`)),
         })),
+        selected_table_count: selected.length,
+        selected_field_count: chosenRows.length,
+        tables: buildTables(),
+        relationships,
+        relationship_candidates: candidateRelationships,
+        enum_dictionaries: [...new Set(selected.flatMap((table) => (table.physical_fields ?? [])
+                .filter((field) => chosenKeys.has(`${tableIdentity(table)}.${field.physical?.name}`))
+                .map((field) => dictionaryFor(table, field)?.name)
+                .filter(Boolean)
+                .map(String)))].map((name) => ({
+            name,
+            values: (dictionaries.get(name)?.values ?? []).slice(0, 50),
+        })),
+        omitted: {
+            tables: Math.max(0, tableScores.size - selected.length),
+            fields: Math.max(0, fieldRows.length - chosenRows.length),
+            candidate_tables: [...tableScores.keys()].filter((identity) => !selectedIdentities.has(identity)),
+        },
         usage: {
-            instruction: "仅使用本上下文设计查询；缺表时再次用 build-context --include 精确扩展，不要读取整个 knowledge 目录。",
+            instruction: "先根据 requirement_intents 和 candidate_sets 形成建模假设；仅使用本切片，缺失业务语义写入一次统一确认，不要读取整个 knowledge 目录。",
             omitted: ["扫描样本", "无关表", "历史版本", "密钥与连接配置"],
+            budget: {
+                max_tables: maxTables,
+                max_fields: maxFields,
+                max_bytes: maxBytes,
+            },
         },
     };
+    while (Buffer.byteLength(JSON.stringify(context, null, 2), "utf8") > maxBytes &&
+        chosenRows.length > selected.length) {
+        const removable = [...chosenRows]
+            .reverse()
+            .find((row) => {
+            const tableRows = chosenRows.filter((candidate) => tableIdentity(candidate.table) === tableIdentity(row.table));
+            return tableRows.length > 1 && row.priority < 400;
+        });
+        if (!removable)
+            break;
+        const index = chosenRows.indexOf(removable);
+        chosenRows.splice(index, 1);
+        chosenKeys.delete(`${tableIdentity(removable.table)}.${removable.field.physical?.name}`);
+        context.tables = buildTables();
+        context.selected_field_count = chosenRows.length;
+        context.omitted.fields = Math.max(0, fieldRows.length - chosenRows.length);
+    }
+    const contextBytes = Buffer.byteLength(JSON.stringify(context, null, 2), "utf8");
+    context.usage.actual_bytes = contextBytes;
+    if (contextBytes > maxBytes) {
+        throw new Error(`按需知识切片仍超过预算：${contextBytes}/${maxBytes} bytes；请减少显式 --include 表`);
+    }
     await writeJson(resolve(options.out), context);
     return context;
 }
@@ -2290,6 +2703,169 @@ export async function initializeReportModel(options) {
     await writeJson(resolve(options.out), model);
     return model;
 }
+function normalizeDiscoverySourceFields(value) {
+    if (!Array.isArray(value))
+        return [];
+    return value.map((field) => {
+        if (typeof field === "string")
+            return { name: field, role: "source" };
+        return {
+            name: String(field.name ??
+                field.field ??
+                field.physical_name ??
+                field.physical?.name ??
+                ""),
+            role: String(field.role ?? "source"),
+        };
+    }).filter((field) => String(field.name).trim());
+}
+function discoveryModelSources(model) {
+    const normalizeSource = (value, index) => {
+        const parts = String(value.table_id ?? "").split("/").filter(Boolean);
+        const [parsedProfileId = "", parsedDatabase = "", ...tableParts] = parts;
+        const profileId = String(value.profile_id ?? parsedProfileId);
+        const database = String(value.database ?? parsedDatabase);
+        const table = String(value.table ?? tableParts.join("/"));
+        const alias = String(value.alias ?? table ?? `source_${index + 1}`);
+        return {
+            id: String(value.id ?? alias),
+            profile_id: profileId,
+            database,
+            table,
+            alias,
+            purpose: String(value.purpose ?? value.entity ?? value.role ?? ""),
+            fields: normalizeDiscoverySourceFields(value.selected_fields ?? value.fields),
+        };
+    };
+    const selected = !Array.isArray(model.selected_tables)
+        ? []
+        : model.selected_tables.map(normalizeSource);
+    if (!Array.isArray(model.sources) || !model.sources.length)
+        return selected;
+    const selectedByTable = new Map(selected.map((source) => [
+        `${source.profile_id}/${source.database}/${source.table}`,
+        source,
+    ]));
+    const merged = model.sources.map((source, index) => {
+        const normalized = normalizeSource(source, index);
+        const key = `${normalized.profile_id}/${normalized.database}/${normalized.table}`;
+        const fallback = selectedByTable.get(key);
+        selectedByTable.delete(key);
+        return {
+            ...fallback,
+            ...normalized,
+            fields: normalized.fields.length ? normalized.fields : fallback?.fields ?? [],
+        };
+    });
+    return [...merged, ...selectedByTable.values()];
+}
+function normalizeFinalReportModelValue(model) {
+    const sources = Array.isArray(model.sources) ? model.sources : [];
+    const sourceById = new Map();
+    for (const source of sources) {
+        for (const key of [source.id, source.alias]) {
+            if (key)
+                sourceById.set(String(key), source);
+        }
+    }
+    const queryContracts = (model.query_contracts ?? []).map((query) => {
+        const normalizedSources = (query.sources ?? []).map((value) => {
+            if (typeof value === "string") {
+                const source = sourceById.get(value);
+                if (!source)
+                    return { id: value };
+                return {
+                    id: source.id,
+                    profile_id: source.profile_id,
+                    database: source.database,
+                    table: source.table,
+                    alias: source.alias,
+                    fields: (source.fields ?? []).map((field) => String(typeof field === "string" ? field : field.name)),
+                };
+            }
+            const source = sourceById.get(String(value.id ?? value.alias ?? ""));
+            return source && (!value.profile_id || !value.database || !value.table)
+                ? {
+                    id: source.id,
+                    profile_id: source.profile_id,
+                    database: source.database,
+                    table: source.table,
+                    alias: source.alias,
+                    fields: (value.fields ?? source.fields ?? []).map((field) => String(typeof field === "string" ? field : field.name)),
+                }
+                : value;
+        });
+        const output = (query.output ?? query.output_contract ?? []).map((column) => typeof column === "string"
+            ? { name: column }
+            : {
+                ...column,
+                name: String(column.name ?? column.id ?? column.column ?? ""),
+            });
+        return {
+            ...query,
+            sources: normalizedSources,
+            output,
+        };
+    });
+    const relationships = (model.relationships ?? []).map((relationship) => {
+        if (relationship.from && relationship.to)
+            return relationship;
+        const match = String(relationship.on ?? "").match(/^\s*([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*$/);
+        return {
+            ...relationship,
+            from: String(relationship.from ?? match?.[1] ?? ""),
+            to: String(relationship.to ?? match?.[2] ?? ""),
+            fanout_risk: relationship.fanout_risk ??
+                ["1:n", "n:n"].includes(String(relationship.cardinality ?? "").toLowerCase()),
+        };
+    });
+    return { ...model, sources, relationships, query_contracts: queryContracts };
+}
+export function validateDiscoveryReportModelValue(model) {
+    const errors = [];
+    if (String(model.model_format_version) !== REPORT_MODEL_FORMAT_VERSION) {
+        errors.push("model_format_version 必须为 1");
+    }
+    if (!model.report?.id || !model.report?.name)
+        errors.push("基础模型缺少报表 id/name");
+    if (!String(model.result_grain?.description ?? "").trim()) {
+        errors.push("基础模型必须描述结果粒度假设");
+    }
+    const strategy = String(model.recommended_strategy ?? "");
+    if (!["sql", "enrichment", "group_queries", "script"].includes(strategy)) {
+        errors.push("基础模型 recommended_strategy 必须是 sql|enrichment|group_queries|script");
+    }
+    const sources = discoveryModelSources(model);
+    if (!sources.length)
+        errors.push("基础模型至少需要一个候选来源表");
+    const sourceIds = new Set();
+    for (const source of sources) {
+        const id = String(source.id ?? "");
+        if (!id || sourceIds.has(id))
+            errors.push("基础模型候选来源 id 缺失或重复");
+        sourceIds.add(id);
+        if (!source.profile_id || !source.database || !source.table) {
+            errors.push(`基础模型来源 ${id || "?"} 缺少物理定位`);
+        }
+        const fields = (source.fields ?? []).filter((field) => String(typeof field === "string" ? field : field.name ?? "").trim());
+        if (!fields.length)
+            errors.push(`基础模型来源 ${id || "?"} 没有候选字段`);
+    }
+    const hypotheses = model.metric_hypotheses ?? model.metrics ?? [];
+    if (!Array.isArray(hypotheses) || !hypotheses.length) {
+        errors.push("基础模型至少需要一个指标假设");
+    }
+    const questionIds = new Set();
+    for (const question of normalizeConfirmationQuestions(model)) {
+        const id = String(question.id ?? "");
+        if (!id || questionIds.has(id))
+            errors.push("统一确认项 id 缺失或重复");
+        questionIds.add(id);
+        if (!String(question.question ?? "").trim())
+            errors.push(`统一确认项 ${id || "?"} 缺少问题文本`);
+    }
+    return errors;
+}
 export function validateReportModelValue(model, requireApproved = false) {
     const errors = [];
     const strategy = String(model.recommended_strategy ?? "");
@@ -2300,8 +2876,14 @@ export function validateReportModelValue(model, requireApproved = false) {
         errors.push("model_format_version 必须为 1");
     if (!model.report?.id || !model.report?.name)
         errors.push("模型缺少报表 id/name");
-    if (!model.result_grain?.description || !(model.result_grain?.keys ?? []).length)
-        errors.push("模型必须明确结果粒度和稳定键");
+    const grainDescription = String(model.result_grain?.description ?? "").trim();
+    const grainKeys = model.result_grain?.keys;
+    const keylessSingleRow = Array.isArray(grainKeys) &&
+        grainKeys.length === 0 &&
+        /单行|单条|汇总为一行|single[\s_-]?row/i.test(grainDescription);
+    if (!grainDescription || !Array.isArray(grainKeys) || (!grainKeys.length && !keylessSingleRow)) {
+        errors.push("模型必须明确结果粒度和稳定键；单行汇总可使用空 keys");
+    }
     const sourceIds = new Set();
     for (const source of model.sources ?? []) {
         if (!source.id || sourceIds.has(String(source.id)))
@@ -2432,11 +3014,12 @@ async function validateAttachedReportModel(plan, planPath) {
     return errors;
 }
 function compactModelTable(table, allowedFields) {
+    const sourceFields = table.physical_fields ?? table.fields ?? [];
     return {
         table_id: table.table_id,
         physical: table.physical,
         semantic: table.semantic,
-        fields: (table.physical_fields ?? [])
+        fields: sourceFields
             .filter((field) => allowedFields.has(String(field.physical?.name)))
             .map((field) => ({ physical: field.physical, semantic: field.semantic, filter: field.filter })),
         indexes: (table.indexes ?? []).filter((index) => (index.fields ?? index.columns ?? []).some((name) => allowedFields.has(String(name)))),
@@ -2445,6 +3028,165 @@ function compactModelTable(table, allowedFields) {
         security: table.security ?? null,
     };
 }
+function compactDiscoveryPlan(plan) {
+    return {
+        plan_format_version: plan.plan_format_version,
+        report: plan.report,
+        sql_dialect: plan.sql_dialect,
+        knowledge: {
+            catalog_version: plan.knowledge?.catalog_version,
+            catalog_status: plan.knowledge?.catalog_status,
+            snapshot_hash: plan.knowledge?.snapshot_hash,
+        },
+        semantic_plan: {
+            result_grain: plan.semantic_plan?.result_grain,
+            dimensions: plan.semantic_plan?.dimensions ?? [],
+            metrics: plan.semantic_plan?.metrics ?? [],
+            distinct_keys: plan.semantic_plan?.distinct_keys ?? {},
+            time_semantics: plan.semantic_plan?.time_semantics ?? [],
+            exclusions: plan.semantic_plan?.exclusions ?? [],
+        },
+        source: plan.source,
+        fields: (plan.fields ?? []).map((field) => ({
+            id: field.id,
+            label: field.label,
+            output_type: field.output_type,
+            source: field.source,
+            roles: field.roles ?? [],
+            description: field.description ?? "",
+        })),
+        parameters: plan.parameters ?? [],
+        system_conditions: plan.system_conditions ?? [],
+    };
+}
+function normalizeConfirmationQuestions(model) {
+    const technicalCategories = new Set(["field_availability", "execution_strategy"]);
+    return (model.open_questions ?? [])
+        .filter((value) => typeof value === "string" ||
+        !technicalCategories.has(String(value.category ?? "")))
+        .map((value, index) => {
+        if (typeof value === "string") {
+            return {
+                id: `question_${stableId(value).replaceAll("-", "_")}`,
+                question: value,
+                options: [],
+                recommended: null,
+                required: true,
+                affected_metrics: [],
+                source: "legacy",
+            };
+        }
+        const question = String(value.question ?? value.message ?? value.label ?? `确认问题 ${index + 1}`);
+        const options = (value.options ?? value.candidates ?? []).map((option) => typeof option === "string"
+            ? { value: option, label: option }
+            : {
+                value: String(option.value ?? option.id ?? option.label ?? ""),
+                label: String(option.label ?? option.value ?? option.id ?? ""),
+                ...(option.description ? { description: String(option.description) } : {}),
+            }).filter((option) => String(option.value).length > 0);
+        let recommended = value.recommended && typeof value.recommended === "object"
+            ? String(value.recommended.value ?? value.recommended.id ?? value.recommended.label ?? "")
+            : value.recommended == null
+                ? null
+                : String(value.recommended);
+        if (recommended) {
+            const decisionStem = (text) => text.trim().split(/[（(：:—–-]/, 1)[0]?.trim().toLocaleLowerCase() ?? "";
+            const recommendedStem = decisionStem(recommended);
+            const matched = options.find((option) => {
+                const optionValue = String(option.value);
+                if (optionValue === recommended)
+                    return true;
+                const optionStem = decisionStem(optionValue);
+                return optionStem.length >= 3 && optionStem === recommendedStem;
+            });
+            if (matched) {
+                recommended = String(matched.value);
+            }
+            else {
+                options.push({
+                    value: recommended,
+                    label: `推荐：${recommended}`,
+                    description: "Discovery Agent 给出的推荐处理方式",
+                });
+            }
+        }
+        return {
+            id: String(value.id ?? `question_${stableId(question).replaceAll("-", "_")}`),
+            question,
+            options,
+            recommended: recommended || null,
+            required: value.required !== false,
+            affected_metrics: (value.affected_metrics ?? value.affectedMetrics ?? []).map(String),
+            category: String(value.category ?? "business_semantics"),
+            impact: value.impact == null ? null : String(value.impact),
+            source: "structured",
+        };
+    });
+}
+export async function createModelConfirmation(options) {
+    const modelPath = resolve(options.model);
+    const raw = await readFile(modelPath, "utf8");
+    const model = JSON.parse(raw);
+    const input = await readJson(resolve(options.input));
+    const revision = sha256(raw);
+    if (input.discovery_revision &&
+        String(input.discovery_revision) !== revision) {
+        throw new Error("基础模型已变化，请刷新统一确认内容后重试");
+    }
+    const questions = normalizeConfirmationQuestions(model);
+    const suppliedAnswers = new Map();
+    if (Array.isArray(input.answers)) {
+        for (const answer of input.answers) {
+            if (answer?.question_id)
+                suppliedAnswers.set(String(answer.question_id), answer.value);
+        }
+    }
+    else if (input.answers && typeof input.answers === "object") {
+        for (const [id, value] of Object.entries(input.answers))
+            suppliedAnswers.set(id, value);
+    }
+    const note = String(input.note ?? "").trim();
+    const acceptRecommended = input.accept_recommended !== false;
+    const answers = questions.map((question) => {
+        let value = suppliedAnswers.get(String(question.id));
+        let source = "user";
+        if ((value == null || String(value).trim() === "") && acceptRecommended && question.recommended) {
+            value = question.recommended;
+            source = "recommended";
+        }
+        if ((value == null || String(value).trim() === "") && note) {
+            value = note;
+            source = "user_note";
+        }
+        if ((value == null || String(value).trim() === "") && question.required !== false) {
+            throw new Error(`确认项尚未回答：${question.question}`);
+        }
+        const allowed = new Set((question.options ?? []).map((option) => String(option.value)));
+        if (allowed.size && value != null && !allowed.has(String(value))) {
+            throw new Error(`确认项「${question.question}」的答案不在候选范围内`);
+        }
+        return {
+            question_id: question.id,
+            value: value == null ? null : String(value),
+            source,
+        };
+    });
+    const confirmation = {
+        confirmation_format_version: "1",
+        report_id: model.report?.id,
+        discovery_revision: revision,
+        discovery_model_hash: reportModelHash(model),
+        status: "confirmed",
+        accept_recommended: acceptRecommended,
+        answers,
+        note,
+        reviewed_by: options.reviewedBy,
+        reviewed_at: new Date().toISOString(),
+    };
+    confirmation.confirmation_hash = sha256(JSON.stringify(confirmation));
+    await writeJson(resolve(options.out), confirmation);
+    return confirmation;
+}
 export async function buildPhaseContext(options) {
     const allowedPhases = new Set(["discovery", "modeling", "query", "script", "repair"]);
     if (!allowedPhases.has(options.phase))
@@ -2452,7 +3194,9 @@ export async function buildPhaseContext(options) {
     const plan = await readJson(resolve(options.plan));
     const model = options.model ? await readJson(resolve(options.model)) : null;
     if (model && options.phase !== "discovery") {
-        const errors = validateReportModelValue(model, ["query", "script"].includes(options.phase));
+        const errors = options.phase === "modeling"
+            ? validateDiscoveryReportModelValue(model)
+            : validateReportModelValue(model, ["query", "script"].includes(options.phase));
         if (errors.length)
             throw new Error(errors.join("；"));
     }
@@ -2461,37 +3205,129 @@ export async function buildPhaseContext(options) {
         phase: options.phase,
         fresh_session: options.phase !== "repair",
         generated_at: new Date().toISOString(),
-        limits: { max_tables: options.phase === "query" ? 3 : 12, max_fields: options.phase === "query" ? 40 : 120, max_reference_sections: 2, max_context_bytes: 100_000 },
+        limits: {
+            max_tables: options.phase === "query" ? 3 : options.phase === "discovery" ? 6 : 12,
+            max_fields: options.phase === "query" ? 40 : options.phase === "discovery" ? 80 : 120,
+            max_reference_sections: 2,
+            max_context_bytes: 100_000,
+        },
         forbidden_inputs: ["knowledge/scans", "历史聊天", "连接配置", "无关报表", "先前失败脚本"],
     };
     let payload;
     if (options.phase === "discovery") {
         const tempOut = `${resolve(options.out)}.knowledge.json`;
-        const knowledge = await buildKnowledgeContext({ plan: options.plan, out: tempOut });
-        payload = { requirement: plan.report, initial_plan: plan, knowledge };
+        const knowledge = await buildKnowledgeContext({
+            plan: options.plan,
+            out: tempOut,
+            maxTables: 6,
+            maxFields: 80,
+            maxBytes: 64_000,
+        });
+        payload = {
+            requirement: plan.report,
+            initial_plan: compactDiscoveryPlan(plan),
+            knowledge,
+            output_contract: {
+                root: "保留 init-model 生成的顶层结构；model_format_version 固定为字符串 1，report.id/name 必填",
+                recommended_strategy: "只能是 sql|enrichment|group_queries|script；group_transform 只能作为执行步骤，不能作为策略",
+                metric_hypotheses: "每个指标的来源、聚合、条件、去重键、证据和置信度",
+                relationship_hypotheses: "只包含候选表之间实际需要的关联",
+                selected_tables: "只列实际采用的来源表；table_id/selected_fields/role/entity，selected_fields 至少一个且只能引用本切片真实字段；不得列 excluded/无关表",
+                open_questions: "结构化数组：id/question/options/recommended/required/affected_metrics/impact",
+                discovery_note: "结果粒度和查询契约可以保留 hypothesis/draft；本阶段不要求最终稳定键、完整 sources 或输出契约",
+            },
+        };
         manifest.expected_outputs = ["discovery-model.json", "一个合并确认问题"];
     }
     else if (options.phase === "modeling") {
-        if (!model)
-            throw new Error("modeling 阶段需要 --model");
+        if (!model || !options.confirmation) {
+            throw new Error("modeling 阶段需要 --model 和 --confirmation");
+        }
+        const confirmation = await readJson(resolve(options.confirmation));
+        const modelRaw = await readFile(resolve(options.model), "utf8");
+        if (confirmation.status !== "confirmed")
+            throw new Error("统一确认产物尚未确认");
+        if (String(confirmation.report_id ?? "") !== String(model.report?.id ?? "")) {
+            throw new Error("统一确认产物与基础模型报表不一致");
+        }
+        if (String(confirmation.discovery_revision ?? "") !== sha256(modelRaw)) {
+            throw new Error("统一确认产物引用的基础模型 revision 已过期");
+        }
+        if (String(confirmation.discovery_model_hash ?? "") !== reportModelHash(model)) {
+            throw new Error("统一确认产物引用的基础模型 hash 已过期");
+        }
         const knowledgeRoot = resolve(String(plan.knowledge?.source_dir ?? ""));
         const allTables = await loadKnowledgeTables(knowledgeRoot);
-        const tables = (model.sources ?? []).map((source) => {
+        const normalizedSources = discoveryModelSources(model);
+        const referenceStrings = [];
+        const collectReferenceStrings = (value) => {
+            if (typeof value === "string") {
+                referenceStrings.push(value);
+            }
+            else if (Array.isArray(value)) {
+                for (const item of value)
+                    collectReferenceStrings(item);
+            }
+            else if (value && typeof value === "object") {
+                for (const item of Object.values(value))
+                    collectReferenceStrings(item);
+            }
+        };
+        collectReferenceStrings({ model, confirmation });
+        const referencedIdentifiers = new Set(referenceStrings.join("\n").match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []);
+        const expandedSources = normalizedSources.map((source) => {
             const table = allTables.find((candidate) => candidate.physical?.profile_id === source.profile_id && candidate.physical?.database === source.database && candidate.physical?.table === source.table);
             if (!table)
                 throw new Error(`模型来源不在知识库：${source.profile_id}/${source.database}/${source.table}`);
+            const fields = new Map((source.fields ?? []).map((field) => [String(field.name), field]));
+            for (const field of table.physical_fields ?? []) {
+                const name = String(field.physical?.name ?? "");
+                if (name && referencedIdentifiers.has(name) && !fields.has(name)) {
+                    fields.set(name, { name, role: "confirmed-reference" });
+                }
+            }
+            return { ...source, fields: [...fields.values()] };
+        });
+        const tables = expandedSources.map((source) => {
+            const table = allTables.find((candidate) => candidate.physical?.profile_id === source.profile_id && candidate.physical?.database === source.database && candidate.physical?.table === source.table);
             return compactModelTable(table, new Set((source.fields ?? []).map((field) => String(field.name))));
         });
-        payload = { discovery_model: model, knowledge: { tables }, user_confirmation_required: true };
+        payload = {
+            discovery_model: {
+                ...model,
+                sources: expandedSources,
+            },
+            confirmation,
+            knowledge: { tables },
+            output_contract: {
+                model_format_version: REPORT_MODEL_FORMAT_VERSION,
+                required_root_fields: ["report", "result_grain", "sources", "relationships", "metrics", "filters", "recommended_strategy", "query_contracts", "confirmation", "open_questions"],
+                recommended_strategy: ["sql", "enrichment", "group_queries", "script"],
+                confirmation: ["discovery_revision", "confirmation_hash"],
+                open_questions: "必须为空；业务口径已完成唯一一次确认",
+            },
+            user_confirmation_required: false,
+        };
         manifest.expected_outputs = ["report-model.json", "semantic-plan.json", "execution-plan.json", "query-contracts/*.json"];
     }
     else if (options.phase === "query") {
-        if (!model || !options.queryId)
+        if (!model || !options.model || !options.queryId)
             throw new Error("query 阶段需要 --model 和 --query-id");
         const contract = (model.query_contracts ?? []).find((query) => query.id === options.queryId);
         if (!contract)
             throw new Error(`未知查询契约：${options.queryId}`);
-        const allTables = await loadKnowledgeTables(resolve(String(plan.knowledge?.source_dir ?? "")));
+        let allTables;
+        try {
+            const sourceLock = await readJson(join(dirname(resolve(options.model)), "source.lock.json"));
+            if (!Array.isArray(sourceLock.tables))
+                throw new Error("source.lock.json 缺少 tables");
+            allTables = sourceLock.tables;
+        }
+        catch {
+            // Compatibility for older staged models that predate the independent
+            // minimal-dependency model package.
+            allTables = await loadKnowledgeTables(resolve(String(plan.knowledge?.source_dir ?? "")));
+        }
         const tables = (contract.sources ?? []).map((source) => {
             const table = allTables.find((candidate) => candidate.physical?.profile_id === source.profile_id && candidate.physical?.database === source.database && candidate.physical?.table === source.table);
             if (!table)
@@ -2567,6 +3403,7 @@ function stagedPaths(rootValue) {
     return {
         root,
         discoveryModel: join(root, "discovery-model.json"),
+        confirmation: join(root, "confirmation.json"),
         reportModel: join(root, "report-model.json"),
         semanticPlan: join(root, "semantic-plan.json"),
         executionPlan: join(root, "execution-plan.json"),
@@ -2710,10 +3547,14 @@ export async function validateStagedArtifacts(options) {
     let model = null;
     if (options.phase === "discovery") {
         model = await readRequiredJson(paths.discoveryModel, "基础模型");
-        errors.push(...validateReportModelValue(model, false));
+        errors.push(...validateDiscoveryReportModelValue(model));
     }
     else {
         model = await readRequiredJson(paths.reportModel, "确定模型");
+        if (options.phase === "modeling") {
+            model = normalizeFinalReportModelValue(model);
+            await writeJson(paths.reportModel, model);
+        }
         errors.push(...validateReportModelValue(model, options.requireApprovedModel ?? ["query", "script"].includes(options.phase)));
         const semanticPlan = await readRequiredJson(paths.semanticPlan, "语义计划");
         const executionPlan = await readRequiredJson(paths.executionPlan, "执行计划");
@@ -2723,6 +3564,21 @@ export async function validateStagedArtifacts(options) {
             errors.push("执行计划缺少 steps");
         if (String(executionPlan.strategy ?? "") !== String(model.recommended_strategy ?? "")) {
             errors.push("执行计划 strategy 与确定模型 recommended_strategy 不一致");
+        }
+        try {
+            const confirmation = await readJson(paths.confirmation);
+            if (String(model.confirmation?.discovery_revision ?? "") !==
+                String(confirmation.discovery_revision ?? "")) {
+                errors.push("确定模型没有引用本次统一确认的 discovery revision");
+            }
+            if (String(model.confirmation?.confirmation_hash ?? "") !==
+                String(confirmation.confirmation_hash ?? "")) {
+                errors.push("确定模型没有引用本次统一确认 hash");
+            }
+        }
+        catch {
+            // Compatibility: direct CLI assembly and old staged tests may predate the
+            // independent confirmation artifact. Studio workflow v3 always creates it.
         }
         if (options.phase === "query" || options.phase === "script") {
             const strategy = String(model.recommended_strategy ?? executionPlan.strategy ?? "script");
@@ -2775,6 +3631,18 @@ export async function validateStagedArtifacts(options) {
         errors,
         checked_at: new Date().toISOString(),
     };
+    if (options.phase === "discovery" && model) {
+        const raw = await readFile(paths.discoveryModel, "utf8");
+        result.confirmation = {
+            confirmation_format_version: "1",
+            report_id: model.report?.id,
+            discovery_revision: sha256(raw),
+            discovery_model_hash: reportModelHash(model),
+            questions: normalizeConfirmationQuestions(model),
+            metric_hypotheses: model.metric_hypotheses ?? [],
+            relationship_hypotheses: model.relationship_hypotheses ?? model.relationships ?? [],
+        };
+    }
     await writeJson(paths.result, result);
     return result;
 }
@@ -2799,6 +3667,114 @@ export async function approveStagedModel(options) {
             ? (model.query_contracts ?? []).map((contract) => String(contract.id))
             : ["declarative"],
     };
+}
+/**
+ * Validate and approve a staged model, then atomically replace the one current
+ * model package owned by the report. Discovery/chat/context files remain work
+ * artifacts and are deliberately excluded; the model package carries only the
+ * approved model, semantic/execution plans, optional declarative configuration,
+ * and the compact physical source slice needed by later query compilation.
+ */
+export async function finalizeStagedModel(options) {
+    const paths = stagedPaths(options.root);
+    const planPath = resolve(options.plan);
+    const out = resolve(options.out);
+    const candidate = join(paths.root, "model-package-candidate");
+    const previous = join(paths.root, "previous-current-model");
+    const originalPlan = await readFile(planPath, "utf8");
+    let movedPrevious = false;
+    let promoted = false;
+    await rm(candidate, { recursive: true, force: true });
+    await rm(previous, { recursive: true, force: true });
+    try {
+        const approval = await approveStagedModel({
+            plan: planPath,
+            root: paths.root,
+            reviewedBy: options.reviewedBy,
+        });
+        const model = await readJson(paths.reportModel);
+        const modelingContext = await readRequiredJson(join(paths.root, "modeling", "context.json"), "确定建模上下文");
+        const compactKnowledge = modelingContext.payload?.knowledge;
+        if (!compactKnowledge || !Array.isArray(compactKnowledge.tables)) {
+            throw new Error("确定建模上下文缺少最小知识切片");
+        }
+        const plan = await readJson(planPath);
+        await mkdir(candidate, { recursive: true });
+        await writeJson(join(candidate, "report-model.json"), model);
+        await writeJson(join(candidate, "semantic-plan.json"), await readJson(paths.semanticPlan));
+        await writeJson(join(candidate, "execution-plan.json"), await readJson(paths.executionPlan));
+        try {
+            await stat(paths.declarativeConfiguration);
+            await writeJson(join(candidate, "declarative-configuration.json"), await readJson(paths.declarativeConfiguration));
+        }
+        catch {
+            // Script models do not carry declarative configuration.
+        }
+        const sourceLock = {
+            source_lock_format_version: "1",
+            report_id: model.report?.id,
+            model_hash: model.approval?.model_hash,
+            knowledge: plan.knowledge ?? null,
+            tables: compactKnowledge.tables,
+        };
+        await writeJson(join(candidate, "source.lock.json"), sourceLock);
+        await writeJson(join(candidate, "model.manifest.json"), {
+            model_package_format_version: "1",
+            report: model.report,
+            status: "approved",
+            model_hash: model.approval?.model_hash,
+            knowledge: plan.knowledge ?? null,
+            source_table_count: compactKnowledge.tables.length,
+            approved_by: options.reviewedBy,
+            approved_at: model.approval?.approved_at,
+        });
+        await writePackageChecksums(candidate);
+        const modelErrors = validateReportModelValue(await readJson(join(candidate, "report-model.json")), true);
+        if (modelErrors.length)
+            throw new Error(modelErrors.join("；"));
+        await mkdir(dirname(out), { recursive: true });
+        try {
+            await stat(out);
+            await rename(out, previous);
+            movedPrevious = true;
+        }
+        catch {
+            // No previous current model.
+        }
+        await rename(candidate, out);
+        promoted = true;
+        const updatedPlan = await readJson(planPath);
+        updatedPlan.report_model = {
+            model_format_version: REPORT_MODEL_FORMAT_VERSION,
+            status: "approved",
+            model_hash: model.approval?.model_hash,
+            ref: relative(dirname(planPath), join(out, "report-model.json")).replaceAll("\\", "/"),
+        };
+        await writeJson(planPath, updatedPlan);
+        if (movedPrevious)
+            await rm(previous, { recursive: true, force: true });
+        return {
+            ok: true,
+            report_id: model.report?.id,
+            model_hash: model.approval?.model_hash,
+            model: out,
+            strategy: approval.strategy,
+        };
+    }
+    catch (error) {
+        if (promoted)
+            await rm(out, { recursive: true, force: true });
+        if (movedPrevious)
+            await rename(previous, out).catch(() => undefined);
+        await writeFile(planPath, originalPlan, "utf8");
+        throw error;
+    }
+    finally {
+        await rm(candidate, { recursive: true, force: true });
+        if (!movedPrevious || promoted) {
+            await rm(previous, { recursive: true, force: true });
+        }
+    }
 }
 export async function finalizeStagedPackage(options) {
     const paths = stagedPaths(options.root);
@@ -3031,13 +4007,25 @@ export async function finalizeStagedPackage(options) {
     }
     catch { /* index may not exist */ }
     const candidateRoot = join(paths.root, "candidate-package");
+    const previousRoot = join(paths.root, "previous-current-package");
     const finalRoot = join(workspace, "reports", "packages", String(model.report?.id), String(model.report?.version));
     let published = false;
+    let movedPrevious = false;
     try {
         await rm(candidateRoot, { recursive: true, force: true });
+        await rm(previousRoot, { recursive: true, force: true });
         try {
-            if ((await stat(finalRoot)).isDirectory())
-                throw new Error(`目标报表版本已存在，禁止原地覆盖：${finalRoot}`);
+            if ((await stat(finalRoot)).isDirectory()) {
+                const currentIndex = originalIndex ? JSON.parse(originalIndex) : { reports: [] };
+                const relativePath = relative(join(workspace, "reports"), finalRoot).split("\\").join("/");
+                const existing = (currentIndex.reports ?? []).find((item) => String(item.id) === String(model.report?.id) &&
+                    String(item.path ?? "") === relativePath);
+                if (!existing || existing.development_only !== true) {
+                    throw new Error(`目标报表版本已发布或来源不明，禁止原地覆盖：${finalRoot}`);
+                }
+                await rename(finalRoot, previousRoot);
+                movedPrevious = true;
+            }
         }
         catch (error) {
             if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
@@ -3053,6 +4041,8 @@ export async function finalizeStagedPackage(options) {
         await rename(candidateRoot, finalRoot);
         published = true;
         await updateReportIndex(workspace, await readJson(join(finalRoot, "report.manifest.json")), finalRoot);
+        if (movedPrevious)
+            await rm(previousRoot, { recursive: true, force: true });
         const result = { ok: true, phase: strategy === "script" ? "script" : "query", strategy, report_id: model.report?.id, package: finalRoot };
         await writeJson(paths.result, result);
         return result;
@@ -3061,12 +4051,17 @@ export async function finalizeStagedPackage(options) {
         await writeFile(planPath, originalPlan, "utf8");
         if (published)
             await rm(finalRoot, { recursive: true, force: true });
+        if (movedPrevious)
+            await rename(previousRoot, finalRoot).catch(() => undefined);
         await rm(candidateRoot, { recursive: true, force: true });
         if (originalIndex === null)
             await rm(indexPath, { force: true });
         else
             await writeFile(indexPath, originalIndex, "utf8");
         throw error;
+    }
+    finally {
+        await rm(previousRoot, { recursive: true, force: true });
     }
 }
 export async function configurePlan(planPathValue, configurationPathValue) {
@@ -4816,13 +5811,15 @@ function usage() {
         "  inspect --workspace <dir> --knowledge <dir> --report-id <id> --out <file> [--version <version>]",
         "  configure-plan --plan <file> --configuration <file>",
         "  explain-plan --plan <file>",
-        "  build-context --plan <file> --out <file> [--include database.table,table_id] [--max-tables 12]",
+        "  build-context --plan <file> --out <file> [--include database.table,table_id] [--max-tables 6] [--max-fields 80] [--max-bytes 64000]",
         "  init-model --plan <file> --out <file>",
         "  validate-model --model <file> [--require-approved true]",
         "  approve-model --model <file> --reviewed-by <name> [--plan <file>]",
-        "  build-phase-context --phase discovery|modeling|query|script|repair --plan <file> --out <file> [--model <file>] [--query-id <id>] [--query-outputs <dir>] [--failure <file>]",
+        "  confirm-discovery --model <discovery-model> --input <confirmation-input.json> --out <confirmation.json> --reviewed-by <name>",
+        "  build-phase-context --phase discovery|modeling|query|script|repair --plan <file> --out <file> [--model <file>] [--confirmation <file>] [--query-id <id>] [--query-outputs <dir>] [--failure <file>]",
         "  validate-stage --phase discovery|modeling|query|script --plan <file> --root <work/report-build/id/revision> [--query-id <id>] [--require-approved-model true]",
         "  approve-staged-model --plan <file> --root <work/report-build/id/revision> --reviewed-by <name>",
+        "  finalize-staged-model --plan <file> --root <work/report-model/id/revision> --out <reports/models/id> --reviewed-by <name>",
         "  finalize-staged --workspace <workspace> --plan <file> --root <work/report-build/id/revision> --reviewed-by <name>",
         "  approve-plan --plan <file> --reviewed-by <name>",
         "  generate --workspace <dir> --plan <file> [--out <dir>]",
@@ -4843,7 +5840,7 @@ async function main() {
             package_format_version: PACKAGE_FORMAT_VERSION,
             supported_package_format_versions: [PACKAGE_FORMAT_VERSION, SCRIPT_PACKAGE_FORMAT_VERSION],
             plan_format_version: PLAN_FORMAT_VERSION,
-            staged_workflow_version: 2,
+            staged_workflow_version: 3,
             runtime_dependencies: [],
         }, null, 2));
         return;
@@ -4891,6 +5888,8 @@ async function main() {
             out: requiredOption(options, "out"),
             include: String(options.include ?? "").split(",").map((value) => value.trim()).filter(Boolean),
             maxTables: options["max-tables"] ? Number(options["max-tables"]) : undefined,
+            maxFields: options["max-fields"] ? Number(options["max-fields"]) : undefined,
+            maxBytes: options["max-bytes"] ? Number(options["max-bytes"]) : undefined,
         });
         console.log(JSON.stringify({
             ok: true,
@@ -4920,6 +5919,16 @@ async function main() {
         console.log(JSON.stringify({ ok: true, approval: model.approval }, null, 2));
         return;
     }
+    if (command === "confirm-discovery") {
+        const confirmation = await createModelConfirmation({
+            model: requiredOption(options, "model"),
+            input: requiredOption(options, "input"),
+            out: requiredOption(options, "out"),
+            reviewedBy: requiredOption(options, "reviewed-by"),
+        });
+        console.log(JSON.stringify({ ok: true, confirmation }, null, 2));
+        return;
+    }
     if (command === "build-phase-context") {
         const phase = requiredOption(options, "phase");
         if (!["discovery", "modeling", "query", "script", "repair"].includes(phase)) {
@@ -4930,6 +5939,7 @@ async function main() {
             plan: requiredOption(options, "plan"),
             out: requiredOption(options, "out"),
             ...(options.model ? { model: options.model } : {}),
+            ...(options.confirmation ? { confirmation: options.confirmation } : {}),
             ...(options["query-id"] ? { queryId: options["query-id"] } : {}),
             ...(options.failure ? { failure: options.failure } : {}),
             ...(options["query-outputs"] ? { queryOutputs: options["query-outputs"] } : {}),
@@ -4958,6 +5968,16 @@ async function main() {
         const result = await approveStagedModel({
             plan: requiredOption(options, "plan"),
             root: requiredOption(options, "root"),
+            reviewedBy: requiredOption(options, "reviewed-by"),
+        });
+        console.log(JSON.stringify(result, null, 2));
+        return;
+    }
+    if (command === "finalize-staged-model") {
+        const result = await finalizeStagedModel({
+            plan: requiredOption(options, "plan"),
+            root: requiredOption(options, "root"),
+            out: requiredOption(options, "out"),
             reviewedBy: requiredOption(options, "reviewed-by"),
         });
         console.log(JSON.stringify(result, null, 2));

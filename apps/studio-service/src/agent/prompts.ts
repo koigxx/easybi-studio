@@ -32,15 +32,23 @@ const TEMPLATES: Record<Exclude<AgentActionType, 'free-chat'>, string> = {
   'publish-knowledge':
     '在语义审阅通过后发布知识库版本到 knowledge/versions，并更新 knowledge/index.json；发布前请输出待确认摘要。' +
     COMMON_TAIL,
+  'model-report':
+    '阅读 skills/create-report-package/SKILL.md，只执行报表建模：根据选中的报表需求和知识库分析结果粒度、表字段、关联关系、关系基数、字段角色、指标去重键、时间和排除口径。' +
+    '把所有不清晰事项合并成一个问题写入基础模型后结束当前阶段，不要直接调用交互式提问；Studio 会统一展示且只确认一次。' +
+    '本动作只生成唯一当前模型，禁止生成 SQL、脚本或报表包。' +
+    COMMON_TAIL +
+    '本动作的确认由 Studio 在阶段结束后统一承接，因此不要在 Agent 会话中直接等待用户。',
+  'build-report-package':
+    '阅读 skills/create-report-package/SKILL.md，只从选中报表已经确认的当前模型生成报表包。' +
+    '不得重新分析整个知识库、不得改变字段或关联口径、不得再次发起业务确认；模型不足时输出结构化失败并返回模型修订。' +
+    COMMON_TAIL,
   'create-report':
-    '阅读 skills/create-report-package/SKILL.md，只执行基础建模阶段：运行 inspect 和 discovery context，' +
-    '梳理结果粒度、所需表字段、关系基数、指标去重键、时间与排除口径，写入 report discovery model；' +
-    '只提出一个合并确认问题。本阶段禁止生成 SQL、脚本或报表包。' +
+    '这是旧版“构建报表”入口，按“构建报表建模”处理。阅读 skills/create-report-package/SKILL.md，只生成并确认唯一当前报表模型；' +
+    '把不清晰事项合并成一个问题，禁止生成 SQL、脚本或报表包。' +
     COMMON_TAIL,
   'modify-report':
-    '阅读 skills/create-report-package/SKILL.md，只执行已有报表的基础建模阶段：读取现有计划作为参考，' +
-    '重新检查结果粒度、字段白名单、关系基数、指标去重键与变更需求，写入新的 discovery model；' +
-    '保留旧版本，只提出一个合并确认问题。本阶段禁止生成 SQL、脚本或报表包。' +
+    '这是旧版“修改报表”入口，按“构建报表建模”处理。读取当前模型作为参考，重新生成该报表唯一当前模型；' +
+    '只提出一个合并确认问题，禁止生成 SQL、脚本或报表包。' +
     COMMON_TAIL,
   'validate-report':
     '对指定报表包运行静态校验（结构、绑定、参数、校验和），报告问题；不要把静态校验当作真实导出成功。' +
@@ -78,30 +86,43 @@ export function buildReportPhasePrompt(
   unitId?: string,
   strategy?: string,
 ): string {
+  const phaseBase = phase === 'MODELING' ? 'work/report-model' : 'work/report-build';
   const root = reportId && reportRevision
-    ? `work/report-build/${reportId}/${reportRevision}`
-    : 'work/report-build/<report-id>/<revision>';
+    ? `${phaseBase}/${reportId}/${reportRevision}`
+    : `${phaseBase}/<report-id>/<revision>`;
   const common =
     '这是同一前端逻辑对话中的全新 Agent 会话，不得恢复或依赖上一会话内容。' +
     `本阶段报表为 ${reportId ?? '<report-id>'}，阶段目录固定为 ${root}。` +
-    '只读取阶段目录中 context.json 的 context_manifest 所允许输入；禁止递归读取 knowledge、历史聊天、扫描样本和无关报表。';
+    '只读取本提示指定的阶段 Context Pack 中 context_manifest 所允许输入；禁止递归读取 knowledge、历史聊天、扫描样本和无关报表。';
+  if (phase === 'DISCOVERY') {
+    return `${common} 只读取 ${root}/discovery/context.json，在 ${root}/discovery-model.json 中完成基础建模分析。` +
+      '必须保留初始化文件的顶层契约：model_format_version 固定为字符串 "1"，report.id/name 不得改名，' +
+      'recommended_strategy 只能是 sql、enrichment、group_queries、script 之一；group_transform 是执行步骤而不是策略值。' +
+      '按 requirement_intents 和 candidate_sets 为每个指标生成 metric_hypotheses（来源、聚合、条件、去重键、证据、置信度），并生成必要的 relationship_hypotheses。' +
+      'selected_tables 只能包含实际采用的来源表，每张表必须至少选择一个 Context Pack 中真实存在的字段；不得加入 excluded/无关表，不得虚构候选字段或关联字段。' +
+      '只有未明确的业务口径才写成结构化 open_questions：id、question、options、recommended、required、affected_metrics、impact；字段是否存在、Context 扩展和执行策略属于技术决策，必须自行验证或推荐，不得向用户提问。' +
+      '不要调用交互式提问，也不要等待用户输入，写完产物后结束本阶段。' +
+      '不得生成 report-model.json、SQL、脚本或报表包。';
+  }
   if (phase === 'MODELING') {
-    return `${common} 阅读已生成的 discovery model 和用户确认，运行确定建模阶段命令，` +
+    return `${common} 只读取 ${root}/modeling/context.json，其中包含已生成的 discovery model、带 revision/hash 的 confirmation.json 和最小知识切片，运行确定建模阶段命令，` +
       `生成并校验 ${root}/report-model.json、semantic-plan.json、execution-plan.json 和模型内逐查询 query contracts。` +
-      `若 recommended_strategy 不是 script，同时生成 ${root}/declarative-configuration.json；只输出模型审阅摘要，不生成 SQL、report.ts 或报表包。` +
-      (userConfirmation ? ` 用户确认：${userConfirmation}` : '');
+      '必须严格沿用 Context Pack 的 model_format_version="1"、report.id/name、sources/relationships/query_contracts 字段名和四种合法 recommended_strategy；不得自创格式版本或字段名。' +
+      'report-model.json 必须写入 confirmation.discovery_revision 和 confirmation.confirmation_hash，且与 Context Pack 中的统一确认产物完全一致。' +
+      `若 recommended_strategy 不是 script，同时生成 ${root}/declarative-configuration.json；不得再提第二轮业务问题，只输出模型摘要，不生成 SQL、report.ts 或报表包。` +
+      (userConfirmation ? ' 用户补充说明已经固化在 confirmation.json，不得只依赖本提示文本。' : '');
   }
   if (phase === 'QUERY_COMPILATION') {
     if (strategy && strategy !== 'script') {
-      return `${common} 当前执行策略为 ${strategy}，只校验并完善 ${root}/declarative-configuration.json；不得生成 report.ts 或 script_report。` +
+      return `${common} 只读取 ${root}/contexts/declarative.json。当前执行策略为 ${strategy}，只校验并完善 ${root}/declarative-configuration.json；不得生成 report.ts 或 script_report。` +
         '配置必须严格使用已批准模型的字段、关系、过滤和聚合口径，不得扩展知识范围。';
     }
-    return `${common} 本次只处理查询契约 ${unitId ?? '<query-id>'}，只读取该契约及其精确知识切片。` +
+    return `${common} 本次只处理查询契约 ${unitId ?? '<query-id>'}，只读取 ${root}/contexts/${unitId ?? '<query-id>'}.json。` +
       `只生成 ${root}/queries/${unitId ?? '<query-id>'}.sql 和 ${root}/query-outputs/${unitId ?? '<query-id>'}.json；SELECT 输出必须逐列显式 AS 为契约列名，不得处理其他查询或编写 report.ts。` +
       '如果模型缺字段，写 failure.json 并停止，不得扩大知识范围。';
   }
   if (phase === 'SCRIPT_COMPILATION') {
-    return `${common} 只读取已批准语义/执行计划与 query-output contracts，不读取物理知识库或早期探索记录。` +
+    return `${common} 只读取 ${root}/contexts/script.json 中已批准语义/执行计划与 query-output contracts，不读取物理知识库或早期探索记录。` +
       `只编写 ${root}/scripts/report.ts，使用 queryStream/loadIndex/batchLookup/emit；组包、批准与静态校验由 Studio 的确定性门禁执行。` +
       '发现查询输出不匹配时写 failure.json，不得修改业务模型。';
   }

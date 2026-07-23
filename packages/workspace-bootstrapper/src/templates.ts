@@ -59,6 +59,7 @@ export function defaultWorkspaceManifest(systemId?: string, systemName?: string)
       toolkit: 'toolkit',
       scripts: 'scripts',
       knowledge: 'knowledge',
+      report_models: 'reports/models',
       report_packages: 'reports/packages',
       outputs: 'outputs',
       work: 'work',

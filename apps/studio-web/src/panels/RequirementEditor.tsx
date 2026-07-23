@@ -11,15 +11,30 @@ import {
   hasRole,
   toggleRole,
   FIELD_ROLES,
+  METRIC_AGGREGATIONS,
   type FieldRole,
+  type MetricAggregation,
   type ReportRequirementDraft,
 } from './reports-config.js';
 
-const ROLE_LABELS: Record<FieldRole, string> = { output: '输出', filter: '筛选', group: '分组' };
+const ROLE_LABELS: Record<FieldRole, string> = {
+  output: '输出',
+  filter: '筛选',
+  group: '分组',
+  metric: '指标',
+};
 const ROLE_HINTS: Record<FieldRole, string> = {
   output: '作为报表输出列',
   filter: '作为可筛选项（操作符/控件由知识库语义自动推断）',
   group: '作为分组维度（按此字段分组汇总，几组几行）',
+  metric: '作为聚合指标，由建模阶段确定来源、状态条件和去重键',
+};
+const AGGREGATION_LABELS: Record<MetricAggregation, string> = {
+  count: '计数',
+  count_distinct: '去重计数',
+  sum: '求和',
+  avg: '平均值',
+  ratio: '比率',
 };
 
 /**
@@ -101,6 +116,14 @@ export function RequirementEditor({
     if (!draft) return;
     patch({
       requiredFields: draft.requiredFields.map((f, i) => (i === index ? toggleRole(f, role) : f)),
+    });
+  }
+  function updateAggregation(index: number, aggregation: MetricAggregation): void {
+    if (!draft) return;
+    patch({
+      requiredFields: draft.requiredFields.map((field, fieldIndex) =>
+        fieldIndex === index ? { ...field, aggregation } : field,
+      ),
     });
   }
 
@@ -286,6 +309,23 @@ export function RequirementEditor({
                             onChange={(e) => updateFieldDescription(fi, e.target.value)}
                             style={{ marginLeft: 2, fontSize: 11.5, color: 'var(--ide-text-secondary)' }}
                           />
+                          {hasRole(f, 'metric') && (
+                            <select
+                              className="ide-input"
+                              value={f.aggregation ?? 'count_distinct'}
+                              onChange={(event) =>
+                                updateAggregation(fi, event.target.value as MetricAggregation)
+                              }
+                              style={{ marginLeft: 2, width: 150, fontSize: 11.5 }}
+                              title="指标聚合方式"
+                            >
+                              {METRIC_AGGREGATIONS.map((aggregation) => (
+                                <option key={aggregation} value={aggregation}>
+                                  {AGGREGATION_LABELS[aggregation]}
+                                </option>
+                              ))}
+                            </select>
+                          )}
                           {showBinding && (
                             <div
                               style={{ display: 'flex', gap: 8, alignItems: 'center', marginLeft: 2 }}

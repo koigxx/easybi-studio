@@ -14,11 +14,13 @@ Before changing formats, commands, Runtime APIs, outputs, or workspace paths, re
 Keep the default prompt small and cross phase boundaries with fresh Agent sessions:
 
 1. Read this file.
-2. Run `inspect`, `init-model`, and the `discovery` phase context; do not write code.
-3. After the user confirms the discovery model, start a fresh Agent session and read only the `modeling` context.
-4. Keep every staged path under `work/report-build/<report-id>/<revision>`; never reuse another revision.
-5. After model approval, compile each v3 query from its own `query` context, then start another fresh session with only the `script` context. Declarative strategies skip the script session.
-5. Select one strategy and load only its sections from [报表与 Runtime 技术规范](references/报表与Runtime技术规范.md):
+2. Run `inspect`, `init-model`, and the `discovery` phase context; do not write code. Natural-language totals and status counts are metric intents, not missing physical fields.
+3. Discovery uses requirement-driven retrieval: at most 6 tables, 80 fields, and a 64 KB knowledge slice containing candidate fields, enum evidence, and relevant relationships. Put only unresolved business semantics in structured `open_questions` and end the Agent turn; field availability, context expansion, and execution strategy are technical decisions and must not be sent to the user. The discovery Agent must not ask interactively.
+4. When business questions exist, Studio shows one consolidated confirmation. When none exist, Studio creates the revision-bound `confirmation.json` automatically. In both cases it then starts a fresh modeling Agent that reads only that artifact plus the `modeling` context under `work/report-model/<report-id>/<revision>`.
+5. Deterministically validate, approve, and promote one current model package to `reports/models/<report-id>/`. Contract-only failures are repaired in a bounded provider-fresh run inside the same phase and never reopen business confirmation. The package contains only the model, semantic/execution plans, optional declarative configuration, and the compact `source.lock.json`.
+6. A later, independent **Generate Report** action copies only that approved current model into `work/report-build/<report-id>/<revision>`. It must not rediscover knowledge or ask another business question.
+7. Compile each v3 query from its own `query` context, then start another fresh session with only the `script` context. Declarative strategies skip the script session.
+8. Select one strategy and load only its sections from [报表与 Runtime 技术规范](references/报表与Runtime技术规范.md):
    - simple SQL/JOIN: plan, SQL, filters, validation;
    - enrichment: additionally §8.1;
    - grouped multi-query: additionally the `group_queries` section;
@@ -35,6 +37,8 @@ Never recursively read the knowledge directory, table samples, scan history, con
 - Use one logical Studio conversation but never resume a provider session across discovery, modeling, query compilation, and script compilation.
 - Hand phases off only through approved, hashed artifacts and generated Context Packs.
 - Ask only about unresolved business semantics, in one consolidated question.
+- One report requirement owns exactly one current model package and one current development report package.
+- Manual model edits may change only the current source-field whitelist and relationships; revalidate and reseal the model before generation.
 - Read hot tables before warm tables; never infer fields from cold summaries.
 - Never concatenate request values into SQL. Only package-declared bindings and fixed operators are allowed.
 - Do not run DDL, DML, stored procedures, network calls, filesystem access, or direct database APIs from a report script.
@@ -80,59 +84,83 @@ node dist/scripts/report-package-cli.js build-context \
 
 node dist/scripts/report-package-cli.js init-model \
   --plan <workspace>/reports/plans/<report-id>.json \
-  --out <workspace>/work/report-build/<report-id>/<revision>/discovery-model.json
+  --out <workspace>/work/report-model/<report-id>/<revision>/discovery-model.json
 
 node dist/scripts/report-package-cli.js build-phase-context \
   --phase discovery \
   --plan <workspace>/reports/plans/<report-id>.json \
-  --out <workspace>/work/report-build/<report-id>/<revision>/discovery/context.json
+  --out <workspace>/work/report-model/<report-id>/<revision>/discovery/context.json
 ```
 
 The inspector resolves required fields, aliases, visible filters, hidden conditions, tenant binding, deterministic ordering, source lineage, blockers, and an initial semantic/execution plan. It must not create enum questions.
 
-The context slice contains only selected semantic/physical fields, relationships, indexes, conditions, and security metadata. It excludes samples, secrets, configuration, and history. If a planned relation is absent:
+The context slice contains only scored candidate sets, selected semantic/physical fields,
+referenced enums, relevant relationships, indexes, conditions, and security metadata. Discovery
+defaults to 6 tables, 80 fields, a 64 KB knowledge slice, and a 100 KB complete phase context.
+The byte and field budgets are both enforced before Agent startup. It excludes samples, secrets,
+configuration, and history. If a planned relation is absent:
 
 ```bash
 node dist/scripts/report-package-cli.js build-context \
   --plan <plan-file> \
   --include database.table,other_database.other_table \
   --max-tables 12 \
+  --max-fields 120 \
+  --max-bytes 96000 \
   --out <context-file>
 ```
 
 Extend the existing plan; do not repeatedly rerun a broad discovery pass.
 
 The discovery Agent must output only the draft result grain, source field whitelist,
-relationships/cardinalities, metric distinct keys, time/exclusion semantics, recommended
-strategy, and one consolidated question. It must not generate SQL, scripts, or packages.
-Write it to `work/report-build/<report-id>/<revision>/discovery-model.json`. Studio runs
-`validate-stage --phase discovery` before showing the confirmation boundary.
+relationships/cardinalities, `metric_hypotheses`, metric distinct keys, time/exclusion semantics,
+recommended strategy, `relationship_hypotheses`, and structured `open_questions`
+(`id/question/options/recommended/required/affected_metrics/impact`). It must not call an interactive question tool,
+generate SQL, scripts, or packages. Write it to
+`work/report-model/<report-id>/<revision>/discovery-model.json`, then end the phase. Studio
+runs `validate-stage --phase discovery` and shows the only user confirmation boundary.
 
-After user confirmation, start a provider-fresh modeling Agent and build its context:
+Persist that response before starting a provider-fresh modeling Agent:
 
 ```bash
+node dist/scripts/report-package-cli.js confirm-discovery \
+  --model <discovery-model> \
+  --input <confirmation-input.json> \
+  --out <workspace>/work/report-model/<report-id>/<revision>/confirmation.json \
+  --reviewed-by "<reviewer>"
+
 node dist/scripts/report-package-cli.js build-phase-context \
   --phase modeling --plan <plan-file> --model <discovery-model> \
-  --out <workspace>/work/report-build/<report-id>/<revision>/modeling/context.json
+  --confirmation <workspace>/work/report-model/<report-id>/<revision>/confirmation.json \
+  --out <workspace>/work/report-model/<report-id>/<revision>/modeling/context.json
 ```
 
 The modeling Agent resolves the confirmed model, semantic plan, execution plan, and one
 `query_contract` per independently compiled query. Write them only to
-`work/report-build/<report-id>/<revision>/{report-model.json,semantic-plan.json,execution-plan.json}` and
-clear `open_questions`. Do not approve the model yourself. When the user clicks approve,
-Studio deterministically validates and attaches it:
+`work/report-model/<report-id>/<revision>/{report-model.json,semantic-plan.json,execution-plan.json}`
+and clear `open_questions`. `report-model.json.confirmation` must copy the discovery revision and
+confirmation hash from `confirmation.json`. There is no second user approval: this immutable
+artifact is the only approval input. Studio deterministically validates, approves, and promotes
+the result.
 
 When `recommended_strategy` is `sql`, `enrichment`, or `group_queries`, also write
-`declarative-configuration.json` in the same revision. The next fresh Agent may only review
-that configuration; Studio finalizes a v2 package immediately after validation and must not
-create `report.ts` or a v3 `script_report`.
+`declarative-configuration.json` in the same revision. It is stored in the current model package
+as generation input; no report package is generated during modeling.
 
 ```bash
 node dist/scripts/report-package-cli.js validate-stage \
-  --phase modeling --plan <plan-file> --root <workspace>/work/report-build/<report-id>/<revision>
-node dist/scripts/report-package-cli.js approve-staged-model \
-  --plan <plan-file> --root <workspace>/work/report-build/<report-id>/<revision> --reviewed-by "<reviewer>"
+  --phase modeling --plan <plan-file> --root <workspace>/work/report-model/<report-id>/<revision>
+node dist/scripts/report-package-cli.js finalize-staged-model \
+  --plan <plan-file> \
+  --root <workspace>/work/report-model/<report-id>/<revision> \
+  --out <workspace>/reports/models/<report-id> \
+  --reviewed-by "<reviewer>"
 ```
+
+`reports/models/<report-id>/` is the only generation input. Studio may expose its selected
+fields and relationships for manual editing. Saving an edit must validate every selected field
+against the knowledge catalog, synchronize query contracts and the compact source lock, update
+the model hash and plan reference, and reseal checksums.
 
 ## 3. Choose exactly one execution strategy
 
@@ -187,6 +215,11 @@ For a staged model, plan approval additionally verifies the attached model hash 
 queries or sources outside its whitelist.
 
 ## 5. Compile queries and script in separate contexts
+
+This section belongs to the separate **Generate Report** action. Before starting, validate
+`reports/models/<report-id>/report-model.json` with `--require-approved true`, copy that minimal
+model package into a new `work/report-build/<report-id>/<revision>`, and do not read the full
+knowledge catalog.
 
 For every approved `query_contract`, start a fresh query compiler with only that contract,
 its dialect, and its exact field/relationship slice:
@@ -283,7 +316,9 @@ node dist/scripts/report-package-cli.js validate \
   --package <package-directory>
 ```
 
-Default output is `reports/packages/<report-id>/<version>/`. Generation also updates `reports/index.json`; only development packages may be overwritten.
+Default output is `reports/packages/<report-id>/<version>/`. Generation also updates
+`reports/index.json`. The one current development package may be replaced atomically after its
+candidate validates; a published or unregistered target is never overwritten.
 
 Validation must pass plan approval, schema, lineage locks, query safety, dialect quoting, script safety, resource budgets, required files, checksums, filters, ordering, and execution policy. A static pass is not a real export test.
 
@@ -321,7 +356,9 @@ The caller may set `X-Request-Id` to obtain a stable synchronous cancellation ID
 
 ## 10. Modify and version
 
-Inspect the current package and knowledge lock, verify referenced schema fingerprints, then create a new plan/version. Re-run configure, semantic/execution review, approval, generation, validation, and Runtime verification. Preserve earlier package versions and update `reports/index.json` only after the candidate passes its gates.
+Edit or rebuild the one current model first, then run **Generate Report** again. A development
+current package is atomically replaced only after the candidate passes all gates. Preserve
+published package versions and never overwrite them in place.
 
 ## 11. Reject legacy formats
 

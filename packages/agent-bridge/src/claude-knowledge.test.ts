@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtemp, rm, cp, stat } from 'node:fs/promises';
+import { mkdtemp, rm, cp } from 'node:fs/promises';
 import { accessSync, constants } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
@@ -14,11 +14,15 @@ import type { AgentEvent } from '@easybi-studio/contracts';
  * synced bundle is unavailable, so DB-less/CI runs still pass.
  */
 const CLAUDE = join(homedir(), '.local', 'bin', 'claude');
-const BUNDLE = join(homedir(), '.easybi-studio', 'skill-cache', 'easybi', '1.2.0');
+const BUNDLE = join(homedir(), '.easybi-studio', 'skill-cache', 'easybi', '1.31.8');
 
 let ok = false;
 try {
   accessSync(CLAUDE, constants.X_OK);
+  accessSync(
+    join(BUNDLE, 'skills', 'initialize-report-knowledge', 'SKILL.md'),
+    constants.R_OK,
+  );
   // The synced immutable cache holds the whitelisted skills.
   ok = true;
 } catch {
@@ -30,12 +34,7 @@ let ws: string;
 
 beforeAll(async () => {
   ws = await mkdtemp(join(tmpdir(), 'easybi-k6-'));
-  try {
-    await stat(BUNDLE);
-    await cp(join(BUNDLE, 'skills'), join(ws, 'skills'), { recursive: true });
-  } catch {
-    // no synced bundle; the test body will still run but Claude just answers from the prompt
-  }
+  if (ok) await cp(join(BUNDLE, 'skills'), join(ws, 'skills'), { recursive: true });
 });
 afterAll(async () => {
   await rm(ws, { recursive: true, force: true });

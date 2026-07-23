@@ -21,6 +21,11 @@ export type AgentActionType =
   | 'rescan-knowledge'
   | 'review-enums'
   | 'publish-knowledge'
+  /** Build the single editable/approved model owned by one report requirement. */
+  | 'model-report'
+  /** Generate the single current report package from the approved report model. */
+  | 'build-report-package'
+  /** Legacy aliases kept so existing workspace prompt configuration still opens. */
   | 'create-report'
   | 'modify-report'
   | 'validate-report'

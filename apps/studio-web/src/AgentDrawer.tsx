@@ -23,7 +23,15 @@ import {
   ChevronRight,
   ChevronDown,
 } from 'lucide-react';
-import { agentApi, type AgentActionType, type AgentHealth, type AgentJob, type JobEvent } from './api.js';
+import {
+  agentApi,
+  type AgentActionType,
+  type AgentHealth,
+  type AgentJob,
+  type JobEvent,
+  type ModelConfirmationSubmission,
+  type ModelConfirmationView,
+} from './api.js';
 import {
   emptyChat,
   reduceEvent,
@@ -113,6 +121,7 @@ export function AgentDrawerProvider({
   const [starting, setStarting] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
   const [reply, setReply] = useState('');
+  const [confirmationAnswers, setConfirmationAnswers] = useState<Record<string, string>>({});
   const [view, setView] = useState<'chat' | 'history'>('chat');
   const [history, setHistory] = useState<AgentJob[] | null>(null);
   // Bumped on artifact/checkpoint/completion events so panels auto-reload.
@@ -124,6 +133,21 @@ export function AgentDrawerProvider({
   useEffect(() => {
     eventCountRef.current = chat.eventCount;
   }, [chat.eventCount]);
+
+  useEffect(() => {
+    const confirmation = chat.modelConfirmation;
+    if (!confirmation) {
+      setConfirmationAnswers({});
+      return;
+    }
+    setConfirmationAnswers(
+      Object.fromEntries(
+        confirmation.questions
+          .filter((question) => question.recommended)
+          .map((question) => [question.id, question.recommended!]),
+      ),
+    );
+  }, [chat.modelConfirmation?.discovery_revision]);
 
   useEffect(() => {
     agentApi.health().then(setHealth).catch(() => setHealth(null));
@@ -185,6 +209,7 @@ export function AgentDrawerProvider({
       setStarting(true);
       setBanner(null);
       setReply('');
+      setConfirmationAnswers({});
       setActiveAction(action);
       setChat(emptyChat('QUEUED'));
       agentApi
@@ -212,6 +237,7 @@ export function AgentDrawerProvider({
       setChat(emptyChat('SUCCEEDED')); // idle so the input box is enabled immediately
       setBanner(null);
       setReply('');
+      setConfirmationAnswers({});
       closeStream();
     },
     [closeStream],
@@ -274,19 +300,39 @@ export function AgentDrawerProvider({
 
   const sendReply = useCallback(() => {
     const intent =
+      chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
       chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
-        ? 'confirm_discovery'
+        ? 'confirm_model'
         : chat.phase === 'AWAITING_MODEL_APPROVAL'
           ? 'approve_model'
           : 'chat';
     const text =
       reply.trim() ||
-      (intent === 'confirm_discovery'
-        ? '确认基础模型，按已说明的业务口径继续确定建模。'
+      (intent === 'confirm_model'
+        ? '统一确认以上字段、关联关系和业务口径，继续生成当前报表模型。'
         : intent === 'approve_model'
           ? '批准确定模型，开始编译报表。'
           : '');
     if (!text) return;
+    let confirmation: ModelConfirmationSubmission | undefined;
+    if (intent === 'confirm_model' && chat.modelConfirmation) {
+      const unanswered = chat.modelConfirmation.questions.filter(
+        (question) =>
+          question.required &&
+          !confirmationAnswers[question.id]?.trim() &&
+          !(question.options.length === 0 && reply.trim()),
+      );
+      if (unanswered.length) {
+        setBanner(`还有 ${unanswered.length} 个必填确认项未选择`);
+        return;
+      }
+      confirmation = {
+        discovery_revision: chat.modelConfirmation.discovery_revision,
+        accept_recommended: true,
+        answers: confirmationAnswers,
+        note: reply.trim(),
+      };
+    }
     if (!jobId && !currentProjectId) {
       setBanner('请先在左侧选择一个工作区');
       return;
@@ -314,7 +360,7 @@ export function AgentDrawerProvider({
       // the stream immediately and leave the reply unanswered).
       const since = eventCountRef.current;
       agentApi
-        .reply(jobId, text, intent)
+        .reply(jobId, text, intent, confirmation)
         .then(() => subscribe(jobId, since))
         .catch(restoreAfterFailure);
       return;
@@ -329,7 +375,7 @@ export function AgentDrawerProvider({
       })
       .catch(restoreAfterFailure)
       .finally(() => setStarting(false));
-  }, [jobId, reply, subscribe, currentProjectId, chat]);
+  }, [jobId, reply, subscribe, currentProjectId, chat, confirmationAnswers]);
 
   // "终止" stops the current turn but keeps the conversation alive: the backend
   // settles the job to SUCCEEDED (resumable) and streams a job_completed, which
@@ -366,6 +412,10 @@ export function AgentDrawerProvider({
             isFreeChat={activeAction === 'free-chat'}
             history={history}
             onReply={setReply}
+            confirmationAnswers={confirmationAnswers}
+            onConfirmationAnswer={(questionId, value) =>
+              setConfirmationAnswers((current) => ({ ...current, [questionId]: value }))
+            }
             onSend={sendReply}
             onCancel={interrupt}
             onClose={() => setIsOpen(false)}
@@ -397,6 +447,96 @@ function statusText(s: ChatModel['status']): string {
   }
 }
 
+function ModelConfirmationPanel({
+  confirmation,
+  answers,
+  onAnswer,
+}: {
+  confirmation: ModelConfirmationView;
+  answers: Record<string, string>;
+  onAnswer: (questionId: string, value: string) => void;
+}): JSX.Element {
+  return (
+    <div
+      className="ide-card"
+      style={{ padding: 10, display: 'flex', flexDirection: 'column', gap: 9 }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+        <CheckCircle2 className="w-3.5 h-3.5" style={{ color: 'var(--state-info)' }} />
+        <strong style={{ fontSize: 12.5 }}>统一确认建模假设</strong>
+        <span className="ide-badge ide-badge-info">
+          {confirmation.questions.length} 项
+        </span>
+      </div>
+      {confirmation.metric_hypotheses.length > 0 && (
+        <div style={{ fontSize: 11.5, color: 'var(--ide-text-secondary)', lineHeight: 1.5 }}>
+          已形成 {confirmation.metric_hypotheses.length} 个指标假设
+          {confirmation.metric_hypotheses
+            .slice(0, 3)
+            .map((item) => item.label ?? item.requirement_id)
+            .filter(Boolean)
+            .map((label) => ` · ${label}`)
+            .join('')}
+          {confirmation.metric_hypotheses.length > 3 ? ' …' : ''}
+        </div>
+      )}
+      {confirmation.questions.length === 0 ? (
+        <div style={{ fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
+          没有未决业务口径，可直接确认推荐模型。
+        </div>
+      ) : (
+        confirmation.questions.map((question, index) => (
+          <label
+            key={question.id}
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 5,
+              paddingTop: index ? 8 : 0,
+              borderTop: index ? '1px solid var(--ide-border-subtle)' : undefined,
+            }}
+          >
+            <span style={{ fontSize: 12, color: 'var(--ide-text-primary)', lineHeight: 1.45 }}>
+              {question.required ? '＊' : ''}
+              {question.question}
+            </span>
+            {question.affected_metrics.length > 0 && (
+              <span style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                影响：{question.affected_metrics.join('、')}
+              </span>
+            )}
+            {question.options.length > 0 ? (
+              <select
+                className="ide-input"
+                value={answers[question.id] ?? ''}
+                onChange={(event) => onAnswer(question.id, event.target.value)}
+                style={{ width: '100%', fontSize: 11.5 }}
+              >
+                <option value="">请选择</option>
+                {question.options.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                    {option.value === question.recommended ? '（推荐）' : ''}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>
+                请在下方“补充口径”中统一回答
+              </span>
+            )}
+            {question.impact && (
+              <span style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                {question.impact}
+              </span>
+            )}
+          </label>
+        ))
+      )}
+    </div>
+  );
+}
+
 function DrawerView({
   view,
   chat,
@@ -408,7 +548,9 @@ function DrawerView({
   hasJob,
   isFreeChat,
   history,
+  confirmationAnswers,
   onReply,
+  onConfirmationAnswer,
   onSend,
   onCancel,
   onClose,
@@ -427,7 +569,9 @@ function DrawerView({
   hasJob: boolean;
   isFreeChat: boolean;
   history: AgentJob[] | null;
+  confirmationAnswers: Record<string, string>;
   onReply: (v: string) => void;
+  onConfirmationAnswer: (questionId: string, value: string) => void;
   onSend: () => void;
   onCancel: () => void;
   onClose: () => void;
@@ -446,8 +590,17 @@ function DrawerView({
   // for a brand-new free-chat before its first message (hasJob is still false).
   const canType = view === 'chat' && (hasJob || isFreeChat) && !busy;
   const approvalPhase =
+    chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
     chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ||
     chat.phase === 'AWAITING_MODEL_APPROVAL';
+  const confirmationReady =
+    !chat.modelConfirmation ||
+    chat.modelConfirmation.questions.every(
+      (question) =>
+        !question.required ||
+        Boolean(confirmationAnswers[question.id]?.trim()) ||
+        (question.options.length === 0 && Boolean(reply.trim())),
+    );
   const statusKind = busy
     ? 'warning'
     : chat.status === 'FAILED'
@@ -533,16 +686,33 @@ function DrawerView({
 
           {/* Footer */}
           <div className="chat-footer">
+        {(chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
+          chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION') &&
+          chat.modelConfirmation && (
+            <ModelConfirmationPanel
+              confirmation={chat.modelConfirmation}
+              answers={confirmationAnswers}
+              onAnswer={onConfirmationAnswer}
+            />
+          )}
         {chat.status === 'WAITING_FOR_USER' && chat.waitingQuestion && (
           <div className="chat-waiting">{chat.waitingQuestion}</div>
         )}
         {approvalPhase && (
           <div className="chat-waiting">
-            {chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
-              ? '请补充或确认基础模型；确认后将使用全新上下文进行确定建模。'
+            {chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
+            chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
+              ? '请一次性补充或确认全部字段、关联关系和业务口径；确认后将生成唯一当前模型。'
               : '请审阅确定模型；批准后将使用全新上下文编译查询和脚本。'}
-            <button className="ide-btn ide-btn-primary ide-btn-sm" onClick={onSend}>
-              {chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ? '确认并确定建模' : '批准并开始编译'}
+            <button
+              className="ide-btn ide-btn-primary ide-btn-sm"
+              onClick={onSend}
+              disabled={!confirmationReady}
+            >
+              {chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
+              chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
+                ? '统一确认并生成模型'
+                : '批准并开始编译'}
             </button>
           </div>
         )}

@@ -14,10 +14,13 @@ import {
   readReportPackageFile,
   writeReportPackageFile,
   resealReportPackage,
+  readReportModel,
+  writeReportModel,
   WorkspaceSkillAdapter,
   CatalogConflictError,
   CatalogNotFoundError,
   ReportPackageError,
+  ReportModelError,
   PathNotAllowedError,
   PathTraversalError,
   type CatalogKind,
@@ -30,9 +33,14 @@ function reportPackageErrorStatus(code: ReportPackageError['code']): number {
   return code === 'NOT_FOUND' ? 404 : code === 'PROTECTED' ? 409 : 400;
 }
 import type { ProjectService } from '../projects/service.js';
+import type { JobManager } from '@easybi-studio/job-manager';
 
 /** Knowledge & report status routes backed by disk facts (plan §10.3, §10.4). */
-export function registerWorkspaceStateRoutes(app: FastifyInstance, service: ProjectService): void {
+export function registerWorkspaceStateRoutes(
+  app: FastifyInstance,
+  service: ProjectService,
+  jobs?: JobManager,
+): void {
   app.get<{ Params: { projectId: string } }>(
     '/api/easybi/projects/:projectId/knowledge',
     async (request, reply) => {
@@ -42,6 +50,88 @@ export function registerWorkspaceStateRoutes(app: FastifyInstance, service: Proj
       return ok(request.requestId, state);
     },
   );
+
+  app.get<{ Params: { projectId: string }; Querystring: { reportId?: string } }>(
+    '/api/easybi/projects/:projectId/reports/model',
+    async (request, reply) => {
+      const project = service.get(request.params.projectId);
+      if (!project) return reply.code(404).send(fail(request.requestId, 'NOT_FOUND', '项目不存在'));
+      if (!request.query.reportId) {
+        return reply.code(400).send(fail(request.requestId, 'VALIDATION_FAILED', '缺少 reportId'));
+      }
+      try {
+        return ok(request.requestId, await readReportModel(project.workspaceRoot, request.query.reportId));
+      } catch (err) {
+        if (err instanceof ReportModelError) {
+          return reply
+            .code(err.code === 'NOT_FOUND' ? 404 : err.code === 'CONFLICT' ? 409 : 400)
+            .send(fail(request.requestId, `REPORT_MODEL_${err.code}`, err.message));
+        }
+        throw err;
+      }
+    },
+  );
+
+  app.put<{
+    Params: { projectId: string };
+    Body: {
+      reportId?: string;
+      expectedRevision?: string;
+      reviewedBy?: string;
+      sources?: Array<{ id: string; fields: Array<{ name: string; role?: string }> }>;
+      relationships?: Array<{
+        from: string;
+        to: string;
+        type: string;
+        cardinality: string;
+        grain?: string | null;
+        fanoutRisk?: boolean;
+      }>;
+    };
+  }>('/api/easybi/projects/:projectId/reports/model', async (request, reply) => {
+    const project = service.get(request.params.projectId);
+    if (!project) return reply.code(404).send(fail(request.requestId, 'NOT_FOUND', '项目不存在'));
+    const active = jobs?.activeWriteJob(project.workspaceRoot);
+    if (active) {
+      return reply
+        .code(409)
+        .send(fail(request.requestId, 'WRITE_TASK_CONFLICT', `当前模型正在被任务 ${active.id} 使用，请等待任务结束后再编辑`));
+    }
+    const body = request.body ?? {};
+    if (
+      !body.reportId ||
+      typeof body.expectedRevision !== 'string' ||
+      !Array.isArray(body.sources) ||
+      !Array.isArray(body.relationships)
+    ) {
+      return reply
+        .code(400)
+        .send(fail(request.requestId, 'VALIDATION_FAILED', '缺少 reportId / expectedRevision / sources / relationships'));
+    }
+    try {
+      const reviewerHeader = request.headers['x-easybi-user'];
+      const reviewedBy =
+        body.reviewedBy?.trim() ||
+        (Array.isArray(reviewerHeader) ? reviewerHeader[0] : reviewerHeader)?.trim() ||
+        'studio-user';
+      return ok(
+        request.requestId,
+        await writeReportModel(project.workspaceRoot, body.reportId, {
+          expectedRevision: body.expectedRevision,
+          reviewedBy,
+          sources: body.sources,
+          relationships: body.relationships,
+        }),
+      );
+    } catch (err) {
+      if (err instanceof ReportModelError) {
+        return reply
+          .code(err.code === 'NOT_FOUND' ? 404 : err.code === 'CONFLICT' ? 409 : 400)
+          .send(fail(request.requestId, `REPORT_MODEL_${err.code}`, err.message));
+      }
+      throw err;
+    }
+  });
 
   app.get<{ Params: { projectId: string } }>(
     '/api/easybi/projects/:projectId/reports',

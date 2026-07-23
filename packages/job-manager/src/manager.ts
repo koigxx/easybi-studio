@@ -28,6 +28,8 @@ const WRITE_ACTIONS = new Set<AgentActionType>([
   'rescan-knowledge',
   'review-enums',
   'publish-knowledge',
+  'model-report',
+  'build-report-package',
   'create-report',
   'modify-report',
 ]);
@@ -48,7 +50,17 @@ interface JobRecord {
   reportStrategy?: string;
   pendingQueryIds: string[];
   reviewedBy?: string;
+  /** Bounded internal retries for deterministic stage-contract failures. */
+  phaseRepairAttempts: Partial<Record<ReportWorkflowPhase, number>>;
 }
+
+const AUTO_REPAIR_PHASES = new Set<ReportWorkflowPhase>([
+  'DISCOVERY',
+  'MODELING',
+  'QUERY_COMPILATION',
+  'SCRIPT_COMPILATION',
+]);
+const MAX_PHASE_REPAIR_ATTEMPTS = 2;
 
 export interface StartJobInput {
   projectId: string;
@@ -64,6 +76,7 @@ export interface ReportPhaseHookInput {
   workspaceRoot: string;
   reportId: string;
   userConfirmation?: string;
+  modelConfirmation?: Record<string, unknown>;
   reportRevision: string;
   unitId?: string;
   strategy?: string;
@@ -168,13 +181,23 @@ export class JobManager {
 
   private activeStatuses: JobStatus[] = ['QUEUED', 'RUNNING', 'WAITING_FOR_USER'];
 
+  activeWriteJob(workspaceRoot: string): Job | undefined {
+    const id = this.activeWriteByWorkspace.get(workspaceRoot);
+    const record = id ? this.jobs.get(id) : undefined;
+    return record && this.activeStatuses.includes(record.job.status) ? { ...record.job } : undefined;
+  }
+
   private initialPhase(action: AgentActionType): ReportWorkflowPhase | undefined {
-    return action === 'create-report' || action === 'modify-report' ? 'DISCOVERY' : undefined;
+    if (action === 'model-report' || action === 'create-report' || action === 'modify-report') {
+      return 'DISCOVERY';
+    }
+    return action === 'build-report-package' ? 'QUERY_COMPILATION' : undefined;
   }
 
   private phaseLabel(phase: ReportWorkflowPhase): string {
     const labels: Record<ReportWorkflowPhase, string> = {
       DISCOVERY: '基础建模',
+      AWAITING_MODEL_CONFIRMATION: '等待统一确认模型',
       AWAITING_DISCOVERY_CONFIRMATION: '等待确认基础模型',
       MODELING: '确定建模',
       AWAITING_MODEL_APPROVAL: '等待批准确定模型',
@@ -201,18 +224,22 @@ export class JobManager {
       }
     }
 
-    const reportRevision = input.reportId
+    const phase = this.initialPhase(input.action);
+    const reportRevision = phase && input.reportId
       ? `${new Date().toISOString().replace(/[-:.TZ]/g, '')}-${randomUUID().slice(0, 8)}`
       : undefined;
-    if (input.reportId && reportRevision && this.prepareInitialReport) {
-      const prepared = await this.prepareInitialReport({
-        phase: 'DISCOVERY',
+    let initialPrepared: ReportPhaseHookResult | undefined;
+    if (phase && input.reportId && reportRevision && this.prepareInitialReport) {
+      initialPrepared = await this.prepareInitialReport({
+        phase: phase ?? 'DISCOVERY',
         projectId: input.projectId,
         workspaceRoot: input.workspaceRoot,
         reportId: input.reportId,
         reportRevision,
       });
-      if (!prepared.ok) throw new Error(prepared.error ?? '当前工作区不支持分阶段报表构建');
+      if (!initialPrepared.ok) {
+        throw new Error(initialPrepared.error ?? '当前工作区不支持分阶段报表构建');
+      }
     }
 
     // Create a checkpoint BEFORE a write task starts (plan §10.10).
@@ -227,9 +254,41 @@ export class JobManager {
       });
     }
 
-    const scopedPrompt = reportRevision && input.reportId
-      ? `${input.prompt}\n\n本次构建修订号：${reportRevision}。所有阶段产物只能写入 work/report-build/${input.reportId}/${reportRevision}。`
-      : input.prompt;
+    let initialStrategy: string | undefined;
+    let initialUnitId: string | undefined;
+    let pendingQueryIds: string[] = [];
+    if (initialPrepared?.details) {
+      if (typeof initialPrepared.details.strategy === 'string') {
+        initialStrategy = initialPrepared.details.strategy;
+      }
+      if (Array.isArray(initialPrepared.details.query_ids)) {
+        const ids = initialPrepared.details.query_ids.map(String);
+        initialUnitId = ids.shift();
+        pendingQueryIds = ids;
+      }
+    }
+    const stageBase =
+      input.action === 'model-report' ||
+      input.action === 'create-report' ||
+      input.action === 'modify-report'
+        ? 'work/report-model'
+        : 'work/report-build';
+    const scopedPrompt =
+      phase === 'QUERY_COMPILATION' && this.buildReportPhasePrompt
+        ? this.buildReportPhasePrompt(phase, {
+            reportId: input.reportId,
+            reportRevision,
+            unitId: initialUnitId,
+            strategy: initialStrategy,
+          })
+        : phase === 'DISCOVERY' && this.buildReportPhasePrompt
+          ? `${input.prompt}\n\n${this.buildReportPhasePrompt(phase, {
+              reportId: input.reportId,
+              reportRevision,
+            })}`
+        : reportRevision && input.reportId
+          ? `${input.prompt}\n\n本次建模修订号：${reportRevision}。所有阶段产物只能写入 ${stageBase}/${input.reportId}/${reportRevision}。`
+          : input.prompt;
     const task = await this.bridge.start({
       projectId: input.projectId,
       workspaceRoot: input.workspaceRoot,
@@ -238,7 +297,6 @@ export class JobManager {
     });
 
     const now = new Date().toISOString();
-    const phase = this.initialPhase(input.action);
     const run: AgentRun = {
       id: `run_${randomUUID()}`,
       conversationId: task.taskId,
@@ -251,6 +309,7 @@ export class JobManager {
       startedAt: now,
       ...(checkpointId ? { checkpointId } : {}),
       ...(reportRevision ? { reportRevision } : {}),
+      ...(initialUnitId ? { unitId: initialUnitId } : {}),
     };
     const job: Job = {
       id: task.taskId,
@@ -278,7 +337,9 @@ export class JobManager {
       action: input.action,
       currentProviderTaskId: task.taskId,
       currentRun: run,
-      pendingQueryIds: [],
+      pendingQueryIds,
+      phaseRepairAttempts: {},
+      ...(initialStrategy ? { reportStrategy: initialStrategy } : {}),
       ...(checkpointId ? { checkpointId } : {}),
     };
     this.jobs.set(job.id, record);
@@ -303,6 +364,7 @@ export class JobManager {
         runId: run.id,
         contextMode: 'fresh',
         ...(phase ? { phase, label: this.phaseLabel(phase) } : {}),
+        ...(initialUnitId ? { unitId: initialUnitId } : {}),
       },
     });
     if (checkpointId) {
@@ -340,6 +402,8 @@ export class JobManager {
   private async pump(record: JobRecord, taskId: string): Promise<void> {
     const { workspaceRoot, checkpointId } = record;
     let autoNextPhase: ReportWorkflowPhase | undefined;
+    let autoNextPrompt: string | undefined;
+    let autoNextSkipPrepare = false;
     let deferredCompletionSummary: string | undefined;
     record.pumping = true;
     try {
@@ -376,7 +440,29 @@ export class JobManager {
             }
           }
           if (gateError && completedPhase) {
-            deferredCompletionSummary = `阶段产物未通过门禁：${gateError}`;
+            const repairAttempts = record.phaseRepairAttempts[completedPhase] ?? 0;
+            const canAutoRepair =
+              AUTO_REPAIR_PHASES.has(completedPhase) &&
+              repairAttempts < MAX_PHASE_REPAIR_ATTEMPTS &&
+              Boolean(this.buildReportPhasePrompt);
+            if (canAutoRepair) {
+              const nextAttempt = repairAttempts + 1;
+              record.phaseRepairAttempts[completedPhase] = nextAttempt;
+              autoNextPhase = completedPhase;
+              autoNextSkipPrepare = true;
+              autoNextPrompt =
+                `${this.buildReportPhasePrompt?.(completedPhase, {
+                  reportId: record.job.reportId,
+                  reportRevision: record.job.reportRevision,
+                  unitId: record.currentRun.unitId,
+                  strategy: record.reportStrategy,
+                }) ?? ''}\n\n` +
+                `上一次产物未通过 Studio 的确定性门禁（自动修复 ${nextAttempt}/${MAX_PHASE_REPAIR_ATTEMPTS}）：${gateError}\n` +
+                '这是技术契约修复，不是新的业务确认。只修复当前阶段产物，严格保持已确认的业务口径；' +
+                '不要向用户提问，不要进入下一阶段，不要把“已写入文件”表述为阶段完成。';
+            } else {
+              deferredCompletionSummary = `阶段产物未通过门禁：${gateError}`;
+            }
             record.currentRun.status = 'FAILED';
             record.currentRun.finishedAt = at;
             this.eventStore?.upsertRun?.(record.currentRun);
@@ -400,11 +486,19 @@ export class JobManager {
                 label: `${this.phaseLabel(completedPhase)}（产物需修复）`,
                 validationFailed: true,
                 error: gateError,
+                ...(canAutoRepair
+                  ? {
+                      autoRepair: true,
+                      repairAttempt: repairAttempts + 1,
+                      maxRepairAttempts: MAX_PHASE_REPAIR_ATTEMPTS,
+                    }
+                  : {}),
                 runId: record.currentRun.id,
               },
             });
             continue;
           }
+          if (completedPhase) delete record.phaseRepairAttempts[completedPhase];
           if (record.currentRun.phase) deferredCompletionSummary = e.summary;
           record.currentRun.status = 'SUCCEEDED';
           record.currentRun.finishedAt = at;
@@ -420,14 +514,29 @@ export class JobManager {
               ...(record.currentRun.unitId ? { unitId: record.currentRun.unitId } : {}),
             },
           });
+          const modelConfirmation =
+            gateResult?.details?.model_confirmation &&
+            typeof gateResult.details.model_confirmation === 'object'
+              ? (gateResult.details.model_confirmation as Record<string, unknown>)
+              : undefined;
+          const confirmationQuestions = Array.isArray(modelConfirmation?.questions)
+            ? modelConfirmation.questions
+            : undefined;
           let awaiting: ReportWorkflowPhase | undefined =
             record.job.phase === 'DISCOVERY'
-              ? 'AWAITING_DISCOVERY_CONFIRMATION'
+              ? confirmationQuestions?.length === 0
+                ? undefined
+                : 'AWAITING_MODEL_CONFIRMATION'
               : record.job.phase === 'MODELING'
-                ? 'AWAITING_MODEL_APPROVAL'
+                ? gateResult?.details?.workflow_complete === true
+                  ? 'COMPLETED'
+                  : undefined
                 : record.job.phase === 'SCRIPT_COMPILATION'
                   ? 'COMPLETED'
                   : undefined;
+          if (record.job.phase === 'DISCOVERY' && confirmationQuestions?.length === 0) {
+            autoNextPhase = 'MODELING';
+          }
           if (record.job.phase === 'QUERY_COMPILATION') {
             if (gateResult?.details?.workflow_complete === true) {
               awaiting = 'COMPLETED';
@@ -450,6 +559,7 @@ export class JobManager {
                 phase: awaiting,
                 label: this.phaseLabel(awaiting),
                 runId: record.currentRun.id,
+                ...(gateResult?.details ? { details: gateResult.details } : {}),
               },
             });
           }
@@ -510,14 +620,18 @@ export class JobManager {
           this.activeWriteByWorkspace.delete(workspaceRoot);
         }
         if (autoNextPhase && this.buildReportPhasePrompt) {
-          const nextUnitId = autoNextPhase === 'QUERY_COMPILATION'
-            ? record.pendingQueryIds.shift()
-            : undefined;
+          const nextUnitId =
+            autoNextSkipPrepare && autoNextPhase === record.currentRun.phase
+              ? record.currentRun.unitId
+              : autoNextPhase === 'QUERY_COMPILATION'
+                ? record.pendingQueryIds.shift()
+                : undefined;
           await this.startFreshPhase({
             jobId: record.job.id,
             phase: autoNextPhase,
+            ...(autoNextPrompt ? { prompt: autoNextPrompt } : {}),
+            ...(autoNextSkipPrepare ? { skipPrepare: true } : {}),
             ...(nextUnitId ? { unitId: nextUnitId } : {}),
-            skipPrepare: true,
           }).catch((error) => {
             this.setStatus(record, 'FAILED');
             this.emit(record, {
@@ -554,6 +668,7 @@ export class JobManager {
     modelRevision?: string;
     modelHash?: string;
     userMessage?: string;
+    modelConfirmation?: Record<string, unknown>;
     unitId?: string;
     reviewedBy?: string;
     skipPrepare?: boolean;
@@ -564,9 +679,13 @@ export class JobManager {
       throw new JobActiveError(`任务当前阶段仍在运行（${record.job.status}）`);
     }
     const allowed: Partial<Record<ReportWorkflowPhase, ReportWorkflowPhase[]>> = {
+      DISCOVERY: ['DISCOVERY', 'MODELING'],
+      AWAITING_MODEL_CONFIRMATION: ['MODELING'],
       AWAITING_DISCOVERY_CONFIRMATION: ['MODELING'],
+      MODELING: ['MODELING'],
       AWAITING_MODEL_APPROVAL: ['QUERY_COMPILATION'],
       QUERY_COMPILATION: ['QUERY_COMPILATION', 'SCRIPT_COMPILATION', 'REVISION_REQUIRED'],
+      SCRIPT_COMPILATION: ['SCRIPT_COMPILATION'],
       REVISION_REQUIRED: ['MODELING'],
     };
     if (record.job.phase && !(allowed[record.job.phase] ?? []).includes(input.phase)) {
@@ -580,8 +699,11 @@ export class JobManager {
         workspaceRoot: record.workspaceRoot,
         reportId: record.job.reportId,
         reportRevision: record.job.reportRevision!,
+        ...(input.unitId ? { unitId: input.unitId } : {}),
+        ...(record.reportStrategy ? { strategy: record.reportStrategy } : {}),
         ...(input.reviewedBy ? { reviewedBy: input.reviewedBy } : {}),
         ...(input.userMessage ? { userConfirmation: input.userMessage } : {}),
+        ...(input.modelConfirmation ? { modelConfirmation: input.modelConfirmation } : {}),
       });
       if (!prepared.ok) throw new Error(prepared.error ?? '下一阶段准备失败');
     }
@@ -857,6 +979,7 @@ export class JobManager {
       currentProviderTaskId: currentRun.providerTaskId,
       currentRun,
       pendingQueryIds: [],
+      phaseRepairAttempts: {},
       ...(job.checkpointId ? { checkpointId: job.checkpointId } : {}),
     };
     this.jobs.set(jobId, record);

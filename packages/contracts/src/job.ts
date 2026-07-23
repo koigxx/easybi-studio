@@ -13,8 +13,11 @@ export type JobStatus =
 /** Provider-independent phases for the staged report-generation workflow. */
 export type ReportWorkflowPhase =
   | 'DISCOVERY'
+  | 'AWAITING_MODEL_CONFIRMATION'
+  /** Legacy persisted phase from the previous two-confirmation workflow. */
   | 'AWAITING_DISCOVERY_CONFIRMATION'
   | 'MODELING'
+  /** Legacy persisted phase from the previous two-confirmation workflow. */
   | 'AWAITING_MODEL_APPROVAL'
   | 'QUERY_COMPILATION'
   | 'SCRIPT_COMPILATION'

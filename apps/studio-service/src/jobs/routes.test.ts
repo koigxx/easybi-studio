@@ -71,7 +71,7 @@ describe('agent-action job routes (FakeAgentBridge)', () => {
     const first = await studio.app.inject({
       method: 'POST',
       url: '/api/easybi/projects/jobws/agent-actions',
-      payload: { action: 'create-report', prompt: 'a', reportId: 'report-a' },
+      payload: { action: 'initialize-knowledge', prompt: 'a' },
     });
     expect(first.statusCode).toBe(201);
     await waitForStatus(first.json().data.job.id, 'WAITING_FOR_USER');
@@ -79,7 +79,7 @@ describe('agent-action job routes (FakeAgentBridge)', () => {
     const second = await studio.app.inject({
       method: 'POST',
       url: '/api/easybi/projects/jobws/agent-actions',
-      payload: { action: 'modify-report', prompt: 'b', reportId: 'report-b' },
+      payload: { action: 'continue-knowledge', prompt: 'b' },
     });
     expect(second.statusCode).toBe(409);
     expect(second.json().error.code).toBe('WRITE_TASK_CONFLICT');

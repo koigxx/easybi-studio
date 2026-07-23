@@ -1,6 +1,6 @@
 {
   "name": "@easybi/create-report-package",
-  "version": "2.26.5",
+  "version": "2.28.8",
   "private": true,
   "type": "module",
   "engines": {

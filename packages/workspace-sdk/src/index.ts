@@ -12,4 +12,5 @@ export * from './knowledge-state.js';
 export * from './knowledge-catalog.js';
 export * from './knowledge-edit.js';
 export * from './report-state.js';
+export * from './report-model.js';
 export * from './files.js';

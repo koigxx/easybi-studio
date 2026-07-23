@@ -22,6 +22,7 @@ export function AgentQuickStart({
   actions,
   selectedReport,
   gateActions,
+  disabledReasons,
 }: {
   projectId: string;
   actions: string[];
@@ -29,6 +30,8 @@ export function AgentQuickStart({
   selectedReport?: { id: string; name: string } | null;
   /** Preset actions that require a selected report before they can run. */
   gateActions?: string[];
+  /** Per-action business gate shown in the preset menu. */
+  disabledReasons?: Partial<Record<string, string>>;
 }): JSX.Element {
   const { startAction, newChat } = useAgentDrawer();
   const [open, setOpen] = useState(false);
@@ -79,24 +82,30 @@ export function AgentQuickStart({
             )}
             {shown.map((a) => {
               const needsSelection = gated.has(a.action);
-              const disabled = needsSelection && !selectedReport;
-              const hint = disabled
+              const selectionDisabled = needsSelection && !selectedReport;
+              const businessReason = disabledReasons?.[a.action];
+              const disabled = selectionDisabled || Boolean(businessReason);
+              const hint = selectionDisabled
                 ? '请先在下方报表需求列表中选择一张报表'
+                : businessReason
+                  ? businessReason
                 : needsSelection && selectedReport
-                  ? `将为「${selectedReport.name || selectedReport.id}」生成报表包`
+                  ? a.action === 'model-report'
+                    ? `将为「${selectedReport.name || selectedReport.id}」构建并确认当前模型`
+                    : `将从「${selectedReport.name || selectedReport.id}」的当前模型生成报表包`
                   : a.hint;
               return (
                 <button
                   key={a.action}
                   className="agent-quick-item"
                   disabled={disabled}
-                  title={disabled ? '请先选择一张报表' : undefined}
+                  title={disabled ? hint : undefined}
                   onClick={() => {
                     if (disabled) return;
                     setOpen(false);
                     const prompt =
                       needsSelection && selectedReport
-                        ? buildScopedReportPrompt(a.prompt, selectedReport)
+                        ? buildScopedReportPrompt(a.prompt, selectedReport, a.action)
                         : a.prompt;
                     startAction(projectId, a.action, prompt, selectedReport?.id);
                   }}

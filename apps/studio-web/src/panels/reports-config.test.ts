@@ -334,6 +334,39 @@ describe('field roles + description', () => {
     const fields = merged.knowledge.report_requirements[0]!.required_fields as unknown[];
     expect(fields[0]).toEqual({ label: '订单数总和', roles: [], description: '订单数量的总和' });
   });
+
+  it('round-trips an unbound metric intent with its aggregation', () => {
+    const draft = extractReportConfig({
+      knowledge: {
+        report_requirements: [
+          {
+            id: 'usage',
+            name: '系统使用统计',
+            required_fields: [
+              {
+                label: '已完成订单数量',
+                roles: ['output', 'metric'],
+                aggregation: 'count_distinct',
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const metric = draft.requirements[0]!.requiredFields[0]!;
+    expect(metric.roles).toEqual(['output', 'metric']);
+    expect(metric.aggregation).toBe('count_distinct');
+    const merged = mergeReportConfig({ knowledge: {} }, draft) as {
+      knowledge: { report_requirements: Array<Record<string, unknown>> };
+    };
+    expect(merged.knowledge.report_requirements[0]!.required_fields).toEqual([
+      {
+        label: '已完成订单数量',
+        roles: ['output', 'metric'],
+        aggregation: 'count_distinct',
+      },
+    ]);
+  });
 });
 
 describe('parseImportedReports', () => {
@@ -545,8 +578,20 @@ describe('buildScopedReportPrompt', () => {
     const out = buildScopedReportPrompt('生成报表包。', { id: 'gp', name: '毛利明细' });
     expect(out).toContain('生成报表包。');
     expect(out).toContain('gp（毛利明细）');
-    expect(out).toContain('当前首轮只执行基础建模');
+    expect(out).toContain('只执行基础建模');
+    expect(out).toContain('一次统一确认');
     expect(out).toContain('不得提前生成 SQL、脚本或报表包');
+  });
+
+  it('scopes package generation to the approved current model', () => {
+    const out = buildScopedReportPrompt(
+      '生成报表。',
+      { id: 'gp', name: '毛利明细' },
+      'build-report-package',
+    );
+    expect(out).toContain('只使用该报表已确认的当前模型');
+    expect(out).toContain('不得重新建模');
+    expect(out).not.toContain('只执行基础建模');
   });
 
   it('uses just the id when name equals id or is empty', () => {

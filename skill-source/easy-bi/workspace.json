@@ -13,6 +13,8 @@
     "toolkit": "toolkit",
     "scripts": "scripts",
     "knowledge": "knowledge",
+    "report_plans": "reports/plans",
+    "report_models": "reports/models",
     "report_packages": "reports/packages",
     "outputs": "outputs",
     "work": "work"
