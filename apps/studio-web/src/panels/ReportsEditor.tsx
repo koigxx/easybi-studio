@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, Save, Plus, Trash2, X, Link2, Upload, Copy, ArrowLeft, Pencil, ChevronRight } from 'lucide-react';
+import { RefreshCw, Save, Plus, Trash2, X, Link2, Upload, Copy, ArrowLeft, Pencil, ChevronRight, ChevronDown, GripVertical, ArrowUp, ArrowDown } from 'lucide-react';
 import { api, type Project } from '../api.js';
 import { SectionTitle, ErrorBanner, EmptyState } from '../components/ui/common.js';
 import {
@@ -58,6 +58,9 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
   // Which field row is focused, and which rows have their binding box opened.
   const [selected, setSelected] = useState<string | null>(null);
   const [opened, setOpened] = useState<Set<string>>(new Set());
+  // Drag-and-drop reorder state.
+  const [dragSource, setDragSource] = useState<{ ri: number; fi: number } | null>(null);
+  const [dragOver, setDragOver] = useState<{ ri: number; fi: number } | null>(null);
   // Import dialog state.
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState('');
@@ -232,6 +235,19 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
             }
           : requirement,
       ),
+    });
+  }
+
+  function moveField(reqIndex: number, fromIndex: number, toIndex: number): void {
+    if (fromIndex === toIndex) return;
+    patch({
+      requirements: draft!.requirements.map((r, i) => {
+        if (i !== reqIndex) return r;
+        const fields = [...r.requiredFields];
+        const [moved] = fields.splice(fromIndex, 1);
+        fields.splice(toIndex, 0, moved!);
+        return { ...r, requiredFields: fields };
+      }),
     });
   }
 
@@ -486,12 +502,72 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                       {r.requiredFields.map((f, fi) => {
                         const key = fieldKey(ri, fi);
                         const binding = fieldBinding(f);
-                        // Binding box shows when opened OR when a binding already exists.
-                        const showBinding = opened.has(key) || binding.length > 0;
                         const isSelected = selected === key;
-                        return (
-                          <div key={fi} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-                            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        const expanded = opened.has(key);
+                        const isDragSource =
+                              dragSource !== null && dragSource.ri === ri && dragSource.fi === fi;
+                            const isDragOver =
+                              dragOver !== null && dragOver.ri === ri && dragOver.fi === fi;
+                            return (
+                          <div
+                            key={fi}
+                            style={{
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: 3,
+                              opacity: isDragSource ? 0.4 : 1,
+                              transition: 'opacity 0.15s',
+                            }}
+                            draggable
+                            onDragStart={(e) => {
+                              setDragSource({ ri, fi });
+                              e.dataTransfer.effectAllowed = 'move';
+                              e.dataTransfer.setData('text/plain', `${ri}:${fi}`);
+                            }}
+                            onDragOver={(e) => {
+                              e.preventDefault();
+                              e.dataTransfer.dropEffect = 'move';
+                              setDragOver({ ri, fi });
+                            }}
+                            onDragLeave={() => setDragOver(null)}
+                            onDrop={(e) => {
+                              e.preventDefault();
+                              setDragOver(null);
+                              if (dragSource && dragSource.ri === ri) {
+                                moveField(ri, dragSource.fi, fi);
+                              }
+                              setDragSource(null);
+                            }}
+                            onDragEnd={() => {
+                              setDragSource(null);
+                              setDragOver(null);
+                            }}
+                          >
+                            {isDragOver && (
+                              <div
+                                style={{
+                                  height: 2,
+                                  backgroundColor: 'var(--ide-accent)',
+                                  borderRadius: 1,
+                                  marginBottom: -1,
+                                }}
+                              />
+                            )}
+                            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                              {/* Drag handle */}
+                              <span
+                                style={{
+                                  cursor: 'grab',
+                                  color: 'var(--ide-text-muted)',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  flexShrink: 0,
+                                  userSelect: 'none',
+                                }}
+                                title="拖拽调整字段顺序"
+                              >
+                                <GripVertical className="w-3.5 h-3.5" />
+                              </span>
                               <input
                                 className="ide-input"
                                 value={f.text}
@@ -516,16 +592,49 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                   );
                                 })}
                               </div>
-                              {isSelected && !showBinding && (
+                              {/* Expand/collapse toggle for extra details */}
+                              <button
+                                className="ide-btn ide-btn-sm ide-btn-ghost"
+                                onClick={() =>
+                                  setOpened((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(key)) next.delete(key);
+                                    else next.add(key);
+                                    return next;
+                                  })
+                                }
+                                title={opened.has(key) ? '折叠描述与绑定' : '展开描述与绑定'}
+                                style={{ padding: '2px 3px' }}
+                              >
+                                <ChevronDown
+                                  className="w-3.5 h-3.5"
+                                  style={{
+                                    transform: opened.has(key) ? 'rotate(0deg)' : 'rotate(-90deg)',
+                                    transition: 'transform 0.15s',
+                                  }}
+                                />
+                              </button>
+                              {/* Move buttons */}
+                              <div style={{ display: 'flex', gap: 1, flexShrink: 0 }}>
                                 <button
                                   className="ide-btn ide-btn-sm ide-btn-ghost"
-                                  onClick={() => setOpened((prev) => new Set(prev).add(key))}
-                                  title="为该字段指定数据库绑定（仅歧义字段需要）"
+                                  onClick={() => moveField(ri, fi, fi - 1)}
+                                  disabled={fi === 0}
+                                  title="上移"
+                                  style={{ padding: '2px 3px' }}
                                 >
-                                  <Link2 className="w-3.5 h-3.5" />
-                                  指定绑定
+                                  <ArrowUp className="w-3 h-3" />
                                 </button>
-                              )}
+                                <button
+                                  className="ide-btn ide-btn-sm ide-btn-ghost"
+                                  onClick={() => moveField(ri, fi, fi + 1)}
+                                  disabled={fi === r.requiredFields.length - 1}
+                                  title="下移"
+                                  style={{ padding: '2px 3px' }}
+                                >
+                                  <ArrowDown className="w-3 h-3" />
+                                </button>
+                              </div>
                               <button
                                 className="ide-btn ide-btn-sm ide-btn-ghost"
                                 onClick={() =>
@@ -538,80 +647,78 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                 <X className="w-3.5 h-3.5" />
                               </button>
                             </div>
-                            <input
-                              className="ide-input"
-                              value={f.description}
-                              placeholder="字段描述（可选，帮助 AI 理解此字段，例：订单数量的总和）"
-                              onChange={(e) => updateFieldDescription(ri, fi, e.target.value)}
-                              onFocus={() => setSelected(key)}
-                              style={{
-                                marginLeft: 2,
-                                fontSize: 11.5,
-                                color: 'var(--ide-text-secondary)',
-                              }}
-                            />
-                            {hasRole(f, 'metric') && (
-                              <select
-                                className="ide-input"
-                                value={f.aggregation ?? 'count_distinct'}
-                                onChange={(event) =>
-                                  updateFieldAggregation(
-                                    ri,
-                                    fi,
-                                    event.target.value as MetricAggregation,
-                                  )
-                                }
-                                style={{ marginLeft: 2, width: 150, fontSize: 11.5 }}
-                                title="指标聚合方式"
-                              >
-                                {METRIC_AGGREGATIONS.map((aggregation) => (
-                                  <option key={aggregation} value={aggregation}>
-                                    {AGGREGATION_LABELS[aggregation]}
-                                  </option>
-                                ))}
-                              </select>
-                            )}
-                            {showBinding && (
-                              <div
-                                style={{
-                                  display: 'flex',
-                                  gap: 8,
-                                  alignItems: 'center',
-                                  marginLeft: 2,
-                                }}
-                              >
-                                <span
-                                  style={{
-                                    fontSize: 11,
-                                    color: 'var(--ide-text-tertiary)',
-                                    whiteSpace: 'nowrap',
-                                  }}
-                                >
-                                  绑定
-                                </span>
+                            {expanded && (
+                              <>
                                 <input
                                   className="ide-input"
-                                  value={binding}
-                                  placeholder="db.table.column"
-                                  onChange={(e) => updateFieldBinding(ri, fi, e.target.value)}
+                                  value={f.description}
+                                  placeholder="字段描述（可选，帮助 AI 理解此字段，例：订单数量的总和）"
+                                  onChange={(e) => updateFieldDescription(ri, fi, e.target.value)}
                                   onFocus={() => setSelected(key)}
-                                  style={{ flex: 1, fontSize: 12 }}
-                                />
-                                <button
-                                  className="ide-btn ide-btn-sm ide-btn-ghost"
-                                  onClick={() => {
-                                    updateFieldBinding(ri, fi, '');
-                                    setOpened((prev) => {
-                                      const next = new Set(prev);
-                                      next.delete(key);
-                                      return next;
-                                    });
+                                  style={{
+                                    marginLeft: 2,
+                                    fontSize: 11.5,
+                                    color: 'var(--ide-text-secondary)',
                                   }}
-                                  title="删除绑定"
+                                />
+                                {hasRole(f, 'metric') && (
+                                  <select
+                                    className="ide-input"
+                                    value={f.aggregation ?? 'count_distinct'}
+                                    onChange={(event) =>
+                                      updateFieldAggregation(
+                                        ri,
+                                        fi,
+                                        event.target.value as MetricAggregation,
+                                      )
+                                    }
+                                    style={{ marginLeft: 2, width: 150, fontSize: 11.5 }}
+                                    title="指标聚合方式"
+                                  >
+                                    {METRIC_AGGREGATIONS.map((aggregation) => (
+                                      <option key={aggregation} value={aggregation}>
+                                        {AGGREGATION_LABELS[aggregation]}
+                                      </option>
+                                    ))}
+                                  </select>
+                                )}
+                                <div
+                                  style={{
+                                    display: 'flex',
+                                    gap: 8,
+                                    alignItems: 'center',
+                                    marginLeft: 2,
+                                  }}
                                 >
-                                  <X className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
+                                  <span
+                                    style={{
+                                      fontSize: 11,
+                                      color: 'var(--ide-text-tertiary)',
+                                      whiteSpace: 'nowrap',
+                                    }}
+                                  >
+                                    <Link2 className="w-3 h-3" style={{ display: 'inline', verticalAlign: 'middle', marginRight: 2 }} />
+                                    绑定
+                                  </span>
+                                  <input
+                                    className="ide-input"
+                                    value={binding}
+                                    placeholder="db.table.column"
+                                    onChange={(e) => updateFieldBinding(ri, fi, e.target.value)}
+                                    onFocus={() => setSelected(key)}
+                                    style={{ flex: 1, fontSize: 12 }}
+                                  />
+                                  {binding && (
+                                    <button
+                                      className="ide-btn ide-btn-sm ide-btn-ghost"
+                                      onClick={() => updateFieldBinding(ri, fi, '')}
+                                      title="删除绑定"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                </div>
+                              </>
                             )}
                           </div>
                         );
