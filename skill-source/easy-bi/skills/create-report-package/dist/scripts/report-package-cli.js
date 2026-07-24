@@ -2949,13 +2949,46 @@ function normalizeFinalReportModelValue(model) {
         };
     });
     const relationships = (model.relationships ?? []).map((relationship) => {
-        if (relationship.from && relationship.to)
-            return relationship;
+        // Normalize relationship endpoints. Accepts:
+        //   1. string "t0.field"
+        //   2. object {alias, field} or {source, field}
+        //   3. split-key format {from_source, from_field, to_source, to_field} (no from/to keys)
+        const normalizeEndpoint = (raw) => {
+            if (typeof raw === "string" && raw.trim())
+                return raw.trim();
+            if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+                const obj = raw;
+                const alias = String(obj.alias ?? obj.source ?? obj.sourceId ?? obj.source_id ?? "");
+                const field = String(obj.field ?? obj.fieldName ?? obj.field_name ?? "");
+                if (alias && field)
+                    return `${alias}.${field}`;
+            }
+            return String(raw ?? "");
+        };
+        // Resolve from/to from the relationship, falling back to split-key fields.
+        const resolveFrom = () => {
+            const v = normalizeEndpoint(relationship.from);
+            if (v && v !== "[object Object]")
+                return v;
+            const src = String(relationship.from_alias ?? relationship.from_source ?? "");
+            const field = String(relationship.from_field ?? "");
+            return src && field ? `${src}.${field}` : "";
+        };
+        const resolveTo = () => {
+            const v = normalizeEndpoint(relationship.to);
+            if (v && v !== "[object Object]")
+                return v;
+            const src = String(relationship.to_alias ?? relationship.to_source ?? "");
+            const field = String(relationship.to_field ?? "");
+            return src && field ? `${src}.${field}` : "";
+        };
         const match = String(relationship.on ?? "").match(/^\s*([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\s*$/);
+        const nFrom = resolveFrom() || normalizeEndpoint(match?.[1] ?? "");
+        const nTo = resolveTo() || normalizeEndpoint(match?.[2] ?? "");
         return {
             ...relationship,
-            from: String(relationship.from ?? match?.[1] ?? ""),
-            to: String(relationship.to ?? match?.[2] ?? ""),
+            from: nFrom,
+            to: nTo,
             fanout_risk: relationship.fanout_risk ??
                 ["1:n", "n:n"].includes(String(relationship.cardinality ?? "").toLowerCase()),
         };
@@ -3034,6 +3067,58 @@ export function validateReportModelValue(model, requireApproved = false) {
             errors.push(`来源 ${source.id ?? "?"} 缺少物理定位`);
         if (!(source.fields ?? []).length)
             errors.push(`来源 ${source.id ?? "?"} 没有字段白名单`);
+    }
+    // Validate relationship endpoints: resolve object or string format and check against source fields.
+    const sourceFields = new Map((model.sources ?? []).map((source) => [
+        String(source.id ?? source.alias ?? ""),
+        new Set((source.fields ?? []).map((field) => String(typeof field === "string" ? field : field.name))),
+    ]));
+    const relationKeys = new Set();
+    for (const relationship of model.relationships ?? []) {
+        const resolveEp = (raw) => {
+            if (typeof raw === "string" && raw.trim()) {
+                const dot = raw.indexOf(".");
+                return { id: dot > 0 ? raw.slice(0, dot) : "", field: dot > 0 ? raw.slice(dot + 1) : "", display: raw };
+            }
+            if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+                const obj = raw;
+                const alias = String(obj.alias ?? obj.source ?? obj.sourceId ?? obj.source_id ?? "");
+                const field = String(obj.field ?? obj.fieldName ?? obj.field_name ?? "");
+                return { id: alias, field, display: `${alias || "?"}.${field || "?"}（对象：${JSON.stringify(raw)}）` };
+            }
+            return { id: "", field: "", display: JSON.stringify(raw ?? "(空)") };
+        };
+        // Also accept split-key format: {from_source, from_field, to_source, to_field}
+        const resolveFromRaw = () => {
+            if (relationship.from != null)
+                return relationship.from;
+            const src = relationship.from_alias ?? relationship.from_source;
+            const fld = relationship.from_field;
+            if (src != null || fld != null)
+                return { alias: src, field: fld };
+            return undefined;
+        };
+        const resolveToRaw = () => {
+            if (relationship.to != null)
+                return relationship.to;
+            const src = relationship.to_alias ?? relationship.to_source;
+            const fld = relationship.to_field;
+            if (src != null || fld != null)
+                return { alias: src, field: fld };
+            return undefined;
+        };
+        const epFrom = resolveEp(resolveFromRaw());
+        const epTo = resolveEp(resolveToRaw());
+        if (!epFrom.id || !epFrom.field || !sourceFields.get(epFrom.id)?.has(epFrom.field)) {
+            errors.push(`关联端点不在字段白名单中：${epFrom.display}`);
+        }
+        if (!epTo.id || !epTo.field || !sourceFields.get(epTo.id)?.has(epTo.field)) {
+            errors.push(`关联端点不在字段白名单中：${epTo.display}`);
+        }
+        const key = `${epFrom.id}.${epFrom.field}->${epTo.id}.${epTo.field}`;
+        if (relationKeys.has(key))
+            errors.push(`重复关联：${key}`);
+        relationKeys.add(key);
     }
     const approvedSources = new Map((model.sources ?? []).map((source) => [
         `${source.profile_id}/${source.database}/${source.table}`,

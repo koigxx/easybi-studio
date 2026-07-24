@@ -104,6 +104,37 @@ function assertReportId(reportId: string): void {
   if (!REPORT_ID.test(reportId)) throw new ReportModelError('INVALID', '报表 ID 不合法');
 }
 
+/**
+ * Parse a relationship endpoint that can be either:
+ * - a dot-separated string: "t0.field_name"
+ * - an object: { source: "t0", field: "field_name" }
+ *
+ * Returns the parsed source ID, field name, and a human-readable display string.
+ */
+function parseEndpoint(raw: unknown): { sourceId: string; field: string; normalized: string; display: string } {
+  if (typeof raw === 'string' && raw.trim()) {
+    const dot = raw.indexOf('.');
+    return {
+      sourceId: dot > 0 ? raw.slice(0, dot) : '',
+      field: dot > 0 ? raw.slice(dot + 1) : '',
+      normalized: raw.trim(),
+      display: raw,
+    };
+  }
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const obj = raw as Record<string, unknown>;
+    const sourceId = String(obj.source ?? obj.sourceId ?? obj.source_id ?? obj.alias ?? '');
+    const fieldName = String(obj.field ?? obj.fieldName ?? obj.field_name ?? '');
+    return {
+      sourceId,
+      field: sourceId && fieldName ? fieldName : '',
+      normalized: sourceId && fieldName ? `${sourceId}.${fieldName}` : JSON.stringify(raw),
+      display: `${sourceId || '?'}.${fieldName || '?'} （对象格式：${JSON.stringify(raw)}）`,
+    };
+  }
+  return { sourceId: '', field: '', normalized: String(raw ?? ''), display: JSON.stringify(raw ?? '(空)') };
+}
+
 function validateModel(model: JsonRecord): string[] {
   const errors: string[] = [];
   if (!model.report?.id || !model.report?.name) errors.push('模型缺少报表 id/name');
@@ -119,12 +150,9 @@ function validateModel(model: JsonRecord): string[] {
   }
   for (const relation of model.relationships ?? []) {
     for (const endpoint of ['from', 'to'] as const) {
-      const raw = String(relation[endpoint] ?? '');
-      const split = raw.indexOf('.');
-      const sourceId = split > 0 ? raw.slice(0, split) : '';
-      const field = split > 0 ? raw.slice(split + 1) : '';
-      if (!sourceId || !field || !sources.get(sourceId)?.has(field)) {
-        errors.push(`关联端点不在字段白名单中：${raw || '(空)'}`);
+      const ep = parseEndpoint(relation[endpoint]);
+      if (!ep.sourceId || !ep.field || !sources.get(ep.sourceId)?.has(ep.field)) {
+        errors.push(`关联端点不在字段白名单中：${ep.display}`);
       }
     }
   }
@@ -313,14 +341,24 @@ export async function readReportModel(
       keys: (model.result_grain?.keys ?? []).map(String),
     },
     sources,
-    relationships: (model.relationships ?? []).map((relationship: JsonRecord) => ({
-      from: String(relationship.from ?? ''),
-      to: String(relationship.to ?? ''),
+    relationships: (model.relationships ?? []).map((relationship: JsonRecord) => {
+      // Accept split-key format {from_source, from_field, to_source, to_field}
+      const resolveEp = (key: string, srcKey: string, fldKey: string) => {
+        if (relationship[key] != null) return relationship[key];
+        const src = relationship[srcKey];
+        const fld = relationship[fldKey];
+        if (src != null || fld != null) return { alias: src, field: fld };
+        return undefined;
+      };
+      return {
+      from: parseEndpoint(resolveEp('from', 'from_source', 'from_field') ?? resolveEp('from', 'from_alias', 'from_field')).normalized,
+      to: parseEndpoint(resolveEp('to', 'to_source', 'to_field') ?? resolveEp('to', 'to_alias', 'to_field')).normalized,
       type: normalizeRelationType(String(relationship.type ?? 'left')),
       cardinality: normalizeCardinality(String(relationship.cardinality ?? 'unknown')),
       grain: relationship.grain == null ? null : String(relationship.grain),
       fanoutRisk: Boolean(relationship.fanout_risk),
-    })),
+    };
+    }),
     filters: model.filters ?? [],
     metrics: model.metrics ?? [],
     comparison: model.comparison && typeof model.comparison === 'object'
@@ -415,20 +453,20 @@ export async function writeReportModel(
     if (!CARDINALITIES.has(relationship.cardinality)) {
       throw new ReportModelError('INVALID', `不支持的关系基数：${relationship.cardinality}`);
     }
-    for (const endpoint of [relationship.from, relationship.to]) {
-      const split = endpoint.indexOf('.');
-      const id = split > 0 ? endpoint.slice(0, split) : '';
-      const field = split > 0 ? endpoint.slice(split + 1) : '';
-      if (!selectedBySource.get(id)?.has(field)) {
-        throw new ReportModelError('INVALID', `关联端点不在已选字段中：${endpoint}`);
-      }
+    const epFrom = parseEndpoint(relationship.from);
+    const epTo = parseEndpoint(relationship.to);
+    if (!epFrom.sourceId || !epFrom.field || !selectedBySource.get(epFrom.sourceId)?.has(epFrom.field)) {
+      throw new ReportModelError('INVALID', `关联端点不在已选字段中：${epFrom.display}`);
     }
-    const key = `${relationship.from}->${relationship.to}`;
+    if (!epTo.sourceId || !epTo.field || !selectedBySource.get(epTo.sourceId)?.has(epTo.field)) {
+      throw new ReportModelError('INVALID', `关联端点不在已选字段中：${epTo.display}`);
+    }
+    const key = `${epFrom.normalized}->${epTo.normalized}`;
     if (relationKeys.has(key)) throw new ReportModelError('INVALID', `重复关联：${key}`);
     relationKeys.add(key);
     return {
-      from: relationship.from,
-      to: relationship.to,
+      from: epFrom.normalized,
+      to: epTo.normalized,
       type: normalizeRelationType(relationship.type),
       cardinality: normalizeCardinality(relationship.cardinality),
       grain: relationship.grain ?? null,

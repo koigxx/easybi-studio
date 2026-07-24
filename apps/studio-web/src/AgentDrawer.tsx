@@ -540,6 +540,34 @@ export function AgentDrawerProvider({
       .finally(() => setStarting(false));
   }, [jobId, reply, subscribe, currentProjectId, chat, confirmationAnswers]);
 
+  // Direct confirmation: accept all recommended answers without requiring per-question interaction.
+  const directConfirm = useCallback(() => {
+    if (!jobId || !chat.modelConfirmation) return;
+    const text = '统一确认以上字段、关联关系和业务口径，继续生成当前报表模型。';
+    const previousChat = chat;
+    const restoreAfterFailure = (error: unknown) => {
+      setChat(previousChat);
+      setBanner(String((error as { message?: unknown })?.message ?? error));
+    };
+    setBanner(null);
+    setChat((m) => ({
+      ...m,
+      status: 'RUNNING',
+      waitingQuestion: undefined,
+      lines: [...m.lines, { kind: 'user', text }],
+    }));
+    const since = eventCountRef.current;
+    agentApi
+      .reply(jobId, text, 'confirm_model', {
+        discovery_revision: chat.modelConfirmation.discovery_revision,
+        accept_recommended: true,
+        answers: {},
+        note: '',
+      })
+      .then(() => subscribe(jobId, since))
+      .catch(restoreAfterFailure);
+  }, [jobId, subscribe, chat]);
+
   // "终止" stops the current turn but keeps the conversation alive: the backend
   // settles the job to SUCCEEDED (resumable) and streams a job_completed, which
   // re-enables the input so the user can send another message. We deliberately
@@ -593,6 +621,7 @@ export function AgentDrawerProvider({
               setConfirmationAnswers((current) => ({ ...current, [questionId]: value }))
             }
             onSend={sendReply}
+            onDirectConfirm={directConfirm}
             onCancel={interrupt}
             onClose={() => setIsOpen(false)}
             onShowHistory={showHistory}
@@ -728,6 +757,7 @@ function DrawerView({
   onReply,
   onConfirmationAnswer,
   onSend,
+  onDirectConfirm,
   onCancel,
   onClose,
   onShowHistory,
@@ -749,6 +779,7 @@ function DrawerView({
   onReply: (v: string) => void;
   onConfirmationAnswer: (questionId: string, value: string) => void;
   onSend: () => void;
+  onDirectConfirm: () => void;
   onCancel: () => void;
   onClose: () => void;
   onShowHistory: () => void;
@@ -886,16 +917,35 @@ function DrawerView({
             chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
               ? '请一次性补充或确认全部字段、关联关系和业务口径；确认后将生成唯一当前模型。'
               : '请审阅确定模型；批准后将使用全新上下文编译查询和脚本。'}
-            <button
-              className="ide-btn ide-btn-primary ide-btn-sm"
-              onClick={onSend}
-              disabled={!confirmationReady}
-            >
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               {chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
-              chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION'
-                ? '统一确认并生成模型'
-                : '批准并开始编译'}
-            </button>
+              chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ? (
+                <>
+                  <button
+                    className="ide-btn ide-btn-primary ide-btn-sm"
+                    onClick={onDirectConfirm}
+                  >
+                    直接确认（接受全部推荐方案）
+                  </button>
+                  <button
+                    className="ide-btn ide-btn-sm"
+                    onClick={onSend}
+                    disabled={!confirmationReady}
+                    title="选择并调整各确认项后提交"
+                  >
+                    自定义确认
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="ide-btn ide-btn-primary ide-btn-sm"
+                  onClick={onSend}
+                  disabled={!confirmationReady}
+                >
+                  批准并开始编译
+                </button>
+              )}
+            </div>
           </div>
         )}
         <div className="chat-input-row">
