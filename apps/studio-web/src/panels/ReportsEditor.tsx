@@ -25,20 +25,20 @@ const ROLE_LABELS: Record<FieldRole, string> = {
   output: '输出',
   filter: '筛选',
   group: '分组',
-  metric: '指标',
+  metric: '聚合',
 };
 const ROLE_HINTS: Record<FieldRole, string> = {
-  output: '作为报表输出列',
+  output: '原样输出，不加工（如订单号、客户名）',
   filter: '作为可筛选项（操作符/控件由知识库语义自动推断）',
-  group: '作为分组维度（按此字段分组汇总，几组几行）',
-  metric: '作为聚合指标，由建模阶段确定来源、状态条件和去重键',
+  group: '作为分组维度（按此字段分组，一组一行）',
+  metric: '对该字段做聚合计算（COUNT/SUM/AVG 等），数据来源与去重方式由 AI 建模阶段确定',
 };
 const AGGREGATION_LABELS: Record<MetricAggregation, string> = {
-  count: '计数',
-  count_distinct: '去重计数',
-  sum: '求和',
-  avg: '平均值',
-  ratio: '比率',
+  count: '计数 COUNT',
+  count_distinct: '去重计数 COUNT DISTINCT',
+  sum: '求和 SUM',
+  avg: '平均值 AVG',
+  ratio: '比率 RATIO',
 };
 
 /**
@@ -518,12 +518,6 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                               opacity: isDragSource ? 0.4 : 1,
                               transition: 'opacity 0.15s',
                             }}
-                            draggable
-                            onDragStart={(e) => {
-                              setDragSource({ ri, fi });
-                              e.dataTransfer.effectAllowed = 'move';
-                              e.dataTransfer.setData('text/plain', `${ri}:${fi}`);
-                            }}
                             onDragOver={(e) => {
                               e.preventDefault();
                               e.dataTransfer.dropEffect = 'move';
@@ -538,10 +532,6 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                               }
                               setDragSource(null);
                             }}
-                            onDragEnd={() => {
-                              setDragSource(null);
-                              setDragOver(null);
-                            }}
                           >
                             {isDragOver && (
                               <div
@@ -554,8 +544,9 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                               />
                             )}
                             <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                              {/* Drag handle */}
+                              {/* Drag handle — only the grip is draggable so buttons keep their tooltips */}
                               <span
+                                draggable
                                 style={{
                                   cursor: 'grab',
                                   color: 'var(--ide-text-muted)',
@@ -564,7 +555,16 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                   flexShrink: 0,
                                   userSelect: 'none',
                                 }}
-                                title="拖拽调整字段顺序"
+                                data-tooltip="拖拽调整字段顺序"
+                                onDragStart={(e) => {
+                                  setDragSource({ ri, fi });
+                                  e.dataTransfer.effectAllowed = 'move';
+                                  e.dataTransfer.setData('text/plain', `${ri}:${fi}`);
+                                }}
+                                onDragEnd={() => {
+                                  setDragSource(null);
+                                  setDragOver(null);
+                                }}
                               >
                                 <GripVertical className="w-3.5 h-3.5" />
                               </span>
@@ -584,7 +584,7 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                       key={role}
                                       type="button"
                                       className={'ide-chip-toggle' + (on ? ' ide-chip-toggle-on' : '')}
-                                      title={ROLE_HINTS[role]}
+                                      data-tooltip={ROLE_HINTS[role]}
                                       onClick={() => toggleFieldRole(ri, fi, role)}
                                     >
                                       {ROLE_LABELS[role]}
@@ -603,7 +603,7 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                     return next;
                                   })
                                 }
-                                title={opened.has(key) ? '折叠描述与绑定' : '展开描述与绑定'}
+                                data-tooltip={opened.has(key) ? '折叠描述与绑定' : '展开描述与绑定'}
                                 style={{ padding: '2px 3px' }}
                               >
                                 <ChevronDown
@@ -620,7 +620,7 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                   className="ide-btn ide-btn-sm ide-btn-ghost"
                                   onClick={() => moveField(ri, fi, fi - 1)}
                                   disabled={fi === 0}
-                                  title="上移"
+                                  data-tooltip="上移"
                                   style={{ padding: '2px 3px' }}
                                 >
                                   <ArrowUp className="w-3 h-3" />
@@ -629,7 +629,7 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                   className="ide-btn ide-btn-sm ide-btn-ghost"
                                   onClick={() => moveField(ri, fi, fi + 1)}
                                   disabled={fi === r.requiredFields.length - 1}
-                                  title="下移"
+                                  data-tooltip="下移"
                                   style={{ padding: '2px 3px' }}
                                 >
                                   <ArrowDown className="w-3 h-3" />
@@ -642,7 +642,7 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                     requiredFields: r.requiredFields.filter((_, j) => j !== fi),
                                   })
                                 }
-                                title="删除字段"
+                                data-tooltip="删除字段"
                               >
                                 <X className="w-3.5 h-3.5" />
                               </button>
@@ -662,25 +662,32 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                   }}
                                 />
                                 {hasRole(f, 'metric') && (
-                                  <select
-                                    className="ide-input"
-                                    value={f.aggregation ?? 'count_distinct'}
-                                    onChange={(event) =>
-                                      updateFieldAggregation(
-                                        ri,
-                                        fi,
-                                        event.target.value as MetricAggregation,
-                                      )
-                                    }
-                                    style={{ marginLeft: 2, width: 150, fontSize: 11.5 }}
-                                    title="指标聚合方式"
+                                  <div
+                                    style={{ display: 'flex', gap: 6, alignItems: 'center', marginLeft: 2 }}
+                                    data-tooltip="聚合计算方式 — 建模阶段 AI 将按此方式对数据进行汇总计算"
                                   >
-                                    {METRIC_AGGREGATIONS.map((aggregation) => (
-                                      <option key={aggregation} value={aggregation}>
-                                        {AGGREGATION_LABELS[aggregation]}
-                                      </option>
-                                    ))}
-                                  </select>
+                                    <span style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', whiteSpace: 'nowrap' }}>
+                                      聚合方式
+                                    </span>
+                                    <select
+                                      className="ide-input"
+                                      value={f.aggregation ?? 'count_distinct'}
+                                      onChange={(event) =>
+                                        updateFieldAggregation(
+                                          ri,
+                                          fi,
+                                          event.target.value as MetricAggregation,
+                                        )
+                                      }
+                                      style={{ width: 170, fontSize: 11.5 }}
+                                    >
+                                      {METRIC_AGGREGATIONS.map((aggregation) => (
+                                        <option key={aggregation} value={aggregation}>
+                                          {AGGREGATION_LABELS[aggregation]}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
                                 )}
                                 <div
                                   style={{
@@ -712,7 +719,7 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
                                     <button
                                       className="ide-btn ide-btn-sm ide-btn-ghost"
                                       onClick={() => updateFieldBinding(ri, fi, '')}
-                                      title="删除绑定"
+                                      data-tooltip="删除绑定"
                                     >
                                       <X className="w-3.5 h-3.5" />
                                     </button>
