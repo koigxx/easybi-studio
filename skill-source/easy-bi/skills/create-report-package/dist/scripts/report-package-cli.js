@@ -1062,7 +1062,21 @@ export async function inspectReport(options) {
             distinct_keys: {},
             time_semantics: [],
             exclusions: [],
-            open_questions: blockers.map((blocker) => blocker.message),
+            open_questions: blockers.map((blocker) => ({
+                id: String(blocker.field_id ?? `q_unknown`),
+                question: String(blocker.message ?? ''),
+                options: Array.isArray(blocker.suggestions)
+                    ? blocker.suggestions.map((s) => ({ value: s, label: s }))
+                    : [],
+                recommended: null,
+                required: true,
+                affected_metrics: blocker.label ? [String(blocker.label)] : [],
+                impact: String(blocker.code === 'METRIC_REQUIRES_MODELING'
+                    ? '需要确定来源表、聚合方式、去重键和条件口径'
+                    : blocker.code === 'FIELD_NOT_FOUND'
+                        ? '该字段需确定为 computed/sql_expression 或通过 comparison 机制实现'
+                        : '待确认'),
+            })),
         },
         execution_plan: {
             status: "draft",
@@ -2785,10 +2799,30 @@ export async function initializeReportModel(options) {
         exclusions: plan.semantic_plan?.exclusions ?? [],
         recommended_strategy: plan.execution_plan?.strategy ?? "pending",
         query_contracts: initialQueryContracts(plan),
-        open_questions: [
-            ...(plan.semantic_plan?.open_questions ?? []),
-            ...(plan.blockers ?? []).map((blocker) => blocker.message),
-        ],
+        open_questions: (() => {
+            const seen = new Map();
+            const add = (item) => { seen.set(String(item.id ?? ''), item); };
+            for (const item of (plan.semantic_plan?.open_questions ?? []))
+                add(item);
+            for (const blocker of (plan.blockers ?? [])) {
+                add({
+                    id: String(blocker.field_id ?? `q_${String(blocker.code ?? 'unknown')}`),
+                    question: String(blocker.message ?? ''),
+                    options: Array.isArray(blocker.suggestions)
+                        ? blocker.suggestions.map((s) => ({ value: s, label: s }))
+                        : [],
+                    recommended: null,
+                    required: true,
+                    affected_metrics: blocker.label ? [String(blocker.label)] : [],
+                    impact: String(blocker.code === 'METRIC_REQUIRES_MODELING'
+                        ? '需要确定来源表、聚合方式、去重键和条件口径'
+                        : blocker.code === 'FIELD_NOT_FOUND'
+                            ? '该字段需确定为 computed/sql_expression 或通过 comparison 机制实现'
+                            : '待确认'),
+                });
+            }
+            return [...seen.values()];
+        })(),
         approval: { status: "draft" },
     };
     await writeJson(resolve(options.out), model);

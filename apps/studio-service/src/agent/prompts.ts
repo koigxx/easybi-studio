@@ -100,7 +100,9 @@ export function buildReportPhasePrompt(
       'recommended_strategy 只能是 sql、enrichment、group_queries、script 之一；group_transform 是执行步骤而不是策略值。' +
       '按 requirement_intents 和 candidate_sets 为每个指标生成 metric_hypotheses（来源、聚合、条件、去重键、证据、置信度），并生成必要的 relationship_hypotheses。' +
       'selected_tables 只能包含实际采用的来源表，每张表必须至少选择一个 Context Pack 中真实存在的字段；不得加入 excluded/无关表，不得虚构候选字段或关联字段。' +
-      '只有未明确的业务口径才写成结构化 open_questions：id、question、options、recommended、required、affected_metrics、impact；字段是否存在、Context 扩展和执行策略属于技术决策，必须自行验证或推荐，不得向用户提问。' +
+      '只有未明确的业务口径才写成结构化 open_questions。每个问题必须是 JSON 对象 {id, question, options, recommended, required, affected_metrics, impact}，禁止写成纯字符串。' +
+      'id 必须唯一且有语义（如 q_order_semantics），不能为空或重复；options 至少 2 项且每项含 value/label；question 是完整自然语言问题。' +
+      '字段是否存在、Context 扩展和执行策略属于技术决策，必须自行验证或推荐，不得向用户提问。' +
       '不要调用交互式提问，也不要等待用户输入，写完产物后结束本阶段。' +
       '不得生成 report-model.json、SQL、脚本或报表包。';
   }

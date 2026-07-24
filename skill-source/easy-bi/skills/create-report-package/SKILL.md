@@ -115,7 +115,25 @@ Extend the existing plan; do not repeatedly rerun a broad discovery pass.
 The discovery Agent must output only the draft result grain, source field whitelist,
 relationships/cardinalities, `metric_hypotheses`, metric distinct keys, time/exclusion semantics,
 recommended strategy, `relationship_hypotheses`, and structured `open_questions`
-(`id/question/options/recommended/required/affected_metrics/impact`). It must not call an interactive question tool,
+(`id/question/options/recommended/required/affected_metrics/impact`). Each `open_questions` entry
+MUST be a JSON object — strings are rejected by the validator. Example:
+
+```json
+{
+  "id": "q_order_count_semantics",
+  "question": "「订单数」的统计口径如何定义？",
+  "options": [
+    { "value": "all_orders", "label": "所有订单（含已取消）" },
+    { "value": "valid_only", "label": "仅有效订单（排除取消/拒收）" }
+  ],
+  "recommended": "valid_only",
+  "required": true,
+  "affected_metrics": ["订单数总和"],
+  "impact": "决定订单数 COUNT 的 WHERE 条件"
+}
+```
+
+It must not call an interactive question tool,
 generate SQL, scripts, or packages. Write it to
 `work/report-model/<report-id>/<revision>/discovery-model.json`, then end the phase. Studio
 runs `validate-stage --phase discovery` and shows the only user confirmation boundary.
@@ -138,7 +156,9 @@ node dist/scripts/report-package-cli.js build-phase-context \
 The modeling Agent resolves the confirmed model, semantic plan, execution plan, and one
 `query_contract` per independently compiled query. Write them only to
 `work/report-model/<report-id>/<revision>/{report-model.json,semantic-plan.json,execution-plan.json}`
-and clear `open_questions`. `report-model.json.confirmation` must copy the discovery revision and
+and clear `open_questions`. **Never write modeling output to `work/report-build/`** — that
+directory is exclusively for the separate "Generate Report" action (see §5).
+`report-model.json.confirmation` must copy the discovery revision and
 confirmation hash from `confirmation.json`. There is no second user approval: this immutable
 artifact is the only approval input. Studio deterministically validates, approves, and promotes
 the result.

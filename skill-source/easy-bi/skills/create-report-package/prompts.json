@@ -7,7 +7,7 @@
       "label": "构建报表建模",
       "hint": "按报表需求检索知识库，统一确认指标、字段和关系，生成唯一当前模型",
       "write": true,
-      "prompt": "阅读 skills/create-report-package/SKILL.md，只执行报表建模。Studio 已根据报表配置生成有字段数和字节预算的 discovery Context Pack；先用候选字段、枚举与关联证据形成 metric_hypotheses 和 relationship_hypotheses，再把来源字段、聚合、去重键、关系基数、筛选分组、时间与排除口径中的所有不清晰事项写成结构化 open_questions，一次统一确认后只使用 confirmation.json 完成模型。本动作最终只生成该报表唯一当前模型，禁止生成 SQL、脚本或报表包；不得递归读取整个 knowledge、扫描样本、历史对话或无关报表。"
+      "prompt": "阅读 skills/create-report-package/SKILL.md，只执行报表建模。Studio 已根据报表配置生成有字段数和字节预算的 discovery Context Pack；先用候选字段、枚举与关联证据形成 metric_hypotheses 和 relationship_hypotheses，再把来源字段、聚合、去重键、关系基数、筛选分组、时间与排除口径中的所有不清晰事项写成结构化 open_questions。\n\n关键约束：\n1. 每个 open_question 必须是 JSON 对象（{id, question, options, recommended, required, affected_metrics, impact}），绝对不能写成纯字符串；id 必须唯一且有语义（如 q_order_count），不可为空或重复。\n2. 建模产物（report-model.json 等）写入 work/report-model/<id>/<rev>/，禁止写入 work/report-build/（那是生成报表包的目录，本阶段不得触碰）。\n3. 一次统一确认后只使用 confirmation.json 完成模型。\n\n本动作最终只生成该报表唯一当前模型，禁止生成 SQL、脚本或报表包；不得递归读取整个 knowledge、扫描样本、历史对话或无关报表。"
     },
     {
       "action": "build-report-package",
