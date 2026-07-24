@@ -69,7 +69,7 @@ export function ReportModelEditor({
       (model?.sources ?? []).flatMap((source) =>
         source.fields.map((field) => ({
           value: `${source.id}.${field.name}`,
-          label: `${source.alias || source.id}.${field.label || field.name}`,
+          label: `${source.id}.${field.name}(${field.label || field.name})`,
         })),
       ),
     [model],
