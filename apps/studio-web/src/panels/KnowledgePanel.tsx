@@ -209,7 +209,7 @@ function CatalogViewer({
   const tables = useMemo(() => allTables(overview), [overview]);
   const { startAction } = useAgentDrawer();
 
-  const [tiers, setTiers] = useState<Set<Tier>>(new Set<Tier>(['hot', 'warm', 'cold']));
+  const [tiers, setTiers] = useState<Set<Tier>>(new Set<Tier>(['hot', 'warm']));
   const [query, setQuery] = useState('');
   const [dbFilter, setDbFilter] = useState<string | null>(null);
   const [selectedTable, setSelectedTable] = useState<string | null>(null);

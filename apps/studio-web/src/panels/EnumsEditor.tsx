@@ -24,6 +24,8 @@ import {
   completeness,
   renameDictionary,
   rebindDictionary,
+  addBinding,
+  removeBinding,
   setDictionaryValues,
   type EnumBindingRow,
 } from './enums-view.js';
@@ -49,6 +51,9 @@ export function EnumsEditor({ project }: { project: Project }): JSX.Element {
   const [jsonError, setJsonError] = useState<string | null>(null);
   // Strict-validation result panel (from the 校验 button), dismissable.
   const [checkIssues, setCheckIssues] = useState<string[] | null>(null);
+  // New binding form state.
+  const [showNewBinding, setShowNewBinding] = useState(false);
+  const [newBinding, setNewBinding] = useState({ profileId: '', database: '', table: '', field: '', note: '', dictionary_name: '' });
   const { startAction } = useAgentDrawer();
   const refreshNonce = useAgentRefresh();
 
@@ -474,16 +479,80 @@ export function EnumsEditor({ project }: { project: Project }): JSX.Element {
             />
           ) : (
             <>
-              <div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>
-                {filteredRows.length} / {rows.length} 条绑定
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>
+                  {filteredRows.length} / {rows.length} 条绑定
+                </span>
+                <button
+                  className="ide-btn ide-btn-sm"
+                  onClick={() => {
+                    setShowNewBinding(!showNewBinding);
+                    if (showNewBinding) setNewBinding({ profileId: '', database: '', table: '', field: '', note: '', dictionary_name: '' });
+                  }}
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  新增绑定
+                </button>
               </div>
-              {filteredRows.length === 0 ? (
+              {showNewBinding && (
+                <div className="ide-card" style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: 10 }}>
+                  <div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>新增字段绑定</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+                    <label style={{ fontSize: 12 }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)' }}>连接</span>
+                      <input className="ide-input" value={newBinding.profileId} placeholder="连接名" onChange={(e) => setNewBinding({ ...newBinding, profileId: e.target.value })} />
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)' }}>数据库</span>
+                      <input className="ide-input" value={newBinding.database} placeholder="数据库名" onChange={(e) => setNewBinding({ ...newBinding, database: e.target.value })} />
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)' }}>表</span>
+                      <input className="ide-input" value={newBinding.table} placeholder="表名" onChange={(e) => setNewBinding({ ...newBinding, table: e.target.value })} />
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)' }}>字段</span>
+                      <input className="ide-input" value={newBinding.field} placeholder="字段名" onChange={(e) => setNewBinding({ ...newBinding, field: e.target.value })} />
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)' }}>字段说明</span>
+                      <input className="ide-input" value={newBinding.note} placeholder="可选" onChange={(e) => setNewBinding({ ...newBinding, note: e.target.value })} />
+                    </label>
+                    <label style={{ fontSize: 12 }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)' }}>枚举名称</span>
+                      <input className="ide-input" value={newBinding.dictionary_name} placeholder="选择或输入枚举名" list="enum-names-list" onChange={(e) => setNewBinding({ ...newBinding, dictionary_name: e.target.value })} />
+                    </label>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                    <button className="ide-btn ide-btn-sm" onClick={() => { setShowNewBinding(false); setNewBinding({ profileId: '', database: '', table: '', field: '', note: '', dictionary_name: '' }); }}>取消</button>
+                    <button
+                      className="ide-btn ide-btn-sm ide-btn-primary"
+                      disabled={!newBinding.profileId || !newBinding.database || !newBinding.table || !newBinding.field || !newBinding.dictionary_name}
+                      onClick={() => {
+                        const tableId = `${newBinding.profileId}/${newBinding.database}/${newBinding.table}`;
+                        setDoc(addBinding(doc!, { table_id: tableId, field: newBinding.field, dictionary_name: newBinding.dictionary_name, note: newBinding.note || undefined }));
+                        setShowNewBinding(false);
+                        setNewBinding({ profileId: '', database: '', table: '', field: '', note: '', dictionary_name: '' });
+                        setStatus(`已添加绑定 ${tableId}.${newBinding.field} → ${newBinding.dictionary_name}（尚未保存）`);
+                      }}
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      添加
+                    </button>
+                  </div>
+                </div>
+              )}
+              {filteredRows.length === 0 && !showNewBinding ? (
                 <EmptyState
                   title="暂无枚举绑定"
-                  hint="点上方「初始化枚举」从数据库生成绑定与候选 code。"
+                  hint="点上方「初始化枚举」从数据库生成绑定与候选 code，或点「新增绑定」手动添加。"
                 />
               ) : (
             <div className="ide-card ide-scroll" style={{ padding: 0, overflow: 'auto', maxHeight: 560 }}>
+              {/* Datalist for enum name autocomplete */}
+              <datalist id="enum-names-list">
+                {names.map((n) => <option key={n} value={n} />)}
+              </datalist>
               <table className="ide-table">
                 <thead>
                   <tr>
@@ -492,9 +561,9 @@ export function EnumsEditor({ project }: { project: Project }): JSX.Element {
                     <th>表</th>
                     <th>字段</th>
                     <th>字段说明</th>
-                    <th>枚举名称</th>
+                    <th style={{ minWidth: 120 }}>枚举名称</th>
                     <th style={{ textAlign: 'right' }}>映射</th>
-                    <th style={{ width: 28 }} />
+                    <th style={{ width: 60 }} />
                   </tr>
                 </thead>
                 <tbody>
@@ -503,7 +572,6 @@ export function EnumsEditor({ project }: { project: Project }): JSX.Element {
                     return (
                       <tr
                         key={`${r.table_id} ${r.field}`}
-                        onClick={() => setSelectedDict(r.dictionary_name)}
                         style={{ cursor: 'pointer' }}
                         title="点击配置该枚举的 code→中文 映射"
                       >
@@ -517,7 +585,9 @@ export function EnumsEditor({ project }: { project: Project }): JSX.Element {
                             key={`${r.table_id}/${r.field}/${r.dictionary_name}`}
                             className="ide-input"
                             defaultValue={r.dictionary_name}
-                            title="修改单个字段的枚举名称可拆分或合并字典"
+                            list="enum-names-list"
+                            title="修改枚举名称可拆分/合并字典；输入时可搜索已有枚举"
+                            style={{ minWidth: 110 }}
                             onKeyDown={(event) => {
                               if (event.key === 'Enter') event.currentTarget.blur();
                             }}
@@ -541,16 +611,33 @@ export function EnumsEditor({ project }: { project: Project }): JSX.Element {
                             }}
                           />
                         </td>
-                        <td style={{ textAlign: 'right' }}>
+                        <td style={{ textAlign: 'right' }} onClick={() => setSelectedDict(r.dictionary_name)}>
                           <Badge kind={c.total > 0 && c.filled === c.total ? 'success' : 'warning'}>
                             {c.filled}/{c.total}
                           </Badge>
                         </td>
-                        <td>
-                          <ChevronRight
-                            className="w-3.5 h-3.5"
-                            style={{ color: 'var(--ide-text-tertiary)' }}
-                          />
+                        <td style={{ whiteSpace: 'nowrap' }}>
+                          <button
+                            className="ide-btn ide-btn-sm ide-btn-ghost"
+                            onClick={() => setSelectedDict(r.dictionary_name)}
+                            title="编辑 code→中文 映射"
+                            style={{ padding: '2px 4px' }}
+                          >
+                            <ChevronRight className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)' }} />
+                          </button>
+                          <button
+                            className="ide-btn ide-btn-sm ide-btn-ghost"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (!window.confirm(`确认删除绑定「${r.table}.${r.field} → ${r.dictionary_name}」？\n不会删除字典本身。`)) return;
+                              setDoc(removeBinding(doc!, r.table_id, r.field));
+                              setStatus(`已移除绑定 ${r.table}.${r.field}（尚未保存）`);
+                            }}
+                            title="删除该绑定（不删除字典）"
+                            style={{ padding: '2px 4px' }}
+                          >
+                            <X className="w-3 h-3" style={{ color: 'var(--ide-text-tertiary)' }} />
+                          </button>
                         </td>
                       </tr>
                     );

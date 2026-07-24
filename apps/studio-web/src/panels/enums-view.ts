@@ -109,6 +109,31 @@ export function rebindDictionary(
   return { ...doc, bindings, dictionaries };
 }
 
+/** Add a new binding row. If the dictionary doesn't exist yet, creates an empty one. */
+export function addBinding(
+  doc: EnumsDocument,
+  binding: { table_id: string; field: string; dictionary_name: string; note?: string },
+): EnumsDocument {
+  const bindings = [...(doc.bindings ?? []), { ...binding }];
+  const exists = (doc.dictionaries ?? []).some((d) => d.name === binding.dictionary_name);
+  const dictionaries = exists
+    ? doc.dictionaries
+    : [...(doc.dictionaries ?? []), { name: binding.dictionary_name, values: [] }];
+  return { ...doc, bindings, dictionaries };
+}
+
+/** Remove a single binding by table_id + field. */
+export function removeBinding(
+  doc: EnumsDocument,
+  tableId: string,
+  field: string,
+): EnumsDocument {
+  const bindings = (doc.bindings ?? []).filter(
+    (b) => !(b.table_id === tableId && b.field === field),
+  );
+  return { ...doc, bindings };
+}
+
 /** Replace one dictionary's values (immutably). Creates the dictionary if absent. */
 export function setDictionaryValues(
   doc: EnumsDocument,
