@@ -581,6 +581,61 @@ body {
   box-shadow: var(--ide-shadow-pop, -8px 0 24px rgba(0, 0, 0, 0.18));
   z-index: 120;
 }
+/* Floating ball — always-visible draggable AI entry point */
+.chat-floating-ball {
+  position: fixed;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--ide-bg-elevated);
+  border: 1px solid var(--ide-border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  user-select: none;
+  z-index: 118;
+  transition: box-shadow 0.15s;
+}
+.chat-floating-ball:active {
+  cursor: grabbing;
+}
+.chat-floating-ball:hover {
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+}
+
+/* Pulse ring — processing (green glow) */
+.chat-floating-ball--busy {
+  animation: float-ball-glow 2s ease-in-out infinite;
+}
+@keyframes float-ball-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(31, 170, 106, 0.35); }
+  50% { box-shadow: 0 0 0 10px rgba(31, 170, 106, 0); }
+}
+
+/* Amber border — waiting for confirmation */
+.chat-floating-ball--waiting {
+  border-color: var(--state-warning, #f59e0b);
+  box-shadow: 0 0 0 3px var(--state-warning-soft, rgba(201, 134, 16, 0.16));
+}
+
+/* Amber dot badge (waiting indicator) */
+.chat-floating-ball-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--state-warning, #f59e0b);
+  border: 2px solid var(--ide-bg-elevated);
+  animation: float-ball-badge-pulse 1.5s ease-in-out infinite;
+}
+@keyframes float-ball-badge-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.25); }
+}
 .chat-header {
   display: flex;
   align-items: center;

@@ -106,6 +106,157 @@ export const SSE_EVENT_NAMES: JobEvent['type'][] = [
   'job_failed',
 ];
 
+/* ============================================================
+   FloatingBall — draggable always-visible entry point.
+   Rendered outside the drawer; hidden when the drawer is open.
+   ============================================================ */
+
+function FloatingBall({
+  visible,
+  busy,
+  needsConfirmation,
+  onClick,
+}: {
+  visible: boolean;
+  busy: boolean;
+  needsConfirmation: boolean;
+  onClick: () => void;
+}): JSX.Element {
+  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const [ready, setReady] = useState(false);
+  const dragRef = useRef({ active: false, sx: 0, sy: 0, px: 0, py: 0 });
+  const movedRef = useRef(false);
+  const onClickRef = useRef(onClick);
+  onClickRef.current = onClick;
+
+  // Initial position: bottom-right, computed after mount so window dimensions are known.
+  useEffect(() => {
+    if (!ready) {
+      setPos({ x: window.innerWidth - 72, y: window.innerHeight - 72 });
+      setReady(true);
+    }
+  }, [ready]);
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      if (!dragRef.current.active) return;
+      const dx = e.clientX - dragRef.current.sx;
+      const dy = e.clientY - dragRef.current.sy;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) movedRef.current = true;
+      setPos({
+        x: Math.max(0, Math.min(window.innerWidth - 48, dragRef.current.px + dx)),
+        y: Math.max(0, Math.min(window.innerHeight - 48, dragRef.current.py + dy)),
+      });
+    };
+    const onUp = () => {
+      if (!dragRef.current.active) return;
+      dragRef.current.active = false;
+      if (!movedRef.current) {
+        onClickRef.current();
+      } else {
+        // Snap to nearest edge
+        setPos((prev) => ({
+          ...prev,
+          x: prev.x < window.innerWidth / 2 ? 24 : window.innerWidth - 72,
+        }));
+      }
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handlePointerDown = (e: React.MouseEvent) => {
+    dragRef.current = {
+      active: true,
+      sx: e.clientX,
+      sy: e.clientY,
+      px: pos.x,
+      py: pos.y,
+    };
+    movedRef.current = false;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = 'grabbing';
+    e.preventDefault();
+  };
+
+  // Touch support
+  const handleTouchStart = (e: React.TouchEvent) => {
+    const t = e.touches[0];
+    if (!t) return;
+    dragRef.current = { active: true, sx: t.clientX, sy: t.clientY, px: pos.x, py: pos.y };
+    movedRef.current = false;
+  };
+  useEffect(() => {
+    const onTouchMove = (e: TouchEvent) => {
+      if (!dragRef.current.active) return;
+      const t = e.touches[0];
+      if (!t) return;
+      const dx = t.clientX - dragRef.current.sx;
+      const dy = t.clientY - dragRef.current.sy;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) movedRef.current = true;
+      setPos({
+        x: Math.max(0, Math.min(window.innerWidth - 48, dragRef.current.px + dx)),
+        y: Math.max(0, Math.min(window.innerHeight - 48, dragRef.current.py + dy)),
+      });
+    };
+    const onTouchEnd = () => {
+      if (!dragRef.current.active) return;
+      dragRef.current.active = false;
+      if (!movedRef.current) {
+        onClickRef.current();
+      } else {
+        setPos((prev) => ({
+          ...prev,
+          x: prev.x < window.innerWidth / 2 ? 24 : window.innerWidth - 72,
+        }));
+      }
+    };
+    window.addEventListener('touchmove', onTouchMove);
+    window.addEventListener('touchend', onTouchEnd);
+    return () => {
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', onTouchEnd);
+    };
+  }, []);
+
+  if (!ready) return <></>;
+
+  const ringClass = busy
+    ? 'chat-floating-ball--busy'
+    : needsConfirmation
+      ? 'chat-floating-ball--waiting'
+      : '';
+
+  return (
+    <div
+      className={`chat-floating-ball ${ringClass}`}
+      style={{
+        left: pos.x,
+        top: pos.y,
+        opacity: visible ? 1 : 0,
+        pointerEvents: visible ? 'auto' : 'none',
+        transform: visible ? 'scale(1)' : 'scale(0.4)',
+        transition: visible
+          ? ''
+          : 'opacity 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease',
+      }}
+      onMouseDown={handlePointerDown}
+      onTouchStart={handleTouchStart}
+      title="AI 助手"
+    >
+      <Bot className="w-5 h-5" style={{ color: 'var(--ide-accent)' }} />
+      {needsConfirmation && <span className="chat-floating-ball-badge" />}
+    </div>
+  );
+}
+
 export function AgentDrawerProvider({
   children,
   currentProjectId,
@@ -126,6 +277,18 @@ export function AgentDrawerProvider({
   const [history, setHistory] = useState<AgentJob[] | null>(null);
   // Bumped on artifact/checkpoint/completion events so panels auto-reload.
   const [refreshNonce, setRefreshNonce] = useState(0);
+
+  // Auto-open drawer when AI needs user confirmation (ball is visible but agent is waiting).
+  useEffect(() => {
+    const needsConfirmation =
+      chat.status === 'WAITING_FOR_USER' ||
+      chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
+      chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ||
+      chat.phase === 'AWAITING_MODEL_APPROVAL';
+    if (!isOpen && needsConfirmation) {
+      setIsOpen(true);
+    }
+  }, [isOpen, chat.status, chat.phase]);
   const esRef = useRef<EventSource | null>(null);
   // Mirror of chat.eventCount readable synchronously inside callbacks, so a reply's
   // re-subscribe knows how many server events were already consumed (the SSE `since`).
@@ -392,9 +555,22 @@ export function AgentDrawerProvider({
     [startAction, open, startFreeChat, refreshNonce],
   );
 
+  const needsConfirmation =
+    chat.status === 'WAITING_FOR_USER' ||
+    chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
+    chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ||
+    chat.phase === 'AWAITING_MODEL_APPROVAL';
+  const busy = chat.status === 'RUNNING' || chat.status === 'QUEUED' || starting;
+
   return (
     <AgentDrawerContext.Provider value={ctxValue}>
       {children}
+      <FloatingBall
+        visible={!isOpen}
+        busy={busy}
+        needsConfirmation={needsConfirmation}
+        onClick={() => setIsOpen(true)}
+      />
       {isOpen && (
         <>
           {/* Backdrop: closes on click; also stops the drawer looking transparent
@@ -411,8 +587,8 @@ export function AgentDrawerProvider({
             hasJob={jobId !== null}
             isFreeChat={activeAction === 'free-chat'}
             history={history}
-            onReply={setReply}
             confirmationAnswers={confirmationAnswers}
+            onReply={setReply}
             onConfirmationAnswer={(questionId, value) =>
               setConfirmationAnswers((current) => ({ ...current, [questionId]: value }))
             }
@@ -622,6 +798,9 @@ function DrawerView({
           <span className={`ide-badge ide-badge-${statusKind}`}>{statusText(chat.status)}</span>
         )}
         <div style={{ flex: 1 }} />
+        <button className="ide-btn ide-btn-sm" title="新建对话" onClick={() => { onNewChat(); }}>
+          <Plus className="w-4 h-4" />
+        </button>
         <button
           className={'ide-btn ide-btn-sm' + (view === 'history' ? ' ide-btn-primary' : '')}
           title="历史对话"
@@ -629,7 +808,7 @@ function DrawerView({
         >
           <History className="w-4 h-4" />
         </button>
-        <button className="ide-btn ide-btn-sm" title="收起（任务继续后台）" onClick={onClose}>
+        <button className="ide-btn ide-btn-sm" title="关闭面板（对话保留在后台）" onClick={onClose}>
           <X className="w-4 h-4" />
         </button>
       </div>
@@ -676,6 +855,18 @@ function DrawerView({
                 <ChatLineView key={i} line={row} />
               ),
             )}
+
+            {/* Confirmation panel — inside scrollable body so it doesn't overflow */}
+            {(chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
+              chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION') &&
+              chat.modelConfirmation && (
+                <ModelConfirmationPanel
+                  confirmation={chat.modelConfirmation}
+                  answers={confirmationAnswers}
+                  onAnswer={onConfirmationAnswer}
+                />
+              )}
+
             {busy && (
               <div className="chat-typing">
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -686,15 +877,6 @@ function DrawerView({
 
           {/* Footer */}
           <div className="chat-footer">
-        {(chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
-          chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION') &&
-          chat.modelConfirmation && (
-            <ModelConfirmationPanel
-              confirmation={chat.modelConfirmation}
-              answers={confirmationAnswers}
-              onAnswer={onConfirmationAnswer}
-            />
-          )}
         {chat.status === 'WAITING_FOR_USER' && chat.waitingQuestion && (
           <div className="chat-waiting">{chat.waitingQuestion}</div>
         )}

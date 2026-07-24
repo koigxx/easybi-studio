@@ -135,7 +135,10 @@ MUST be a JSON object — strings are rejected by the validator. Example:
 
 It must not call an interactive question tool,
 generate SQL, scripts, or packages. Write it to
-`work/report-model/<report-id>/<revision>/discovery-model.json`, then end the phase. Studio
+`work/report-model/<report-id>/<revision>/discovery-model.json`, then end the phase.
+**JSON hygiene**: JSON string values must not contain unescaped ASCII `"` or
+Chinese `""` quotation marks — use `「」` for inline quoting instead. After
+writing, always validate with `python3 -m json.tool <file>` before ending. Studio
 runs `validate-stage --phase discovery` and shows the only user confirmation boundary.
 
 Persist that response before starting a provider-fresh modeling Agent:

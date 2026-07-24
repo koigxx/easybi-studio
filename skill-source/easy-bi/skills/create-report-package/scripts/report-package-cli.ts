@@ -79,7 +79,22 @@ function requiredOption(
 }
 
 async function readJson(path: string): Promise<JsonRecord> {
-  return JSON.parse(await readFile(path, "utf8")) as JsonRecord;
+  const raw = await readFile(path, "utf8");
+  try {
+    return JSON.parse(raw) as JsonRecord;
+  } catch (error) {
+    const msg = error instanceof SyntaxError ? error.message : String(error);
+    // Extract position from Node's JSON.parse error (e.g. "at position 9067")
+    const posMatch = msg.match(/at position (\d+)/);
+    if (posMatch) {
+      const pos = Number(posMatch[1]);
+      const start = Math.max(0, pos - 60);
+      const end = Math.min(raw.length, pos + 60);
+      const ctx = raw.slice(start, end).replace(/\n/g, "\\n");
+      throw new Error(`JSON 解析失败（位置 ${pos} 附近）：「${ctx}」—— ${msg}。请检查该位置是否有未转义的直双引号 " 或中文弯引号 ""，应改用 「」`);
+    }
+    throw error;
+  }
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
@@ -1277,7 +1292,7 @@ export async function inspectReport(options: {
     },
     execution_plan: {
       status: "draft",
-      strategy: sourceTables.length <= 1 ? "sql" : "undecided",
+      strategy: sourceTables.length <= 1 ? "sql" : "group_queries",
       steps: sourceTables.length <= 1 && sourceTables.length > 0
         ? [{ id: "Q1", type: "sql", description: `查询 ${sourceTables[0]!.database}.${sourceTables[0]!.table} 并输出报表字段` }]
         : [],
@@ -3167,7 +3182,7 @@ export async function initializeReportModel(options: { plan: string; out: string
     filters: plan.parameters ?? [],
     time_semantics: plan.semantic_plan?.time_semantics ?? [],
     exclusions: plan.semantic_plan?.exclusions ?? [],
-    recommended_strategy: plan.execution_plan?.strategy ?? "pending",
+    recommended_strategy: plan.execution_plan?.strategy ?? "sql",
     query_contracts: initialQueryContracts(plan),
     open_questions: (() => {
       const seen = new Map<string, JsonRecord>();
@@ -3726,7 +3741,7 @@ export async function buildPhaseContext(options: {
       max_tables: options.phase === "query" ? 3 : options.phase === "discovery" ? 6 : 12,
       max_fields: options.phase === "query" ? 40 : options.phase === "discovery" ? 80 : 120,
       max_reference_sections: 2,
-      max_context_bytes: 100_000,
+      max_context_bytes: Math.max(100_000, ((plan.fields ?? []).length || 0) * 6_000 + 40_000),
     },
     forbidden_inputs: ["knowledge/scans", "历史聊天", "连接配置", "无关报表", "先前失败脚本"],
   };
@@ -5134,6 +5149,25 @@ export async function configurePlan(
     plan.custom_logic.required = false;
     plan.custom_logic.mode = "identity";
   }
+  // Comparison (环比/同比) requires group transform regardless of field kinds.
+  if (plan.comparison?.enabled) {
+    plan.custom_logic.required = true;
+    plan.custom_logic.mode = "group";
+    // Auto-derive group_keys from plan parameters when none are declared.
+    if (!(plan.custom_logic.group_keys ?? []).length) {
+      const paramKeys = (plan.parameters ?? [])
+        .filter((p: JsonRecord) => (p.roles ?? []).includes("group"))
+        .map((p: JsonRecord) => String(p.id));
+      const fieldKeys = (plan.fields ?? [])
+        .filter((f: JsonRecord) => (f.roles ?? []).includes("group"))
+        .map((f: JsonRecord) => String(f.id));
+      plan.custom_logic.group_keys = [...new Set([...paramKeys, ...fieldKeys])];
+      // Fallback: use the period_param field as the minimum grouping key.
+      if (!plan.custom_logic.group_keys.length && plan.comparison.period_param) {
+        plan.custom_logic.group_keys = [String(plan.comparison.period_param)];
+      }
+    }
+  }
 
   const errors = validatePlanV2(plan);
   if (errors.length) {
@@ -5708,7 +5742,7 @@ function buildTransformFiles(plan: JsonRecord): {
       );
     }
     lines.push("  return output;", "}", "");
-    if (groupFields.length) {
+    if (groupFields.length || plan.comparison?.enabled) {
       lines.push(
         `export function transformGroup(rows${typed ? ": ReportRow[]" : ""}, context${typed ? ": { groupKey: unknown[] }" : ""})${typed ? ": ReportRow" : ""} {`,
         '  if (rows.length === 0) throw new Error("transformGroup 不接受空分组");',

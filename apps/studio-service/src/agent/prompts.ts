@@ -103,6 +103,7 @@ export function buildReportPhasePrompt(
       '只有未明确的业务口径才写成结构化 open_questions。每个问题必须是 JSON 对象 {id, question, options, recommended, required, affected_metrics, impact}，禁止写成纯字符串。' +
       'id 必须唯一且有语义（如 q_order_semantics），不能为空或重复；options 至少 2 项且每项含 value/label；question 是完整自然语言问题。' +
       '字段是否存在、Context 扩展和执行策略属于技术决策，必须自行验证或推荐，不得向用户提问。' +
+      'JSON 字符串值中禁止使用直双引号 " 和中文弯引号 ""，请改用 「」；写完 discovery-model.json 后务必用 python3 -m json.tool 校验一次。' +
       '不要调用交互式提问，也不要等待用户输入，写完产物后结束本阶段。' +
       '不得生成 report-model.json、SQL、脚本或报表包。';
   }
