@@ -212,6 +212,13 @@ export interface EditableModelRelationship {
   fanoutRisk?: boolean;
 }
 
+export interface ReportModelComparison {
+  enabled: boolean;
+  modes: string[];
+  period_param: string;
+  lookback_months: number;
+}
+
 export interface ReportModelDetail {
   reportId: string;
   reportName: string;
@@ -224,6 +231,7 @@ export interface ReportModelDetail {
   relationships: EditableModelRelationship[];
   filters: JsonRecord[];
   metrics: JsonRecord[];
+  comparison: ReportModelComparison | null;
   errors: string[];
 }
 
@@ -315,6 +323,14 @@ export async function readReportModel(
     })),
     filters: model.filters ?? [],
     metrics: model.metrics ?? [],
+    comparison: model.comparison && typeof model.comparison === 'object'
+      ? {
+          enabled: Boolean(model.comparison.enabled),
+          modes: Array.isArray(model.comparison.modes) ? model.comparison.modes.map(String) : [],
+          period_param: String(model.comparison.period_param ?? ''),
+          lookback_months: Number(model.comparison.lookback_months ?? 1),
+        }
+      : null,
     errors,
   };
 }
@@ -324,6 +340,7 @@ export interface ReportModelEdit {
   reviewedBy: string;
   sources: Array<{ id: string; fields: Array<{ name: string; role?: string }> }>;
   relationships: EditableModelRelationship[];
+  comparison?: ReportModelComparison | null;
 }
 
 export async function writeReportModel(
@@ -432,6 +449,17 @@ export async function writeReportModel(
       const selected = selectedByPhysical.get(sourceKey(source));
       if (selected) source.fields = selected;
     }
+  }
+  // Write comparison settings from the editor into the model.
+  if (edit.comparison) {
+    model.comparison = {
+      enabled: Boolean(edit.comparison.enabled),
+      modes: (edit.comparison.modes ?? []).map(String),
+      period_param: String(edit.comparison.period_param ?? ''),
+      lookback_months: Number(edit.comparison.lookback_months ?? 1),
+    };
+  } else if (edit.comparison === null) {
+    delete model.comparison;
   }
   model.generated_at = new Date().toISOString();
   model.open_questions = [];

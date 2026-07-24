@@ -119,6 +119,12 @@ export function registerWorkspaceStateRoutes(
         grain?: string | null;
         fanoutRisk?: boolean;
       }>;
+      comparison?: {
+        enabled: boolean;
+        modes: string[];
+        period_param: string;
+        lookback_months: number;
+      } | null;
     };
   }>('/api/easybi/projects/:projectId/reports/model', async (request, reply) => {
     const project = service.get(request.params.projectId);
@@ -153,6 +159,7 @@ export function registerWorkspaceStateRoutes(
           reviewedBy,
           sources: body.sources,
           relationships: body.relationships,
+          comparison: body.comparison,
         }),
       );
     } catch (err) {

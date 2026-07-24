@@ -30,6 +30,25 @@ function resolveWorkspace(
   return { workspaceRoot: project.workspaceRoot };
 }
 
+/** Resolve the effective connection settings by applying the active environment. */
+function resolveEffectiveProfile(rec: Record<string, unknown>): Record<string, unknown> {
+  const envName = rec.active_environment;
+  if (envName && typeof envName === 'string' && rec.environments && typeof rec.environments === 'object' && !Array.isArray(rec.environments)) {
+    const envs = rec.environments as Record<string, unknown>;
+    const env = envs[envName];
+    if (env && typeof env === 'object' && !Array.isArray(env)) {
+      const envRec = env as Record<string, unknown>;
+      return {
+        ...rec,
+        password: envRec.password ?? rec.password,
+        password_env: envRec.password_env ?? rec.password_env,
+        settings: { ...(rec.settings as Record<string, unknown> ?? {}), ...(envRec.settings as Record<string, unknown> ?? {}) },
+      };
+    }
+  }
+  return rec;
+}
+
 /** Extract db profiles as adapter inputs without echoing secrets. */
 function extractProfiles(value: unknown): Array<{ id: string; input: MysqlProfileInput }> {
   const out: Array<{ id: string; input: MysqlProfileInput }> = [];
@@ -39,7 +58,7 @@ function extractProfiles(value: unknown): Array<{ id: string; input: MysqlProfil
   if (!Array.isArray(profiles)) return out;
   for (const p of profiles) {
     if (typeof p !== 'object' || p === null) continue;
-    const rec = p as Record<string, unknown>;
+    const rec = resolveEffectiveProfile(p as Record<string, unknown>);
     const settings = (rec.settings as Record<string, unknown> | undefined) ?? {};
     out.push({
       id: String(rec.id ?? ''),
@@ -220,7 +239,7 @@ function parseInlineProfile(
   value: unknown,
 ): { id: string; input: MysqlProfileInput } | null {
   if (typeof value !== 'object' || value === null) return null;
-  const rec = value as Record<string, unknown>;
+  const rec = resolveEffectiveProfile(value as Record<string, unknown>);
   const settings = (rec.settings as Record<string, unknown> | undefined) ?? rec;
   return {
     id: String(rec.id ?? ''),

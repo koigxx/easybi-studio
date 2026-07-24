@@ -1051,6 +1051,33 @@ async function resolveTransform(report: LoadedReport): Promise<TransformPipeline
   };
 }
 
+/**
+ * Resolve the effective connection settings for a database profile by applying the
+ * active environment's overrides (host, port, username, password, databases).
+ *
+ * New format (backward-compatible):
+ *   { id, connector_id, active_environment: "qa",
+ *     environments: { qa: { password, settings: { host, port, username, databases } } } }
+ * Old format (returned as-is):
+ *   { id, connector_id, password, settings: { host, port, username, databases } }
+ */
+function resolveEffectiveProfile(profile: JsonRecord): JsonRecord {
+  const envName = profile.active_environment;
+  if (envName && profile.environments && typeof profile.environments === "object") {
+    const env = (profile.environments as JsonRecord)[String(envName)];
+    if (env && typeof env === "object" && !Array.isArray(env)) {
+      const envRec = env as JsonRecord;
+      return {
+        ...profile,
+        password: envRec.password ?? profile.password,
+        password_env: envRec.password_env ?? profile.password_env,
+        settings: { ...(profile.settings ?? {}), ...(envRec.settings ?? {}) },
+      };
+    }
+  }
+  return profile;
+}
+
 function connectionProfile(config: JsonRecord, report: LoadedReport): JsonRecord {
   const profileId = report.knowledgeLock.sources?.[0]?.profile_id;
   const profile = config.connections?.database_profiles?.find(
@@ -1059,7 +1086,7 @@ function connectionProfile(config: JsonRecord, report: LoadedReport): JsonRecord
   if (!profile) {
     throw new RuntimeError("DATABASE_PROFILE_NOT_FOUND", `未找到数据库连接：${profileId}`);
   }
-  return profile;
+  return resolveEffectiveProfile(profile);
 }
 
 function profilePassword(profile: JsonRecord): string {
@@ -1303,10 +1330,14 @@ async function createScriptRows(options: {
   context: JsonRecord;
   policy: JsonRecord;
   signal?: AbortSignal;
+  isPreview?: boolean;
+  onBeginSheet?: (name: string) => void;
 }): Promise<{
   rows: AsyncIterable<JsonRecord>;
   completion: Promise<JsonRecord>;
   cancel(): void;
+  /** Shared state so the writer can check which sheet to write to. */
+  sheetState: { currentName: string };
 }> {
   const controller = new AbortController();
   const abort = (): void => controller.abort();
@@ -1321,9 +1352,23 @@ async function createScriptRows(options: {
   const queryById = new Map(
     (options.report.scriptQueries ?? []).map((query: JsonRecord) => [String(query.id), query]),
   );
-  const resolveQuery = async (id: string, expectedMode: string): Promise<{
+  // Load per-query bindings (for filter compilation).
+  const queryBindings = new Map<string, JsonRecord>();
+  for (const [id, def] of queryById) {
+    const bp = String((def as JsonRecord).bindings ?? "");
+    if (bp) {
+      queryBindings.set(id, await readJson(join(options.report.root, bp)).catch(() => ({})));
+    }
+  }
+
+  const resolveQuery = async (
+    id: string,
+    expectedMode: string,
+    filtersOverride?: JsonRecord,
+  ): Promise<{
     definition: JsonRecord;
     sql: string;
+    values: unknown[];
     profile: JsonRecord;
     dialect: RuntimeDialect;
   }> => {
@@ -1336,36 +1381,62 @@ async function createScriptRows(options: {
         `脚本查询 ${id} 声明为 ${definition.mode}，不能通过 ${expectedMode} 调用`,
       );
     }
-    const profile = appConfig.connections?.database_profiles?.find(
+    const rawProfile = appConfig.connections?.database_profiles?.find(
       (candidate: JsonRecord) => candidate.id === definition.profile_id,
     );
-    if (!profile) throw new RuntimeError("DATABASE_PROFILE_NOT_FOUND", `未找到数据库连接：${definition.profile_id}`);
+    if (!rawProfile) throw new RuntimeError("DATABASE_PROFILE_NOT_FOUND", `未找到数据库连接：${definition.profile_id}`);
+    const profile = resolveEffectiveProfile(rawProfile);
+    const dialect = runtimeDialect(profile.connector_id ?? options.report.manifest.sql_dialect ?? "mysql");
     const sqlPath = String(definition.sql ?? "");
     if (!/^queries\/[a-z0-9_-]+\.sql$/.test(sqlPath)) {
       throw new RuntimeError("INVALID_SCRIPT_QUERY_PATH", `脚本查询路径无效：${sqlPath}`);
     }
+    const template = await readFile(join(options.report.root, sqlPath), "utf8");
+    const bindings = queryBindings.get(id) ?? {};
+    const effectiveFilters = filtersOverride ?? options.filters ?? {};
+    const compiled = compileSql(template, bindings, effectiveFilters, options.context, dialect);
     return {
       definition,
-      sql: await readFile(join(options.report.root, sqlPath), "utf8"),
+      sql: compiled.sql,
+      values: compiled.values,
       profile,
-      dialect: runtimeDialect(profile.connector_id ?? options.report.manifest.sql_dialect ?? "mysql"),
+      dialect,
     };
   };
+  async function executeResolvedQuery(
+    resolved: Awaited<ReturnType<typeof resolveQuery>>,
+    extraValues: unknown[] = [],
+  ): Promise<QueryAdapter> {
+    const adapter = await createQueryAdapter(resolved.dialect, resolved.profile, String(resolved.definition.database));
+    activeAdapters.add(adapter);
+    await adapter.beginReadOnly();
+    return adapter;
+  }
+
   const handlers: ScriptQueryHandlers = {
     async queryStream(queryId, values) {
       const resolved = await resolveQuery(queryId, "stream");
-      const adapter = await createQueryAdapter(
-        resolved.dialect,
-        resolved.profile,
-        String(resolved.definition.database),
-      );
-      activeAdapters.add(adapter);
-      await adapter.beginReadOnly();
-      const source = await adapter.rows(
-        resolved.sql,
-        values,
-        Number(options.policy.query_timeout_seconds ?? 600) * 1000,
-      );
+      const adapter = await executeResolvedQuery(resolved);
+      const allValues = [...resolved.values, ...values];
+      const source = await adapter.rows(resolved.sql, allValues, Number(options.policy.query_timeout_seconds ?? 600) * 1000);
+      return (async function* () {
+        try {
+          for await (const row of source) {
+            throwIfAborted(controller.signal);
+            yield row;
+          }
+          await adapter.rollback();
+        } finally {
+          activeAdapters.delete(adapter);
+          await adapter.close().catch(() => undefined);
+        }
+      })();
+    },
+    /** Re-compile a query with different filter values, then stream. */
+    async queryStreamWithFilters(queryId, filtersOverride) {
+      const resolved = await resolveQuery(queryId, "stream", filtersOverride as JsonRecord);
+      const adapter = await executeResolvedQuery(resolved);
+      const source = await adapter.rows(resolved.sql, resolved.values, Number(options.policy.query_timeout_seconds ?? 600) * 1000);
       return (async function* () {
         try {
           for await (const row of source) {
@@ -1381,11 +1452,9 @@ async function createScriptRows(options: {
     },
     async loadIndex(queryId, values) {
       const resolved = await resolveQuery(queryId, "index");
-      const adapter = await createQueryAdapter(resolved.dialect, resolved.profile, String(resolved.definition.database));
-      activeAdapters.add(adapter);
+      const adapter = await executeResolvedQuery(resolved);
       try {
-        await adapter.beginReadOnly();
-        const rows = await adapter.queryAll(resolved.sql, values, Number(options.policy.query_timeout_seconds ?? 600) * 1000);
+        const rows = await adapter.queryAll(resolved.sql, [...resolved.values, ...values], Number(options.policy.query_timeout_seconds ?? 600) * 1000);
         await adapter.rollback();
         return rows;
       } finally {
@@ -1397,11 +1466,9 @@ async function createScriptRows(options: {
       const resolved = await resolveQuery(queryId, "batch");
       const placeholders = Array.from({ length: Math.max(1, keys.length) }, () => "?").join(", ");
       const sql = resolved.sql.replace(/\/\*\s*KEYS\s*\*\//, placeholders);
-      const adapter = await createQueryAdapter(resolved.dialect, resolved.profile, String(resolved.definition.database));
-      activeAdapters.add(adapter);
+      const adapter = await executeResolvedQuery(resolved);
       try {
-        await adapter.beginReadOnly();
-        const rows = await adapter.queryAll(sql, [...keys, ...values], Number(options.policy.query_timeout_seconds ?? 600) * 1000);
+        const rows = await adapter.queryAll(sql, [...keys, ...resolved.values, ...values], Number(options.policy.query_timeout_seconds ?? 600) * 1000);
         await adapter.rollback();
         return rows;
       } finally {
@@ -1418,6 +1485,7 @@ async function createScriptRows(options: {
       ceiling[name] == null ? value : Math.min(Number(value), Number(ceiling[name])),
     ]),
   );
+  const sheetState = { currentName: "数据" };
   const completion = runScriptIsolated({
     scriptPath: join(options.report.root, String(options.report.manifest.entrypoints?.script ?? "scripts/report.mjs")),
     filters: options.filters,
@@ -1425,6 +1493,11 @@ async function createScriptRows(options: {
     budget: effectiveBudget,
     handlers,
     onEmit: (row) => queue.push(row),
+    onBeginSheet: (name) => {
+      sheetState.currentName = name;
+      if (options.onBeginSheet) options.onBeginSheet(name);
+    },
+    isPreview: options.isPreview,
     signal: controller.signal,
   }).then(
     (result) => {
@@ -1439,7 +1512,7 @@ async function createScriptRows(options: {
       throw mapped;
     },
   ).finally(() => options.signal?.removeEventListener("abort", abort));
-  return { rows: queue, completion, cancel: () => controller.abort() };
+  return { rows: queue, completion, cancel: () => controller.abort(), sheetState };
 }
 
 function safeFileName(value: string): string {
@@ -1454,11 +1527,12 @@ function createSheet(
   workbook: JsonRecord,
   report: LoadedReport,
   sheetNumber: number,
+  sheetName?: string,
 ): JsonRecord {
-  const sheet = workbook.addWorksheet(
-    sheetNumber === 1 ? "数据" : `数据${sheetNumber}`,
-    { views: [{ state: "frozen", ySplit: 1 }] },
-  );
+  const name = sheetName ?? (sheetNumber === 1 ? "数据" : `数据${sheetNumber}`);
+  const sheet = workbook.addWorksheet(name, {
+    views: [{ state: "frozen", ySplit: 1 }],
+  });
   sheet.columns = (report.fields.fields ?? []).map((field: JsonRecord) => ({
     header: field.label,
     key: field.id,
@@ -1482,6 +1556,7 @@ export async function writeWorkbookRows(
     | ((row: JsonRecord) => JsonRecord) = { mode: "identity" },
   startedAt = Date.now(),
   postFilter: (outputRow: JsonRecord) => boolean = () => true,
+  sheetState?: { currentName: string },
 ): Promise<{ rowCount: number; sheetCount: number; fileBytes: number }> {
   // Per-field enum code→中文 map (empty when the package has no enums file).
   const enumByField: Record<string, Record<string, string>> =
@@ -1494,7 +1569,9 @@ export async function writeWorkbookRows(
   let sheetNumber = 1;
   let rowInSheet = 0;
   let rowCount = 0;
-  let sheet = createSheet(workbook, report as LoadedReport, sheetNumber);
+  let activeSheetName = sheetState?.currentName ?? "数据";
+  let sheet = createSheet(workbook, report as LoadedReport, sheetNumber, activeSheetName);
+  const maxSheets = Number(policy.max_sheets_per_workbook ?? 3);
   const pipeline: TransformPipeline =
     typeof transform === "function"
       ? { mode: "row", transformRow: transform }
@@ -1505,13 +1582,27 @@ export async function writeWorkbookRows(
     }
     // Post-transform range filter: drop rows whose computed value is out of range.
     if (!postFilter(transformed)) return;
+    // Check for script-requested sheet switch.
+    const requestedSheet = sheetState?.currentName ?? "数据";
+    if (requestedSheet !== activeSheetName) {
+      sheet.commit();
+      sheetNumber += 1;
+      if (sheetNumber > maxSheets) {
+        throw new RuntimeError("SHEET_LIMIT_EXCEEDED", `数据超过最多 ${maxSheets} 个 Sheet 的容量`);
+      }
+      activeSheetName = requestedSheet;
+      rowInSheet = 0;
+      sheet = createSheet(workbook, report as LoadedReport, sheetNumber, activeSheetName);
+    }
+    // Auto-split on row overflow within the same sheet (keep the base name).
     if (rowInSheet >= Number(policy.max_rows_per_sheet ?? 1_048_575)) {
-      if (sheetNumber >= Number(policy.max_sheets_per_workbook ?? 2)) {
-        throw new RuntimeError("SHEET_LIMIT_EXCEEDED", "数据超过最多 2 个 Sheet 的容量");
+      if (sheetNumber >= maxSheets) {
+        throw new RuntimeError("SHEET_LIMIT_EXCEEDED", `数据超过最多 ${maxSheets} 个 Sheet 的容量`);
       }
       sheet.commit();
       sheetNumber += 1;
       rowInSheet = 0;
+      // Use numbered fallback for auto-split; script-controlled sheets don't auto-split.
       sheet = createSheet(workbook, report as LoadedReport, sheetNumber);
     }
     const outputRow: JsonRecord = {};
@@ -1991,6 +2082,7 @@ async function queryScriptSync(
     context,
     policy,
     signal: options.signal,
+    isPreview: true,
   });
   const collected = await collectRows(report, execution.rows, identityTransform, {
     maxRows,
@@ -2048,6 +2140,7 @@ async function exportScriptSync(
     context,
     policy,
     signal: options.signal,
+    isPreview: false,
   });
   try {
     const written = await writeWorkbookRows(
@@ -2057,6 +2150,8 @@ async function exportScriptSync(
       policy,
       identityTransform,
       startedAt,
+      () => true,
+      execution.sheetState,
     );
     const executionStats = await execution.completion;
     return {

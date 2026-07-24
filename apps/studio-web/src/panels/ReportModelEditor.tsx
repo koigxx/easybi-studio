@@ -13,6 +13,7 @@ import {
 import {
   workspaceApi,
   type AvailableField,
+  type ReportModelComparison,
   type ReportModelDetail,
   type ReportModelRelationship,
 } from '../api.js';
@@ -177,6 +178,7 @@ export function ReportModelEditor({
           fields: s.fields.map((f) => ({ name: f.name, role: f.role })),
         })),
         model.relationships,
+        model.comparison,
       );
       setModel(saved);
       setChanged(false);
@@ -544,10 +546,142 @@ export function ReportModelEditor({
                   </div>
                 </div>
               </section>
+
+              {/* Comparison (环比/同比) configuration */}
+              <ComparisonSection
+                model={model}
+                onChange={(comparison) => mutate((draft) => { draft.comparison = comparison; })}
+              />
             </>
           )}
         </div>
       </div>
     </div>
+  );
+}
+
+/** Extract candidate time columns from the primary source (t0) fields. */
+function candidateTimeColumns(model: ReportModelDetail): Array<{ name: string; label: string }> {
+  const primary = model.sources.find((s) => s.id === 't0') ?? model.sources[0];
+  if (!primary) return [];
+  return primary.fields.map((f) => ({ name: f.name, label: f.label || f.name }));
+}
+
+function ComparisonSection({
+  model,
+  onChange,
+}: {
+  model: ReportModelDetail;
+  onChange: (c: ReportModelComparison | null) => void;
+}): JSX.Element {
+  const comp = model.comparison;
+  const enabled = comp?.enabled ?? false;
+  const modes = comp?.modes ?? [];
+  const periodParam = comp?.period_param ?? '';
+  const lookbackMonths = comp?.lookback_months ?? 1;
+  const candidates = candidateTimeColumns(model);
+  const canUse = model.strategy !== 'group_queries';
+
+  function update(patch: Partial<ReportModelComparison>): void {
+    const next: ReportModelComparison = {
+      enabled: enabled,
+      modes: [...modes],
+      period_param: periodParam,
+      lookback_months: lookbackMonths,
+      ...comp,
+      ...patch,
+    };
+    onChange(next.enabled || comp ? next : null);
+  }
+
+  return (
+    <section>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>环比/同比</div>
+      <div className="ide-card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, userSelect: 'none' }}>
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={!canUse}
+            onChange={(e) => {
+              if (e.target.checked) {
+                onChange({
+                  enabled: true,
+                  modes: ['chain'],
+                  period_param: candidates.find((c) => c.name === 'create_time')?.name ?? candidates[0]?.name ?? '',
+                  lookback_months: 1,
+                });
+              } else {
+                onChange(null);
+              }
+            }}
+            style={{ cursor: 'pointer' }}
+          />
+          <span style={{ color: 'var(--ide-text-secondary)' }}>启用环比/同比</span>
+          {!canUse && (
+            <span style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>
+              （当前策略 group_queries 暂不支持环比/同比）
+            </span>
+          )}
+        </label>
+
+        {enabled && (
+          <>
+            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+              <label style={{ fontSize: 12 }}>
+                <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>对比模式</div>
+                <div style={{ display: 'flex', gap: 12 }}>
+                  {(['chain', 'yoy'] as const).map((mode) => (
+                    <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 12 }}>
+                      <input
+                        type="checkbox"
+                        checked={modes.includes(mode)}
+                        onChange={(e) => {
+                          const next = e.target.checked
+                            ? [...modes, mode]
+                            : modes.filter((m) => m !== mode);
+                          if (next.length) update({ modes: next });
+                        }}
+                        style={{ cursor: 'pointer' }}
+                      />
+                      {mode === 'chain' ? '环比' : '同比'}
+                    </label>
+                  ))}
+                </div>
+              </label>
+
+              <label style={{ flex: '0 0 220px', fontSize: 12 }}>
+                <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>基准时间列</div>
+                <select
+                  className="ide-select"
+                  value={periodParam}
+                  onChange={(e) => update({ period_param: e.target.value })}
+                >
+                  {candidates.map((c) => (
+                    <option key={c.name} value={c.name}>{c.label} ({c.name})</option>
+                  ))}
+                </select>
+              </label>
+
+              <label style={{ flex: '0 0 120px', fontSize: 12 }}>
+                <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>环比回溯月数</div>
+                <input
+                  className="ide-input"
+                  type="number"
+                  min={1}
+                  max={12}
+                  value={Number.isFinite(lookbackMonths) ? lookbackMonths : 1}
+                  onChange={(e) => update({ lookback_months: Math.max(1, Number(e.target.value) || 1) })}
+                />
+              </label>
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', lineHeight: 1.5 }}>
+              启用后，报表将自动追加必填按月时间筛选，运行时间窗口会自动扩展以覆盖对比周期。
+              环比对比前一月，同比对比去年同月。如需修改对比逻辑，请调整上述参数后重新生成报表包。
+            </div>
+          </>
+        )}
+      </div>
+    </section>
   );
 }

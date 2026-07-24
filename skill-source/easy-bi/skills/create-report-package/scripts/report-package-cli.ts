@@ -2376,6 +2376,90 @@ async function applyScriptReport(plan: JsonRecord, config: JsonRecord): Promise<
   }
 }
 
+/**
+ * Wrap a v3 script source with comparison (环比/同比) logic.
+ *
+ * The wrapper injects:
+ * 1. A `shiftMonths` helper to offset a period filter's {from,to} by N months.
+ * 2. After the original script's `run()` body, chain/yoy queries that each
+ *    re-compile the main stream query with a shifted time window, emitting
+ *    into their own named sheets (export only).
+ *
+ * The original AI-authored source is kept intact between the `// --- your logic`
+ * and `// --- end your logic` markers so it remains editable.
+ */
+function wrapScriptForComparison(plan: JsonRecord): void {
+  const comp = plan.comparison as JsonRecord;
+  const modes: string[] = Array.isArray(comp.modes) ? comp.modes.map(String) : [];
+  const periodParam = String(comp.period_param ?? "create_time");
+  const lookback = Number(comp.lookback_months ?? 1);
+
+  const wrapper = `
+// === AUTO-GENERATED: comparison wrapper ===
+// shiftMonths: offset a period filter's {from,to} range by N months.
+function shiftMonths(
+  filterValue,
+  months,
+) {
+  if (!filterValue) return filterValue;
+  // Handle {operator, value:{from,to}} wrapper
+  let range = filterValue;
+  let wrapperObj = null;
+  if (typeof range === 'object' && range !== null && !Array.isArray(range) && 'value' in range) {
+    wrapperObj = range;
+    range = range.value;
+  }
+  if (!range || typeof range !== 'object' || !range.from || !range.to) return filterValue;
+  const shift = (ym) => {
+    const [y, m] = String(ym).split('-').map(Number);
+    if (!Number.isFinite(y) || !Number.isFinite(m)) return ym;
+    const total = y * 12 + (m - 1) + months;
+    const ny = Math.floor(total / 12);
+    const nm = (total % 12) + 1;
+    const padded = \`\${String(ny).padStart(4, '0')}-\${String(nm).padStart(2, '0')}\`;
+    // Preserve day part if present
+    const rest = String(ym).slice(7);
+    return rest ? padded + rest : padded + '-01';
+  };
+  const shifted = { ...range, from: shift(String(range.from)), to: shift(String(range.to)) };
+  return wrapperObj ? { ...wrapperObj, value: shifted } : shifted;
+}
+
+// === begin your logic ===
+`;
+
+  const trailer = `
+// === end your logic ===
+
+// --- comparison queries (auto-generated) ---
+const __comp = {
+  periodParam: ${JSON.stringify(periodParam)},
+  modes: ${JSON.stringify(modes)},
+  lookback: ${JSON.stringify(lookback)},
+};
+if (!ctx.isPreview && __comp.modes.length) {
+  const periodValue = ctx.filters?.[__comp.periodParam];
+  if (periodValue) {
+    ${modes.includes("chain") ? `
+    if (__comp.modes.includes('chain')) {
+      ctx.beginSheet('环比');
+      const chainFilters = { ...ctx.filters, [__comp.periodParam]: shiftMonths(periodValue, -__comp.lookback) };
+      for await (const row of ctx.queryStreamWithFilters('main', chainFilters)) ctx.emit(row);
+    }` : ""}
+    ${modes.includes("yoy") ? `
+    if (__comp.modes.includes('yoy')) {
+      ctx.beginSheet('同比');
+      const yoyFilters = { ...ctx.filters, [__comp.periodParam]: shiftMonths(periodValue, -12) };
+      for await (const row of ctx.queryStreamWithFilters('main', yoyFilters)) ctx.emit(row);
+    }` : ""}
+  }
+}
+`;
+
+  const original = String(plan.script_report.source ?? "");
+  plan.script_report.source = wrapper + original + "\n" + trailer;
+}
+
 function finalizePlanningDocuments(plan: JsonRecord, configuration: JsonRecord): void {
   const strategy = plan.script_report
     ? "script"
@@ -4232,6 +4316,11 @@ export async function finalizeStagedPackage(options: {
         label: col.label ?? col.name,
         expression: col.expression ?? `\`${col.name}\``,
       }));
+  // Inherit comparison from the report model when the declarative config doesn't
+  // set one. Model-saved comparison serves as the default; AI can still override.
+  const modelComparison = (model as JsonRecord).comparison as JsonRecord | undefined;
+  const hasDeclComparison = !!(declarative?.comparison as JsonRecord | undefined);
+
   const configuration: JsonRecord = strategy === "script"
     ? { semantic_plan: await readJson(paths.semanticPlan), execution_plan: executionPlan }
     : {
@@ -4241,6 +4330,10 @@ export async function finalizeStagedPackage(options: {
         select: declSelect,
         semantic_plan: await readJson(paths.semanticPlan),
         execution_plan: executionPlan,
+        // Only inherit model comparison when AI didn't set one explicitly.
+        ...(modelComparison?.enabled && !hasDeclComparison
+          ? { comparison: modelComparison }
+          : {}),
       };
   // The AI's declarative output for group_queries uses a nested per-group format
   // (query_groups[]) that differs from what configurePlan expects (group_queries.queries[]).
@@ -4978,6 +5071,13 @@ export async function configurePlan(
     }
   }
   if (configuration.ordering) plan.ordering = configuration.ordering;
+
+  // When comparison is enabled and the plan uses a v3 script, auto-wrap the script
+  // source so it emits multiple sheets (本期/环比/同比) via independent queries.
+  if (plan.comparison?.enabled && plan.script_report) {
+    wrapScriptForComparison(plan);
+  }
+
   finalizePlanningDocuments(plan, configuration);
   const fieldKinds = new Set(
     (plan.fields ?? []).map((field: JsonRecord) => field.source?.kind),

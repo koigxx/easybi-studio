@@ -9,8 +9,10 @@ import {
   toTestProfile,
   newDbProfile,
   newOssProfile,
+  newEnvDraft,
   type ConnectionsDraft,
   type DbProfileDraft,
+  type EnvDraft,
   type OssProfileDraft,
 } from './connections-config.js';
 
@@ -250,8 +252,74 @@ function DbCard({
   onRemove: () => void;
   onTest: () => void;
 }): JSX.Element {
+  const isEnvMode = Boolean(db.activeEnvironment);
+  const activeEnv = isEnvMode ? db.environments.find((e) => e.name === db.activeEnvironment) : undefined;
+
+  // When in env mode, read/write through the active environment.
+  const envHost = activeEnv?.host ?? db.host;
+  const envPort = activeEnv?.port ?? db.port;
+  const envUsername = activeEnv?.username ?? db.username;
+  const envPassword = activeEnv?.password ?? db.password;
+  const envDatabases = activeEnv?.databases ?? db.databases;
+
+  function updateHost(v: string): void {
+    if (isEnvMode && activeEnv) {
+      onChange({ ...db, environments: db.environments.map((e) => (e.name === activeEnv.name ? { ...e, host: v } : e)) });
+    } else onChange({ ...db, host: v });
+  }
+  function updatePort(v: number): void {
+    if (isEnvMode && activeEnv) {
+      onChange({ ...db, environments: db.environments.map((e) => (e.name === activeEnv.name ? { ...e, port: v } : e)) });
+    } else onChange({ ...db, port: v });
+  }
+  function updateUsername(v: string): void {
+    if (isEnvMode && activeEnv) {
+      onChange({ ...db, environments: db.environments.map((e) => (e.name === activeEnv.name ? { ...e, username: v } : e)) });
+    } else onChange({ ...db, username: v });
+  }
+  function updatePassword(v: string): void {
+    if (isEnvMode && activeEnv) {
+      onChange({ ...db, environments: db.environments.map((e) => (e.name === activeEnv.name ? { ...e, password: v } : e)) });
+    } else onChange({ ...db, password: v });
+  }
+  function updateDatabases(v: string[]): void {
+    if (isEnvMode && activeEnv) {
+      onChange({ ...db, environments: db.environments.map((e) => (e.name === activeEnv.name ? { ...e, databases: v } : e)) });
+    } else onChange({ ...db, databases: v });
+  };
+
+  // Toggle env mode on: migrate current settings into a "qa" environment.
+  function enableEnvMode(): void {
+    const initialEnv = newEnvDraft('qa');
+    initialEnv.host = db.host;
+    initialEnv.port = db.port;
+    initialEnv.username = db.username;
+    initialEnv.password = db.password;
+    initialEnv.databases = [...db.databases];
+    onChange({ ...db, activeEnvironment: 'qa', environments: [initialEnv] });
+  }
+  function disableEnvMode(): void {
+    if (activeEnv) {
+      onChange({ ...db, activeEnvironment: '', environments: [], host: activeEnv.host, port: activeEnv.port, username: activeEnv.username, password: activeEnv.password, databases: [...activeEnv.databases] });
+    }
+  }
+  function addEnv(): void {
+    const name = prompt('新环境名称（如 production）：');
+    if (!name || !name.trim()) return;
+    const trimmed = name.trim();
+    if (db.environments.some((e) => e.name === trimmed)) return;
+    onChange({ ...db, environments: [...db.environments, newEnvDraft(trimmed)] });
+  }
+  function removeEnv(name: string): void {
+    if (db.environments.length <= 1) return;
+    const next = db.environments.filter((e) => e.name !== name);
+    const active = db.activeEnvironment === name ? (next[0]?.name ?? '') : db.activeEnvironment;
+    onChange({ ...db, environments: next, activeEnvironment: active });
+  }
+
   return (
     <div className="ide-card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {/* Row 0: ID + engine type + env toggle */}
       <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' }}>
         {labeledInput('ID', db.id, (v) => onChange({ ...db, id: v }), {
           placeholder: 'transport-main-mysql',
@@ -264,8 +332,6 @@ function DbCard({
             value={db.connectorId === 'postgresql' || db.connectorId === 'postgres' ? 'postgresql' : 'mysql'}
             onChange={(e) => {
               const connectorId = e.target.value;
-              // Nudge the port to the engine default only if it still holds the
-              // other engine's default (don't clobber a custom port).
               const nextPort =
                 connectorId === 'postgresql' && (db.port === 3306 || !db.port)
                   ? 5432
@@ -279,31 +345,79 @@ function DbCard({
             <option value="postgresql">PostgreSQL</option>
           </select>
         </label>
-        {labeledInput('host', db.host, (v) => onChange({ ...db, host: v }), {
-          placeholder: '127.0.0.1',
-        })}
+        <label style={{ flex: '0 0 auto', fontSize: 12, display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', userSelect: 'none' }}>
+          <input
+            type="checkbox"
+            checked={isEnvMode}
+            onChange={(e) => { if (e.target.checked) enableEnvMode(); else disableEnvMode(); }}
+            style={{ cursor: 'pointer' }}
+          />
+          <span style={{ color: 'var(--ide-text-tertiary)' }}>多环境配置</span>
+        </label>
+        <div style={{ flex: 1 }} />
+        <button className="ide-btn ide-btn-sm ide-btn-danger" onClick={onRemove} title="删除该连接">
+          <Trash2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* Environment tabs (only when env mode is on) */}
+      {isEnvMode && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          {db.environments.map((env) => (
+            <span
+              key={env.name}
+              onClick={() => onChange({ ...db, activeEnvironment: env.name })}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                padding: '3px 10px',
+                borderRadius: 4,
+                fontSize: 12,
+                cursor: 'pointer',
+                background: env.name === db.activeEnvironment ? 'var(--ide-accent)' : 'var(--ide-bg-chrome)',
+                color: env.name === db.activeEnvironment ? '#fff' : 'var(--ide-text-secondary)',
+                fontWeight: env.name === db.activeEnvironment ? 600 : 400,
+              }}
+            >
+              {env.name}
+              {db.environments.length > 1 && (
+                <X
+                  className="w-3 h-3"
+                  style={{ marginLeft: 4, opacity: 0.6 }}
+                  onClick={(e) => { e.stopPropagation(); removeEnv(env.name); }}
+                />
+              )}
+            </span>
+          ))}
+          <button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={addEnv} title="添加环境">
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* Connection fields */}
+      <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+        {labeledInput('host', envHost, updateHost, { placeholder: '127.0.0.1' })}
         <label style={{ flex: '0 0 110px', fontSize: 12 }}>
           <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>port</div>
           <input
             className="ide-input"
             type="number"
-            value={Number.isFinite(db.port) ? db.port : 0}
-            onChange={(e) => onChange({ ...db, port: Number(e.target.value) })}
+            value={Number.isFinite(envPort) ? envPort : 0}
+            onChange={(e) => updatePort(Number(e.target.value))}
           />
         </label>
-        <button className="ide-btn ide-btn-sm ide-btn-danger" onClick={onRemove} title="删除该连接">
-          <Trash2 className="w-3.5 h-3.5" />
-        </button>
       </div>
       <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end', flexWrap: 'wrap' }}>
-        {labeledInput('username', db.username, (v) => onChange({ ...db, username: v }), {
-          placeholder: 'report_reader',
-        })}
-        {labeledInput('password（明文）', db.password, (v) => onChange({ ...db, password: v }), {
+        {labeledInput('username', envUsername, updateUsername, { placeholder: 'report_reader' })}
+        {labeledInput('password（明文）', envPassword, updatePassword, {
           placeholder: '直接填写明文密码',
           type: 'password',
         })}
       </div>
+
+      {/* Databases list */}
       <div>
         <div
           style={{
@@ -322,34 +436,29 @@ function DbCard({
           </span>
           <button
             className="ide-btn ide-btn-sm ide-btn-ghost"
-            onClick={() => onChange({ ...db, databases: [...db.databases, ''] })}
+            onClick={() => updateDatabases([...envDatabases, ''])}
           >
             <Plus className="w-3.5 h-3.5" /> 添加库
           </button>
         </div>
-        {db.databases.length === 0 ? (
+        {envDatabases.length === 0 ? (
           <div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>暂无数据库</div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {db.databases.map((name, di) => (
+            {envDatabases.map((name, di) => (
               <div key={di} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                 <input
                   className="ide-input"
                   value={name}
                   placeholder="transport_order"
                   onChange={(e) =>
-                    onChange({
-                      ...db,
-                      databases: db.databases.map((d, j) => (j === di ? e.target.value : d)),
-                    })
+                    updateDatabases(envDatabases.map((d, j) => (j === di ? e.target.value : d)))
                   }
                   style={{ flex: 1 }}
                 />
                 <button
                   className="ide-btn ide-btn-sm ide-btn-ghost"
-                  onClick={() =>
-                    onChange({ ...db, databases: db.databases.filter((_, j) => j !== di) })
-                  }
+                  onClick={() => updateDatabases(envDatabases.filter((_, j) => j !== di))}
                   title="删除"
                 >
                   <X className="w-3.5 h-3.5" />
@@ -359,6 +468,7 @@ function DbCard({
           </div>
         )}
       </div>
+
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
         <button
           className="ide-btn ide-btn-sm"

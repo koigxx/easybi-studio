@@ -25,6 +25,7 @@ test("isolated v3 script uses queryStream/loadIndex/batchLookup/emit through bou
         handlers: {
             async queryStream() { return (async function* () { yield { id: 1 }; yield { id: 2 }; })(); },
             async loadIndex() { return [{ id: 1, name: "A" }, { id: 2, name: "B" }]; },
+            async queryStreamWithFilters() { return (async function* () { })(); },
             async batchLookup(_id, keys) { return keys.map((key) => ({ parent_id: key })); },
         },
         onEmit(row) { emitted.push(row); },
@@ -48,6 +49,7 @@ test("isolated v3 script is canceled through AbortSignal", async () => {
             async queryStream() { return (async function* () { await new Promise(() => undefined); yield {}; })(); },
             async loadIndex() { return []; },
             async batchLookup() { return []; },
+            async queryStreamWithFilters() { return (async function* () { })(); },
         },
         onEmit() { },
     });
@@ -70,6 +72,7 @@ test("isolated v3 script fails explicitly when the query budget is exceeded", as
             async queryStream() { return (async function* () { })(); },
             async loadIndex() { return []; },
             async batchLookup() { return []; },
+            async queryStreamWithFilters() { return (async function* () { })(); },
         },
         onEmit() { },
     }), (error) => error instanceof ScriptExecutionError && error.code === "QUERY_BUDGET_EXCEEDED");

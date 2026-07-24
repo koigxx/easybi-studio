@@ -25,8 +25,10 @@ export class ScriptExecutionError extends Error {
 // ---------------------------------------------------------------------------
 
 export interface ScriptQueryHandlers {
-  /** Return an async iterable of rows for a streaming query. */
+  /** Return an async iterable of rows for a streaming query (with request filters compiled). */
   queryStream(queryId: string, values: unknown[]): Promise<AsyncIterable<JsonRecord>>;
+  /** Re-compile the SQL with different filter overrides, then stream. */
+  queryStreamWithFilters(queryId: string, filtersOverride: unknown): Promise<AsyncIterable<JsonRecord>>;
   /** Return all rows for a small lookup/index query. */
   loadIndex(queryId: string, values: unknown[]): Promise<JsonRecord[]>;
   /** Batch-lookup rows by a set of keys. */
@@ -53,6 +55,10 @@ export interface RunScriptOptions {
   handlers: ScriptQueryHandlers;
   /** Called for each row emitted by the user script. */
   onEmit: (row: JsonRecord) => void;
+  /** Called when the script switches to a new named sheet (export only). */
+  onBeginSheet?: (name: string) => void;
+  /** True when the caller is a preview (not an export). */
+  isPreview?: boolean;
   /** AbortSignal for cancellation. */
   signal?: AbortSignal;
 }
@@ -143,10 +149,50 @@ export async function runScriptIsolated(options: RunScriptOptions): Promise<{
     }
   }
 
+  const isPreview = Boolean(options.isPreview);
+
   // --- ctx object exposed to user scripts ---
   // NOTE: queryStream is NOT async so that "for await (const row of ctx.queryStream(...))"
   // works directly. The handler call is deferred until the first iterator pull.
   const ctx = {
+    /** True during preview; false during export. */
+    isPreview,
+
+    /** The request's filter values (read-only snapshot). */
+    filters: (options.filters ?? {}) as JsonRecord,
+
+    /** Switch to a named output sheet (export only; no-op in preview). */
+    beginSheet(_name: string): void {
+      if (options.onBeginSheet) options.onBeginSheet(_name);
+    },
+
+    /** Stream query with different filter overrides (for comparison queries). */
+    queryStreamWithFilters(queryId: string, filterOverrides: unknown): AsyncIterable<JsonRecord> {
+      checkBudget();
+      queryCount++;
+      let iter: AsyncIterator<JsonRecord> | undefined;
+      return {
+        [Symbol.asyncIterator](): AsyncIterator<JsonRecord> {
+          return {
+            async next() {
+              if (!iter) {
+                const iterable = await handlers.queryStreamWithFilters(queryId, filterOverrides);
+                iter = iterable[Symbol.asyncIterator]();
+              }
+              return iter.next();
+            },
+            async return(value?: unknown) {
+              return iter?.return?.(value) ?? ({ done: true, value } as IteratorResult<JsonRecord>);
+            },
+            async throw(e?: unknown) {
+              if (iter?.throw) return iter.throw(e);
+              throw e;
+            },
+          };
+        },
+      };
+    },
+
     queryStream(queryId: string): AsyncIterable<JsonRecord> {
       checkBudget();
       queryCount++;

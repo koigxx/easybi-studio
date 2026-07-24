@@ -168,7 +168,9 @@ type QueryAdapter = {
 };
 export declare function writeWorkbookRows(report: Pick<LoadedReport, "manifest" | "fields"> & {
     enums?: JsonRecord | null;
-}, rows: AsyncIterable<JsonRecord>, output: string, policy: JsonRecord, transform?: TransformPipeline | ((row: JsonRecord) => JsonRecord), startedAt?: number, postFilter?: (outputRow: JsonRecord) => boolean): Promise<{
+}, rows: AsyncIterable<JsonRecord>, output: string, policy: JsonRecord, transform?: TransformPipeline | ((row: JsonRecord) => JsonRecord), startedAt?: number, postFilter?: (outputRow: JsonRecord) => boolean, sheetState?: {
+    currentName: string;
+}): Promise<{
     rowCount: number;
     sheetCount: number;
     fileBytes: number;

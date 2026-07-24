@@ -396,12 +396,14 @@ export const workspaceApi = {
     expectedRevision: string,
     sources: ReportModelEditSource[],
     relationships: ReportModelRelationship[],
+    comparison?: ReportModelComparison | null,
   ) =>
     call<ReportModelDetail>('PUT', `/api/easybi/projects/${id}/reports/model`, {
       reportId,
       expectedRevision,
       sources,
       relationships,
+      comparison,
     }),
   deleteReportPackage: (id: string, reportId: string, version: string) =>
     call<{ id: string; version: string; removedDir: boolean }>(
@@ -476,6 +478,12 @@ export interface ReportModelEditSource {
   id: string;
   fields: Array<{ name: string; role?: string }>;
 }
+export interface ReportModelComparison {
+  enabled: boolean;
+  modes: string[];
+  period_param: string;
+  lookback_months: number;
+}
 export interface ReportModelDetail {
   reportId: string;
   reportName: string;
@@ -488,6 +496,7 @@ export interface ReportModelDetail {
   relationships: ReportModelRelationship[];
   filters: Array<Record<string, unknown>>;
   metrics: Array<Record<string, unknown>>;
+  comparison: ReportModelComparison | null;
   errors: string[];
 }
 

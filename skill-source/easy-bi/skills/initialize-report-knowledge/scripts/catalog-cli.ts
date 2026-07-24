@@ -163,6 +163,27 @@ function safeName(identifier: string): string {
   return `${readable}-${createHash("sha1").update(identifier).digest("hex").slice(0, 10)}.json`;
 }
 
+/**
+ * Resolve the effective connection settings for a database profile by applying the
+ * active environment's overrides (host, port, username, password, databases).
+ */
+function resolveEffectiveProfile(profile: JsonObject): JsonObject {
+  const envName = profile.active_environment;
+  if (envName && profile.environments && typeof profile.environments === "object") {
+    const env = (profile.environments as JsonObject)[String(envName)];
+    if (env && typeof env === "object" && !Array.isArray(env)) {
+      const envRec = env as JsonObject;
+      return {
+        ...profile,
+        password: envRec.password ?? profile.password,
+        password_env: envRec.password_env ?? profile.password_env,
+        settings: { ...(profile.settings ?? {}), ...(envRec.settings ?? {}) },
+      };
+    }
+  }
+  return profile;
+}
+
 function requireSecret(source: JsonObject): string {
   if (source.password !== undefined && source.password !== null) return String(source.password);
   if (!source.password_env) {
@@ -182,15 +203,18 @@ export function resolveDatabaseSources(config: JsonObject): JsonObject[] {
   const selected = new Set<string>(config.knowledge?.database_profile_ids ?? []);
   const sources = profiles
     .filter((profile: JsonObject) => !selected.size || selected.has(profile.id))
-    .map((profile: JsonObject) => ({
-      ...(profile.settings ?? {}),
-      id: profile.id,
-      engine: String(profile.connector_id ?? "").toLowerCase(),
-      password: profile.password,
-      password_env: profile.password_env,
-      connect_timeout_seconds: profile.connect_timeout_seconds,
-      read_timeout_seconds: profile.read_timeout_seconds,
-    }));
+    .map((profile: JsonObject) => {
+      const effective = resolveEffectiveProfile(profile);
+      return {
+        ...(effective.settings ?? {}),
+        id: effective.id,
+        engine: String(effective.connector_id ?? "").toLowerCase(),
+        password: effective.password,
+        password_env: effective.password_env,
+        connect_timeout_seconds: effective.connect_timeout_seconds,
+        read_timeout_seconds: effective.read_timeout_seconds,
+      };
+    });
   const resolvedIds = new Set(sources.map((source: JsonObject) => source.id));
   const missing = [...selected].filter((id) => !resolvedIds.has(id));
   if (missing.length) {
@@ -3340,6 +3364,40 @@ export function validateConfig(config: JsonObject, scope = "knowledge"): JsonObj
     }
     if (!Array.isArray(source.databases) || !source.databases.length) {
       errors.push(`Database profile ${source.id} requires all database names`);
+    }
+  }
+  // Validate active_environment + environments format on raw profiles.
+  const rawProfiles = (config.connections?.database_profiles ?? []) as JsonObject[];
+  for (const profile of rawProfiles) {
+    const envActive = profile.active_environment;
+    const envs = profile.environments;
+    if (envActive !== undefined || envs !== undefined) {
+      if (typeof envs !== "object" || envs === null || Array.isArray(envs)) {
+        errors.push(`Database profile ${profile.id}: environments must be an object`);
+      } else if (Object.keys(envs).length === 0) {
+        errors.push(`Database profile ${profile.id}: environments must have at least one entry`);
+      } else {
+        for (const [envKey, envVal] of Object.entries(envs)) {
+          if (!/^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/.test(envKey)) {
+            errors.push(`Database profile ${profile.id}: invalid environment name "${envKey}"`);
+          }
+          if (typeof envVal !== "object" || envVal === null || Array.isArray(envVal)) {
+            errors.push(`Database profile ${profile.id}: environment "${envKey}" must be an object`);
+            continue;
+          }
+          const envRec = envVal as JsonObject;
+          if (!envRec.password && !envRec.password_env && !profile.password && !profile.password_env) {
+            errors.push(`Database profile ${profile.id}: environment "${envKey}" requires password or password_env`);
+          }
+          const envSettings = envRec.settings as JsonObject | undefined;
+          if (!envSettings?.host) {
+            errors.push(`Database profile ${profile.id}: environment "${envKey}" requires settings.host`);
+          }
+        }
+        if (typeof envActive === "string" && envActive && !(envActive in envs)) {
+          errors.push(`Database profile ${profile.id}: active_environment "${envActive}" not found in environments`);
+        }
+      }
     }
   }
   const classification = config.knowledge?.classification ?? {};

@@ -44,6 +44,13 @@ export interface ReportRequirementDraft {
   /** Free-text business notes / metric definitions (口径). Optional. */
   description: string;
   requiredFields: ReportFieldDraft[];
+  /** Comparison (环比/同比) configuration for this report. */
+  comparison?: {
+    enabled: boolean;
+    modes: string[];
+    period_param: string;
+    lookback_months: number;
+  };
 }
 
 export interface ReportConfigDraft {
@@ -142,11 +149,20 @@ export function extractReportConfig(configValue: unknown): ReportConfigDraft {
     const fields = Array.isArray(rec.required_fields)
       ? rec.required_fields.map(toFieldDraft)
       : [];
+    const comp = rec.comparison as Record<string, unknown> | undefined;
     return {
       id: String(rec.id ?? ''),
       name: String(rec.name ?? ''),
       description: typeof rec.description === 'string' ? rec.description : '',
       requiredFields: fields,
+      ...(comp && typeof comp.enabled === 'boolean' ? {
+        comparison: {
+          enabled: Boolean(comp.enabled),
+          modes: Array.isArray(comp.modes) ? comp.modes.map(String) : [],
+          period_param: String(comp.period_param ?? ''),
+          lookback_months: Number(comp.lookback_months ?? 1),
+        },
+      } : {}),
     };
   });
 
@@ -165,6 +181,14 @@ function requirementToConfig(r: ReportRequirementDraft): Record<string, unknown>
   };
   const desc = (r.description ?? '').trim();
   if (desc) req.description = desc;
+  if (r.comparison?.enabled) {
+    req.comparison = {
+      enabled: true,
+      modes: r.comparison.modes,
+      period_param: r.comparison.period_param,
+      lookback_months: r.comparison.lookback_months,
+    };
+  }
   return req;
 }
 

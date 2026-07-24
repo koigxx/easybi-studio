@@ -81,10 +81,47 @@ export async function runScriptIsolated(options) {
             throw new BudgetExceededError(`输出行数已达上限（${maxOutputRows}）`);
         }
     }
+    const isPreview = Boolean(options.isPreview);
     // --- ctx object exposed to user scripts ---
     // NOTE: queryStream is NOT async so that "for await (const row of ctx.queryStream(...))"
     // works directly. The handler call is deferred until the first iterator pull.
     const ctx = {
+        /** True during preview; false during export. */
+        isPreview,
+        /** The request's filter values (read-only snapshot). */
+        filters: (options.filters ?? {}),
+        /** Switch to a named output sheet (export only; no-op in preview). */
+        beginSheet(_name) {
+            if (options.onBeginSheet)
+                options.onBeginSheet(_name);
+        },
+        /** Stream query with different filter overrides (for comparison queries). */
+        queryStreamWithFilters(queryId, filterOverrides) {
+            checkBudget();
+            queryCount++;
+            let iter;
+            return {
+                [Symbol.asyncIterator]() {
+                    return {
+                        async next() {
+                            if (!iter) {
+                                const iterable = await handlers.queryStreamWithFilters(queryId, filterOverrides);
+                                iter = iterable[Symbol.asyncIterator]();
+                            }
+                            return iter.next();
+                        },
+                        async return(value) {
+                            return iter?.return?.(value) ?? { done: true, value };
+                        },
+                        async throw(e) {
+                            if (iter?.throw)
+                                return iter.throw(e);
+                            throw e;
+                        },
+                    };
+                },
+            };
+        },
         queryStream(queryId) {
             checkBudget();
             queryCount++;

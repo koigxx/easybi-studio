@@ -5,6 +5,7 @@ import {
   validateConnections,
   toTestProfile,
   newDbProfile,
+  newEnvDraft,
 } from './connections-config.js';
 
 const CONFIG = {
@@ -62,6 +63,8 @@ describe('extractConnections', () => {
       username: 'reader',
       password: 'plain-secret',
       databases: ['a', 'b'],
+      activeEnvironment: '',
+      environments: [],
     });
     expect(d.databases[1]!.password).toBe(''); // password_env is not surfaced as plaintext
     expect(d.ossProfiles[0]).toMatchObject({
@@ -155,5 +158,72 @@ describe('toTestProfile', () => {
     const db = { ...newDbProfile(), id: 'x', host: '1.2.3.4', username: 'u' };
     const p = toTestProfile(db) as { password?: string };
     expect(p.password).toBeUndefined();
+  });
+
+  it('uses active environment settings when env mode is on', () => {
+    const db = {
+      ...newDbProfile(),
+      id: 'x',
+      host: '1.2.3.4',
+      username: 'u',
+      activeEnvironment: 'production',
+      environments: [
+        newEnvDraft('qa'),
+        { ...newEnvDraft('production'), host: '10.0.0.99', port: 3307, username: 'prod_u', password: 'prod_pw', databases: ['prod_db'] },
+      ],
+    };
+    const p = toTestProfile(db) as { id: string; settings: Record<string, unknown>; password?: string; active_environment?: string };
+    expect(p.id).toBe('x');
+    expect(p.active_environment).toBe('production');
+    expect(p.settings.host).toBe('10.0.0.99');
+    expect(p.settings.port).toBe(3307);
+    expect(p.settings.username).toBe('prod_u');
+    expect(p.password).toBe('prod_pw');
+    expect(p.settings.databases).toEqual(['prod_db']);
+  });
+});
+
+describe('mergeConnections env mode', () => {
+  it('writes active_environment + environments and strips top-level password', () => {
+    const d = extractConnections(CONFIG);
+    d.databases[0]!.activeEnvironment = 'production';
+    d.databases[0]!.environments = [
+      { ...newEnvDraft('qa'), host: 'qa-host', username: 'qa_u', password: 'qa_pw', databases: ['qa_db'] },
+      { ...newEnvDraft('production'), host: 'prod-host', username: 'prod_u', password: 'prod_pw', databases: ['prod_db'] },
+    ];
+    const merged = mergeConnections(CONFIG, d) as Record<string, unknown>;
+    const profiles = (merged.connections as Record<string, unknown>).database_profiles as Record<string, unknown>[];
+    const main = profiles[0]!;
+    expect(main.active_environment).toBe('production');
+    expect(main.password).toBeUndefined();
+    const envs = main.environments as Record<string, Record<string, unknown>>;
+    expect(envs.production).toBeDefined();
+    expect((envs.production!.settings as Record<string, unknown>).host).toBe('prod-host');
+  });
+});
+
+describe('validateConnections env mode', () => {
+  it('accepts valid env mode', () => {
+    const d = extractConnections(CONFIG);
+    d.databases[0]!.activeEnvironment = 'prod';
+    d.databases[0]!.environments = [
+      { ...newEnvDraft('qa'), host: 'qa', username: 'qa_u', password: 'pw', databases: ['a'] },
+      { ...newEnvDraft('prod'), host: 'prod', username: 'p_u', password: 'pw', databases: ['a'] },
+    ];
+    expect(validateConnections(d)).toBeNull();
+  });
+
+  it('rejects missing host in env', () => {
+    const d = extractConnections(CONFIG);
+    d.databases[0]!.activeEnvironment = 'qa';
+    d.databases[0]!.environments = [{ ...newEnvDraft('qa'), host: '', username: 'u', databases: ['a'] }];
+    expect(validateConnections(d)).toMatch(/host/);
+  });
+
+  it('rejects invalid port in env', () => {
+    const d = extractConnections(CONFIG);
+    d.databases[0]!.activeEnvironment = 'qa';
+    d.databases[0]!.environments = [{ ...newEnvDraft('qa'), host: 'h', port: 0, username: 'u', databases: ['a'] }];
+    expect(validateConnections(d)).toMatch(/端口/);
   });
 });
