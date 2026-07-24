@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Save, Plus, Trash2, RotateCcw } from 'lucide-react';
+import { Save, Plus, Trash2, RotateCcw, ChevronRight } from 'lucide-react';
 import { promptApi, type Project, type PromptPreset } from '../api.js';
-import { Card, ErrorBanner, Loading } from '../components/ui/common.js';
+import { ErrorBanner, Loading } from '../components/ui/common.js';
 
 /**
  * Editor for the workspace's configurable AI preset prompts (config.agent_prompts).
@@ -17,6 +17,7 @@ export function PromptsEditor({ project }: { project: Project }): JSX.Element {
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -43,10 +44,14 @@ export function PromptsEditor({ project }: { project: Project }): JSX.Element {
     setPresets((ps) => (ps ? ps.filter((_, idx) => idx !== i) : ps));
   }
   function add(): void {
-    setPresets((ps) => [
-      ...(ps ?? []),
-      { action: '', label: '', hint: '', write: true, prompt: '' },
-    ]);
+    setPresets((ps) => {
+      const next = [
+        ...(ps ?? []),
+        { action: '', label: '', hint: '', write: true, prompt: '' },
+      ];
+      setExpandedIndex(next.length - 1);
+      return next;
+    });
   }
 
   async function save(): Promise<void> {
@@ -82,69 +87,106 @@ export function PromptsEditor({ project }: { project: Project }): JSX.Element {
           : '当前为本工作区已保存的配置。'}
       </div>
 
-      {(presets ?? []).map((p, i) => (
-        <Card key={i} style={{ marginBottom: 12 }}>
-          <div style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
-            <div style={{ flex: 1, display: 'grid', gap: 8 }}>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <label style={{ flex: 1, fontSize: 12 }}>
-                  <div className="ide-label">动作标识 action</div>
-                  <input
-                    className="ide-input"
-                    value={p.action}
-                    placeholder="如 initialize-knowledge / model-report / build-report-package"
-                    onChange={(e) => update(i, { action: e.target.value })}
-                  />
-                </label>
-                <label style={{ flex: 1, fontSize: 12 }}>
-                  <div className="ide-label">显示名 label</div>
-                  <input
-                    className="ide-input"
-                    value={p.label}
-                    placeholder="如 初始化知识库"
-                    onChange={(e) => update(i, { label: e.target.value })}
-                  />
-                </label>
-              </div>
-              <label style={{ fontSize: 12 }}>
-                <div className="ide-label">一句话说明 hint</div>
-                <input
-                  className="ide-input"
-                  value={p.hint}
-                  placeholder="下拉里显示的简短说明"
-                  onChange={(e) => update(i, { hint: e.target.value })}
-                />
-              </label>
-              <label style={{ fontSize: 12 }}>
-                <div className="ide-label">提示词内容 prompt（发给 AI 的完整指令）</div>
-                <textarea
-                  className="ide-textarea ide-scroll"
-                  value={p.prompt}
-                  onChange={(e) => update(i, { prompt: e.target.value })}
-                  spellCheck={false}
-                  style={{ minHeight: 120, fontSize: 12.5 }}
-                />
-              </label>
-              <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12.5 }}>
-                <input
-                  type="checkbox"
-                  checked={p.write}
-                  onChange={(e) => update(i, { write: e.target.checked })}
-                />
-                写任务（生成前建检查点、占用工作区写锁）
-                {p.skillId && (
-                  <span style={{ marginLeft: 'auto', color: 'var(--ide-text-tertiary)' }}>
-                    来自技能包 {p.skillId}
-                  </span>
-                )}
-              </label>
-            </div>
-            <button className="ide-btn ide-btn-sm" title="删除该预置" onClick={() => remove(i)}>
+      {(presets ?? []).map((p, i) => {
+        const isExpanded = expandedIndex === i;
+        return (
+        <div key={i} className="ide-card" style={{ marginBottom: 8, cursor: 'pointer', padding: 12 }} onClick={() => setExpandedIndex(isExpanded ? null : i)}>
+          {/* Summary row — always visible */}
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <ChevronRight
+              className="w-3.5 h-3.5"
+              style={{
+                color: 'var(--ide-text-tertiary)',
+                flexShrink: 0,
+                transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                transition: 'transform 0.15s',
+              }}
+            />
+            <span className="ide-text-mono" style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', flexShrink: 0, minWidth: 140 }}>
+              {p.action || '（未设置 action）'}
+            </span>
+            <span style={{ fontSize: 12.5, flex: 1 }}>
+              {p.label || <span style={{ color: 'var(--ide-text-tertiary)' }}>（未命名）</span>}
+            </span>
+            {p.hint && (
+              <span style={{ fontSize: 11.5, color: 'var(--ide-text-secondary)', flex: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {p.hint}
+              </span>
+            )}
+            {p.write && <span className="ide-badge ide-badge-warning" style={{ flexShrink: 0 }}>写</span>}
+            {p.skillId && (
+              <span style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', flexShrink: 0 }}>
+                {p.skillId}
+              </span>
+            )}
+            <button
+              className="ide-btn ide-btn-sm ide-btn-ghost"
+              title="删除该预置"
+              onClick={(e) => { e.stopPropagation(); remove(i); }}
+              style={{ flexShrink: 0 }}
+            >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
           </div>
-        </Card>
-      ))}
+
+          {/* Expanded detail — only shown when clicked */}
+          {isExpanded && (
+            <>
+              <div style={{ height: 1, backgroundColor: 'var(--ide-border-subtle)', margin: '10px 0' }} />
+              <div style={{ display: 'grid', gap: 8 }} onClick={(e) => e.stopPropagation()}>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <label style={{ flex: 1, fontSize: 12 }}>
+                    <div className="ide-label">动作标识 action</div>
+                    <input
+                      className="ide-input"
+                      value={p.action}
+                      placeholder="如 initialize-knowledge / model-report / build-report-package"
+                      onChange={(e) => update(i, { action: e.target.value })}
+                    />
+                  </label>
+                  <label style={{ flex: 1, fontSize: 12 }}>
+                    <div className="ide-label">显示名 label</div>
+                    <input
+                      className="ide-input"
+                      value={p.label}
+                      placeholder="如 初始化知识库"
+                      onChange={(e) => update(i, { label: e.target.value })}
+                    />
+                  </label>
+                </div>
+                <label style={{ fontSize: 12 }}>
+                  <div className="ide-label">一句话说明 hint</div>
+                  <input
+                    className="ide-input"
+                    value={p.hint}
+                    placeholder="下拉里显示的简短说明"
+                    onChange={(e) => update(i, { hint: e.target.value })}
+                  />
+                </label>
+                <label style={{ fontSize: 12 }}>
+                  <div className="ide-label">提示词内容 prompt（发给 AI 的完整指令）</div>
+                  <textarea
+                    className="ide-textarea ide-scroll"
+                    value={p.prompt}
+                    onChange={(e) => update(i, { prompt: e.target.value })}
+                    spellCheck={false}
+                    style={{ minHeight: 120, fontSize: 12.5 }}
+                  />
+                </label>
+                <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12.5 }}>
+                  <input
+                    type="checkbox"
+                    checked={p.write}
+                    onChange={(e) => update(i, { write: e.target.checked })}
+                  />
+                  写任务（生成前建检查点、占用工作区写锁）
+                </label>
+              </div>
+            </>
+          )}
+        </div>
+        );
+      })}
 
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 4 }}>
         <button className="ide-btn ide-btn-sm" onClick={add}>

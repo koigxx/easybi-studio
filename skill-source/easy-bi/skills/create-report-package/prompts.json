@@ -15,6 +15,13 @@
       "hint": "只使用已确认的当前模型生成唯一当前报表包，不再分析或确认业务口径",
       "write": true,
       "prompt": "阅读 skills/create-report-package/SKILL.md，只从该报表已确认且未过期的唯一当前模型生成报表包。不得重新分析知识库、改变字段或关联关系、再次询问业务口径；声明式策略确定性生成 v2，script 策略按 Studio 提供的逐查询 Context Pack 和脚本 Context Pack 编译，最终由 finalize-staged 原子组包。模型资源不足时写结构化 failure 并返回模型修订，不得临时扩展知识范围。"
+    },
+    {
+      "action": "modify-report-model",
+      "label": "AI 修改模型",
+      "hint": "在现有模型与知识库范围内聊天式修改模型（字段/关系/对比等），不重跑完整建模",
+      "write": true,
+      "prompt": "阅读 skills/create-report-package/SKILL.md 中「修改当前模型」部分。当前报表已有一个已确认的模型（reports/models/<report-id>/report-model.json）。你需要：1) 先读懂用户想改什么；2) 只读当前模型的 source.lock.json、semantic-plan.json 和 knowledge 目录中对应表的字段详情，不要重新扫描或跑 discovery；3) 用户可要求增减字段、调整 join 类型/基数、开关环比同比配置、修改筛选或指标口径；涉及字段歧义或口径变更时简短提问确认，其它直接修改 report-model.json 并调用 finalize-staged-model 重签校验；4) 保持模型 status=approved 不变，禁止修改 result_grain 和 strategy。修改完成后向用户列出变更清单。"
     }
   ]
 }

@@ -635,6 +635,7 @@ export type AgentActionType =
   | 'build-report-package'
   | 'create-report'
   | 'modify-report'
+  | 'modify-report-model'
   | 'validate-report';
 
 export type AgentTaskStatus =

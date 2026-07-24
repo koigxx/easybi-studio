@@ -248,7 +248,9 @@ export function buildScopedReportPrompt(
   const instruction =
     action === 'build-report-package'
       ? '只使用该报表已确认的当前模型生成报表包，不得重新建模、读取完整知识库或再次确认业务口径。'
-      : '只执行基础建模，把不清晰事项整理为一次统一确认，不得提前生成 SQL、脚本或报表包。';
+      : action === 'modify-report-model'
+        ? '该报表已有当前模型。请在现有模型与知识库范围内理解用户的修改请求，只做定向修改，不得重新跑完整建模流程。'
+        : '只执行基础建模，把不清晰事项整理为一次统一确认，不得提前生成 SQL、脚本或报表包。';
   const scope = `\n\n本次仅处理报表 ${label}，忽略 config 中的其它 report_requirements；${instruction}`;
   return `${basePrompt}${scope}`;
 }

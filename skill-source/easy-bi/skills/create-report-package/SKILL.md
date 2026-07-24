@@ -162,6 +162,44 @@ fields and relationships for manual editing. Saving an edit must validate every 
 against the knowledge catalog, synchronize query contracts and the compact source lock, update
 the model hash and plan reference, and reseal checksums.
 
+### 2a. 修改当前模型（仅当用户显式要求时）
+
+当用户通过「AI 修改模型」动作进入时，当前报表的 `reports/models/<report-id>/report-model.json`
+已经存在且已确认。此流程**不是**重新建模，而是对现有模型的定向修改。
+
+**前置条件：**
+- `reports/models/<report-id>/report-model.json` 存在且 `status === "approved"` 或 `"draft"`
+- 知识库中对应表的 catalog 可读
+- 用户表达了明确的修改意图
+
+**允许的修改范围：**
+- 增/减 source 的 fields（仅在知识库已有字段范围内）
+- 调整 relationship 的 type、cardinality
+- 增/删 relationship
+- 修改 comparison（环比/同比）配置
+- 修改 filters / metrics 的口径描述
+
+**禁止的修改：**
+- 改变 `result_grain` 或 `strategy`
+- 新增 source 表（超出知识库范围）
+- 重新扫描数据库或跑 discovery
+- 重新询问全局业务确认问题
+
+**流程：**
+
+1. 读取当前模型和 `source.lock.json`，了解已有字段和关系。
+2. 理解用户的修改意图；如果涉及歧义（如"把那个字段去掉"但未指明具体字段），简要提问确认。
+3. 直接编辑 `report-model.json`，修改完成后运行：
+   ```bash
+   node dist/scripts/report-package-cli.js finalize-staged-model \
+     --report-id <report-id> \
+     --root <workspace>/work/report-model/<report-id>/<revision> \
+     --out <workspace>/reports/models/<report-id> \
+     --reviewed-by "<reviewer>"
+   ```
+4. 向用户列出变更清单（字段 X 个变更、关系 Y 个变更、对比配置 Z 个变更）。
+5. 不自动触发生成报表包；用户需手动触发「生成报表」动作。
+
 ## 3. Choose exactly one execution strategy
 
 Do not decide only from table count:

@@ -338,6 +338,7 @@ export const KNOWLEDGE_ACTION_VERBS: string[] = [
 export const REPORT_ACTION_VERBS: string[] = [
   'model-report',
   'build-report-package',
+  'modify-report-model',
   'validate-report',
 ];
 
@@ -352,6 +353,7 @@ const ACTION_LABELS: Record<string, string> = {
   'build-report-package': '生成报表',
   'create-report': '构建报表',
   'modify-report': '修改报表',
+  'modify-report-model': 'AI 修改模型',
   'validate-report': '静态校验报表',
   'free-chat': '自由对话',
 };

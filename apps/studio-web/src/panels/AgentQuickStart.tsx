@@ -92,7 +92,9 @@ export function AgentQuickStart({
                 : needsSelection && selectedReport
                   ? a.action === 'model-report'
                     ? `将为「${selectedReport.name || selectedReport.id}」构建并确认当前模型`
-                    : `将从「${selectedReport.name || selectedReport.id}」的当前模型生成报表包`
+                    : a.action === 'modify-report-model'
+                      ? `将对「${selectedReport.name || selectedReport.id}」的当前模型进行 AI 辅助修改`
+                      : `将从「${selectedReport.name || selectedReport.id}」的当前模型生成报表包`
                   : a.hint;
               return (
                 <button

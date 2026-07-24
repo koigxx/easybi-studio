@@ -594,6 +594,17 @@ describe('buildScopedReportPrompt', () => {
     expect(out).not.toContain('只执行基础建模');
   });
 
+  it('scopes model modification to the existing model', () => {
+    const out = buildScopedReportPrompt(
+      '修改模型。',
+      { id: 'gp', name: '毛利明细' },
+      'modify-report-model',
+    );
+    expect(out).toContain('已有当前模型');
+    expect(out).toContain('定向修改');
+    expect(out).not.toContain('只执行基础建模');
+  });
+
   it('uses just the id when name equals id or is empty', () => {
     expect(buildScopedReportPrompt('x', { id: 'gp', name: 'gp' })).toContain('报表 gp，');
     expect(buildScopedReportPrompt('x', { id: 'gp', name: '' })).toContain('报表 gp，');

@@ -97,12 +97,18 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
               projectId={project.id}
               actions={REPORT_ACTION_VERBS}
               selectedReport={selectedReport}
-              gateActions={['model-report', 'build-report-package']}
+              gateActions={['model-report', 'build-report-package', 'modify-report-model']}
               disabledReasons={{
                 'build-report-package':
                   selectedRequirement && selectedRequirement.modelStatus !== 'approved'
                     ? '请先构建并确认该报表的模型'
                     : undefined,
+                'modify-report-model':
+                  selectedRequirement && !selectedRequirement.modelStatus
+                    ? '该报表尚无模型，请先「构建报表建模」生成初始模型'
+                    : selectedRequirement && selectedRequirement.modelStatus === 'invalid'
+                      ? '该报表模型状态异常（invalid），请先重新构建模型'
+                      : undefined,
               }}
             />
           </>
