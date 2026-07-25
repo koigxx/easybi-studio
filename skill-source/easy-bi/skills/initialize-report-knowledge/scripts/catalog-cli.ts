@@ -1620,10 +1620,20 @@ async function collectTableArtifacts(root: string): Promise<
           }
         }
       }
+      // Cold tables — both aggregated tables.json (legacy) and individual files (current).
       const coldPath = join(base, "cold", "tables.json");
       if (await exists(coldPath)) {
         const cold = await loadJson(coldPath);
         for (const document of cold.tables ?? []) result.push({ tier: "cold", path: null, document });
+      }
+      const coldDir = join(base, "cold", "tables");
+      if (await exists(coldDir)) {
+        for (const file of await readdir(coldDir)) {
+          if (file.endsWith(".json")) {
+            const path = join(coldDir, file);
+            result.push({ tier: "cold", path, document: await loadJson(path) });
+          }
+        }
       }
     }
   }
@@ -2254,9 +2264,7 @@ function enumState(document: JsonObject): {
 }
 
 async function enumFieldRecords(catalog: string): Promise<JsonObject[]> {
-  const artifacts = (await collectTableArtifacts(catalog)).filter(
-    (entry) => entry.tier !== "cold",
-  );
+  const artifacts = await collectTableArtifacts(catalog);
   const records: JsonObject[] = [];
   for (const item of artifacts) {
     for (const field of item.document.physical_fields ?? []) {
@@ -2765,7 +2773,7 @@ export async function importEnums(
       description: read("说明"),
     });
   });
-  return applyEnumRows(catalog, fieldRows, mappingRows, dryRun);
+  return applyEnumRows(catalog, fieldRows, mappingRows, dryRun, true);
 }
 
 interface EnumFieldRow {
@@ -2831,8 +2839,8 @@ async function applyEnumRows(
     const fieldArtifact = artifact?.document.physical_fields?.find(
       (item: JsonObject) => item.physical?.name === field,
     );
-    if (!artifact || artifact.tier === "cold" || !fieldArtifact) {
-      errors.push(`“枚举字段绑定”第 ${rowNumber} 行：找不到字段 ${identifier}.${field}`);
+    if (!artifact || !fieldArtifact) {
+      errors.push(`”枚举字段绑定”第 ${rowNumber} 行：找不到字段 ${identifier}.${field}`);
       continue;
     }
     if (fieldArtifact.filter?.role === "system_condition") {
@@ -2860,7 +2868,7 @@ async function applyEnumRows(
       pushCompleteness(`缺少枚举字段绑定：${split[0]}.${split[1]}`);
     }
   }
-  const seenMappings = new Set<string>();
+  const seenMappings = new Map<string, number>();
   const desiredValues = new Map<string, JsonObject[]>();
   for (const row of mappingRows) {
     const { dictionary_name: dictionaryName, value, label, description, rowNumber } = row;
@@ -2877,11 +2885,20 @@ async function applyEnumRows(
       continue;
     }
     const mappingKey = `${dictionaryName}\u0000${value}`;
-    if (seenMappings.has(mappingKey)) {
-      errors.push(`“枚举值映射”第 ${rowNumber} 行：枚举code重复 ${dictionaryName} / ${value}`);
-      continue;
+    const firstRow = seenMappings.get(mappingKey);
+    if (firstRow !== undefined) {
+      // Duplicate within the uploaded file: warn, keep last occurrence (upsert).
+      warnings.push(
+        `“枚举值映射”第 ${rowNumber} 行：枚举code重复 ${dictionaryName} / ${value}（首次出现在第 ${firstRow} 行，已覆盖为最新值）`,
+      );
+      // Remove the previous entry so last-wins.
+      const prev = desiredValues.get(dictionaryName) ?? [];
+      desiredValues.set(
+        dictionaryName,
+        prev.filter((entry) => entry.value !== value),
+      );
     }
-    seenMappings.add(mappingKey);
+    seenMappings.set(mappingKey, rowNumber);
     desiredValues.set(dictionaryName, [
       ...(desiredValues.get(dictionaryName) ?? []),
       { value, label, description },
@@ -3002,7 +3019,7 @@ async function applyEnumRows(
         `${a.table_id}/${a.field}`.localeCompare(`${b.table_id}/${b.field}`),
       ),
   };
-  for (const artifact of artifacts.filter((item) => item.tier !== "cold")) {
+  for (const artifact of artifacts) {
     let changed = false;
     for (const fieldArtifact of artifact.document.physical_fields ?? []) {
       const key = enumBindingKey(

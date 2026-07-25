@@ -1140,7 +1140,7 @@ test("generic status fields may share when native enum values provide matching e
   assert.equal(exported.mapping_rows, 2);
 });
 
-test("enum import blocks incomplete candidate configuration", async () => {
+test("enum import allows incomplete configuration (warns, doesn't block)", async () => {
   const root = await tempRoot();
   const driver = table(
     "base_primary_driver",
@@ -1164,8 +1164,10 @@ test("enum import blocks incomplete candidate configuration", async () => {
   const enumFile = join(root, "work", "incomplete-enums.xlsx");
   await exportEnums(draft, enumFile);
   const preview = await importEnums(draft, enumFile, true);
-  assert.equal(preview.ok, false);
-  assert.match(preview.errors.join("\n"), /没有配置任何code和中文名称/);
+  // Excel import now uses allowIncomplete: completeness issues are warnings, not blockers.
+  assert.equal(preview.ok, true);
+  assert.equal(preview.errors.length, 0);
+  assert.match(preview.warnings.join("\n"), /没有配置任何code和中文名称/);
 });
 
 test("enums-init writes bindings and prefills native ENUM values offline, idempotently", async () => {
