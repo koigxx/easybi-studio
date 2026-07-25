@@ -1934,6 +1934,7 @@ function buildGroupQueryRawSql(sibling, plan, metricDefs, mergeKeys) {
         ...joinLines,
         "WHERE",
         whereLines,
+        "  /* EASYBI_FILTERS */",
         ...(orderParts.length ? [`ORDER BY ${orderParts.join(", ")}`] : []),
         "",
     ].join("\n");
@@ -2159,18 +2160,62 @@ function buildScriptReportFromGroupQueriesPlan(plan, queryGroups) {
     // Inject all group-query fields into plan.fields so they appear in fields.json.
     // Merge-key dimension fields + all metric fields from every sibling.
     plan.fields = plan.fields ?? [];
-    const existingFieldIds = new Set(plan.fields.map((f) => String(f.id)));
     let fieldOrder = plan.fields.reduce((max, f) => Math.max(max, Number(f.order ?? 0)), 0);
-    // 1. Merge-key dimension fields from the first sibling's merge key columns
+    // Build a set of metric IDs for use during field source rewriting.
+    const allMetricIds = new Set();
+    for (const defs of metricDefsByGroup.values()) {
+        for (const d of defs)
+            allMetricIds.add(d.id);
+    }
+    // Rewrite field sources to clean script lineage. For merge-key dimension fields
+    // and metric fields, the data comes from in-memory computation — replace whatever
+    // nested wrapping exists with a single-level { kind: "script", lineage: columnRef }.
+    // Time-shifted and computed fields keep their own structural shapes.
+    for (const field of plan.fields) {
+        const fid = String(field.id ?? "");
+        const kind = String(field.source?.kind ?? "");
+        if (kind === "time_shifted" || kind === "computed")
+            continue;
+        // Metric fields: replace with clean script→column lineage from the metric def.
+        if (allMetricIds.has(fid)) {
+            const def = [...metricDefsByGroup.values()].flat().find((d) => d.id === fid);
+            const alias = (def?.field ?? "").includes(".") ? (def?.field ?? "").split(".")[0] : "t0";
+            const fieldName = (def?.field ?? "").includes(".") ? (def?.field ?? "").split(".").pop() : (def?.field ?? "");
+            field.source = { kind: "script", lineage: { kind: "column", alias, field: fieldName } };
+            field.output_type = "number";
+            continue;
+        }
+        // Merge-key dimension fields: replace with clean script→column lineage.
+        if (mergeKeys.includes(fid)) {
+            // Try to find the column source from the first sibling's fields.
+            const firstSibling = plan.group_queries.queries?.[0];
+            const siblingField = (firstSibling?.fields ?? []).find((f) => String(f.id) === fid);
+            if (siblingField?.source) {
+                field.source = { kind: "script", lineage: { ...siblingField.source } };
+            }
+            field.output_type = "string";
+            continue;
+        }
+        // Other fields: if not already script, wrap once. If already script but
+        // double-wrapped (script → script → column), flatten to single-level.
+        if (kind !== "script") {
+            field.source = { kind: "script", lineage: { ...field.source } };
+        }
+        else if (field.source?.lineage?.kind === "script" &&
+            field.source?.lineage?.lineage) {
+            // Flatten double-wrapped script source from prior pipeline runs.
+            field.source = { ...field.source.lineage };
+        }
+    }
+    // Ensure merge-key fields exist (add if missing from plan.fields).
+    const existingFieldIds = new Set(plan.fields.map((f) => String(f.id)));
     for (const sibling of plan.group_queries.queries) {
         for (const f of sibling.fields ?? []) {
             const fid = String(f.id ?? "");
             if (existingFieldIds.has(fid))
                 continue;
-            // Check if this is a merge key (column kind) or metric field
-            const kind = f.source?.kind;
-            if (kind === "column" && mergeKeys.includes(fid)) {
-                // Merge key dimension — needs to be in plan.fields
+            const fkind = f.source?.kind;
+            if (fkind === "column" && mergeKeys.includes(fid)) {
                 fieldOrder += 1;
                 plan.fields.push({
                     id: fid,
@@ -2183,31 +2228,6 @@ function buildScriptReportFromGroupQueriesPlan(plan, queryGroups) {
                 existingFieldIds.add(fid);
             }
         }
-    }
-    // 2. All metric fields from metric definitions
-    for (const gid of metricDefsByGroup.keys()) {
-        for (const d of metricDefsByGroup.get(gid) ?? []) {
-            if (existingFieldIds.has(d.id))
-                continue;
-            fieldOrder += 1;
-            plan.fields.push({
-                id: d.id,
-                label: d.label,
-                order: fieldOrder,
-                output_type: "number",
-                source: { kind: "script", lineage: { kind: "column", alias: d.field.includes(".") ? d.field.split(".")[0] : "t0", field: d.field.includes(".") ? d.field.split(".").pop() : d.field } },
-                roles: ["output", "metric"],
-            });
-            existingFieldIds.add(d.id);
-        }
-    }
-    // Rewrite all field sources to script lineage
-    for (const field of plan.fields ?? []) {
-        const kind = String(field.source?.kind ?? "");
-        if (kind === "time_shifted" || kind === "computed")
-            continue;
-        const originalSource = { ...field.source };
-        field.source = { kind: "script", lineage: originalSource };
     }
 }
 /**
@@ -2487,14 +2507,19 @@ function validateScriptSource(source) {
     }
 }
 function safeScriptSql(sql, mode) {
-    const withoutKeys = sql.replace(/\/\*\s*KEYS\s*\*\//g, "KEYS_MARKER");
+    // Allow both /* KEYS */ (batch lookup) and /* EASYBI_FILTERS */ (filter injection)
+    // markers, but reject any other /* ... */ comment blocks.
+    const withoutSafeComments = sql
+        .replace(/\/\*\s*KEYS\s*\*\//g, "KEYS_MARKER")
+        .replace(/\/\*\s*EASYBI_FILTERS\s*\*\//gi, "EASYBI_FILTERS_MARKER")
+        .replace(/\/\*\s*EASYBI_HAVING_FILTERS\s*\*\//gi, "EASYBI_HAVING_FILTERS_MARKER");
     if (!/^\s*(?:SELECT|WITH)\b/i.test(sql)) {
         throw new Error("v3 查询必须以 SELECT 或 WITH 开头");
     }
     if (/\b(?:INSERT|UPDATE|DELETE|REPLACE|MERGE|UPSERT|CREATE|ALTER|DROP|TRUNCATE|CALL|EXECUTE|GRANT|REVOKE)\b/i.test(sql)) {
         throw new Error("v3 查询只能包含只读 SELECT/CTE，禁止 DDL、DML 和过程调用");
     }
-    if (/;|--|#|\/\*(?!\s*KEYS\s*\*\/)/.test(withoutKeys)) {
+    if (/;|--|#|\/\*(?!\s*KEYS\s*\*\/)/.test(withoutSafeComments)) {
         throw new Error("v3 查询包含分号、注释或其它不安全结构");
     }
     const markerCount = (sql.match(/\/\*\s*KEYS\s*\*\//g) ?? []).length;
@@ -5549,11 +5574,6 @@ export async function configurePlan(planPathValue, configurationPathValue) {
     // runtime. Resolved from knowledge here; stored in plan.group_queries.
     if (configuration.group_queries) {
         await applyGroupQueries(plan, configuration.group_queries);
-        // Auto-generate a v3 script report from group_queries: raw-data SQL per sibling
-        // + in-memory COUNT DISTINCT dedup + full-outer-merge on merge_keys.
-        if (Array.isArray(configuration.query_groups) && configuration.query_groups.length) {
-            buildScriptReportFromGroupQueriesPlan(plan, configuration.query_groups);
-        }
     }
     if (configuration.script_report) {
         await applyScriptReport(plan, configuration.script_report);
@@ -5638,6 +5658,14 @@ export async function configurePlan(planPathValue, configurationPathValue) {
                 };
             }
         }
+    }
+    // Auto-generate a v3 script report from group_queries if declarative query_groups
+    // are present. Must run AFTER the field override loop so script-kind rewriting
+    // on plan.fields is not undone by column-kind overrides from configuration.
+    if (configuration.group_queries &&
+        Array.isArray(configuration.query_groups) &&
+        configuration.query_groups.length) {
+        buildScriptReportFromGroupQueriesPlan(plan, configuration.query_groups);
     }
     // Append brand-new computed / sql_expression fields declared in the config.
     // These are transform- or expression-produced (环比/同比 deltas, ratios, …) and
