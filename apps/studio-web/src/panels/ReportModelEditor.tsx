@@ -829,13 +829,28 @@ function FieldDirectoryTab({
                       <span className="ide-text-mono" style={{ fontSize: 11 }}>{f.source || '—'}</span>
                       <button className="ide-btn ide-btn-sm ide-btn-ghost" style={{ marginLeft: 6, padding: '0 4px' }}
                         onClick={() => {
-                          // Edit dimension source: treat as metric edit on a synthetic metric
-                          const m = model.metrics.find((mm) => mm.label === f.label);
-                          if (m) setEditingMetricId(editingMetricId === m.id ? null : m.id);
+                          const dimId = `_dim_${f.name}`;
+                          setEditingMetricId(editingMetricId === dimId ? null : dimId);
                         }}
-                        title="编辑来源映射">
+                        title="编辑来源列">
                         <Edit3 className="w-3 h-3" />
                       </button>
+                      {/* Dimension edit: single source field selector only */}
+                      {editingMetricId === `_dim_${f.name}` && (
+                        <div style={{ marginTop: 6 }}>
+                          <select className="ide-select" style={{ fontSize: 10.5, width: '100%' }}
+                            value={f.source || ''}
+                            onChange={(e) => {
+                              if (!e.target.value) return;
+                              const parts = e.target.value.split('.');
+                              // Persist dimension edit via metricEdits with a synthetic ID
+                              onMetricEdit({ id: f.name, sourceAlias: parts[0], sourceField: parts.slice(1).join('.') });
+                            }}>
+                            <option value="">选择来源列…</option>
+                            {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
+                          </select>
+                        </div>
+                      )}
                     </>
                   ) : f.kind === 'timeshifted' ? (
                     <span className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
@@ -891,8 +906,9 @@ function FieldDirectoryTab({
                         const srcField = edit?.sourceField ?? m.sourceField;
                         const dedup = edit?.dedupKey ?? m.dedupKey;
                         const srcValue = srcAlias && srcField ? `${srcAlias}.${srcField}` : '';
+                        const needsDedup = m.aggregation === 'count_distinct';
                         return (
-                          <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                          <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: needsDedup ? '1fr 1fr' : '1fr', gap: 6 }}>
                             <select className="ide-select" style={{ fontSize: 10.5 }}
                               value={srcValue}
                               onChange={(e) => {
@@ -903,19 +919,21 @@ function FieldDirectoryTab({
                               <option value="">选择来源字段…</option>
                               {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
                             </select>
-                            <select className="ide-select" style={{ fontSize: 10.5 }}
-                              value={dedup ?? ''}
-                              onChange={(e) => { if (e.target.value) onMetricEdit({ id: m.id, dedupKey: e.target.value }); }}>
-                              <option value="">选择去重键…</option>
-                              {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
-                            </select>
+                            {needsDedup && (
+                              <select className="ide-select" style={{ fontSize: 10.5 }}
+                                value={dedup ?? ''}
+                                onChange={(e) => { if (e.target.value) onMetricEdit({ id: m.id, dedupKey: e.target.value }); }}>
+                                <option value="">选择去重键…</option>
+                                {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
+                              </select>
+                            )}
                           </div>
                         );
                       })()}
                       {/* Edit section for fields without a model metric entry — synthetic edit */}
                       {!f.metric && editingMetricId === `_synth_${f.name}` && (
-                        <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                          <select className="ide-select" style={{ fontSize: 10.5 }}
+                        <div style={{ marginTop: 6 }}>
+                          <select className="ide-select" style={{ fontSize: 10.5, width: '100%' }}
                             value=""
                             onChange={(e) => {
                               if (!e.target.value) return;
@@ -923,12 +941,6 @@ function FieldDirectoryTab({
                               onMetricEdit({ id: f.name, sourceAlias: parts[0], sourceField: parts.slice(1).join('.') });
                             }}>
                             <option value="">选择来源字段…</option>
-                            {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
-                          </select>
-                          <select className="ide-select" style={{ fontSize: 10.5 }}
-                            value=""
-                            onChange={(e) => { if (e.target.value) onMetricEdit({ id: f.name, dedupKey: e.target.value }); }}>
-                            <option value="">选择去重键…</option>
                             {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
                           </select>
                         </div>
@@ -1176,7 +1188,6 @@ function ComparisonSection({
   const enabled = comp?.enabled ?? false;
   const modes = comp?.modes ?? [];
   const periodParam = comp?.period_param ?? '';
-  const lookbackMonths = comp?.lookback_months ?? 1;
   const candidates = candidateTimeColumns(model);
   const canUse = model.strategy !== 'group_queries';
 
@@ -1185,7 +1196,7 @@ function ComparisonSection({
       enabled: enabled,
       modes: [...modes],
       period_param: periodParam,
-      lookback_months: lookbackMonths,
+      lookback_months: 1,
       ...comp,
       ...patch,
     };
@@ -1260,22 +1271,9 @@ function ComparisonSection({
                   ))}
                 </select>
               </label>
-
-              <label style={{ flex: '0 0 120px', fontSize: 12 }}>
-                <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>环比回溯月数</div>
-                <input
-                  className="ide-input"
-                  type="number"
-                  min={1}
-                  max={12}
-                  value={Number.isFinite(lookbackMonths) ? lookbackMonths : 1}
-                  onChange={(e) => update({ lookback_months: Math.max(1, Number(e.target.value) || 1) })}
-                />
-              </label>
             </div>
             <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', lineHeight: 1.5 }}>
-              启用后，报表将自动追加必填按月时间筛选，运行时间窗口会自动扩展以覆盖对比周期。
-              环比对比前一月，同比对比去年同月。如需修改对比逻辑，请调整上述参数后重新生成报表包。
+              环比对比前一等长周期，同比对比去年同周期。对比窗口会自动根据筛选时间范围扩展，无需手动配置回溯月数。
             </div>
           </>
         )}
