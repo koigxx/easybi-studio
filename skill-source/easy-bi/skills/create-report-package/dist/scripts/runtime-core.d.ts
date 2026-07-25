@@ -2,8 +2,8 @@ import { createServer } from "node:http";
 type JsonRecord = Record<string, any>;
 export declare class RuntimeError extends Error {
     readonly code: string;
-    readonly details?: unknown;
-    constructor(code: string, message: string, details?: unknown);
+    readonly details?: unknown | undefined;
+    constructor(code: string, message: string, details?: unknown | undefined);
 }
 export type LoadedReport = {
     root: string;

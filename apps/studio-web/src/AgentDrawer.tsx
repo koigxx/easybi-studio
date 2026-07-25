@@ -285,14 +285,21 @@ export function AgentDrawerProvider({
       chat.phase === 'AWAITING_MODEL_CONFIRMATION' ||
       chat.phase === 'AWAITING_DISCOVERY_CONFIRMATION' ||
       chat.phase === 'AWAITING_MODEL_APPROVAL';
-    if (!isOpen && needsConfirmation) {
+    if (!isOpen && needsConfirmation && !userDismissedRef.current) {
       setIsOpen(true);
+    }
+    // Reset the dismiss flag when a new confirmation round arrives.
+    if (!needsConfirmation) {
+      userDismissedRef.current = false;
     }
   }, [isOpen, chat.status, chat.phase]);
   const esRef = useRef<EventSource | null>(null);
   // Mirror of chat.eventCount readable synchronously inside callbacks, so a reply's
   // re-subscribe knows how many server events were already consumed (the SSE `since`).
   const eventCountRef = useRef(0);
+  // Track whether the user explicitly dismissed the confirmation dialog so the
+  // auto-open effect (L282) doesn't fight the manual close and cause a reopen loop.
+  const userDismissedRef = useRef(false);
   useEffect(() => {
     eventCountRef.current = chat.eventCount;
   }, [chat.eventCount]);
@@ -303,6 +310,8 @@ export function AgentDrawerProvider({
       setConfirmationAnswers({});
       return;
     }
+    // New confirmation round → allow auto-open again even if user dismissed the previous one.
+    userDismissedRef.current = false;
     setConfirmationAnswers(
       Object.fromEntries(
         confirmation.questions
@@ -603,7 +612,7 @@ export function AgentDrawerProvider({
         <>
           {/* Backdrop: closes on click; also stops the drawer looking transparent
               over the knowledge tier tables underneath (issue #2). */}
-          <div className="chat-backdrop" onClick={() => setIsOpen(false)} />
+          <div className="chat-backdrop" onClick={() => { userDismissedRef.current = true; setIsOpen(false); }} />
           <DrawerView
             view={view}
             chat={chat}
@@ -623,7 +632,7 @@ export function AgentDrawerProvider({
             onSend={sendReply}
             onDirectConfirm={directConfirm}
             onCancel={interrupt}
-            onClose={() => setIsOpen(false)}
+            onClose={() => { userDismissedRef.current = true; setIsOpen(false); }}
             onShowHistory={showHistory}
             onNewChat={startFreeChat}
             onOpenConversation={openConversation}

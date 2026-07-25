@@ -584,6 +584,40 @@ function componentFor(valueType, operators) {
 }
 /** Comparison (环比/同比) modes the runtime knows how to look back for. */
 const COMPARISON_MODES = new Set(["chain", "yoy"]);
+/** Time-shifted metric (单字段跨期计算) supported shift modes. */
+const TIME_SHIFTED_SHIFT_MODES = new Set(["chain", "yoy"]);
+/** Time-shifted metric supported operations between current and shifted value. */
+const TIME_SHIFTED_OPERATIONS = new Set(["subtract", "divide", "percent_change"]);
+/**
+ * Normalize and validate a time_shifted field source declaration.
+ * Expected shape:
+ *   { kind: "time_shifted", base_metric: "field_xxx", shift: "chain"|"yoy",
+ *     lookback: number, operation: "subtract"|"divide"|"percent_change" }
+ */
+function normalizeTimeShiftedSource(raw) {
+    if (typeof raw !== "object" || raw === null) {
+        throw new Error("time_shifted source 必须是对象");
+    }
+    const s = raw;
+    if (String(s.kind) !== "time_shifted")
+        throw new Error("time_shifted source.kind 必须是 time_shifted");
+    const baseMetric = String(s.base_metric ?? "").trim();
+    if (!baseMetric)
+        throw new Error("time_shifted source.base_metric 不能为空");
+    const shift = String(s.shift ?? "").trim();
+    if (!TIME_SHIFTED_SHIFT_MODES.has(shift)) {
+        throw new Error(`time_shifted source.shift 必须是 chain 或 yoy，收到：${shift}`);
+    }
+    const lookback = Number(s.lookback ?? 1);
+    if (!Number.isInteger(lookback) || lookback < 1) {
+        throw new Error(`time_shifted source.lookback 必须是 >=1 的整数，收到：${s.lookback}`);
+    }
+    const operation = String(s.operation ?? "subtract").trim();
+    if (!TIME_SHIFTED_OPERATIONS.has(operation)) {
+        throw new Error(`time_shifted source.operation 必须是 ${[...TIME_SHIFTED_OPERATIONS].join(" / ")}，收到：${operation}`);
+    }
+    return { kind: "time_shifted", base_metric: baseMetric, shift, lookback, operation };
+}
 /**
  * Normalize a configuration `comparison` block into the plan/manifest shape.
  * `chain` = 环比（对比上一个月），`yoy` = 同比（对比去年同月）。`period_param` is the
@@ -1246,6 +1280,32 @@ function validatePlanV2(plan) {
             else if (kind === "script" && plan.script_report) {
                 // Produced by the isolated v3 report script through ctx.emit. Physical
                 // lineage, when known, is preserved under source.lineage and query locks.
+            }
+            else if (kind === "time_shifted") {
+                // Time-shifted metric: must reference an existing base metric.
+                const baseId = String(field.source?.base_metric ?? "");
+                if (!baseId) {
+                    errors.push(`time_shifted 字段 ${field.id} 缺少 base_metric`);
+                }
+                else if (!(plan.fields ?? []).some((f) => String(f.id) === baseId)) {
+                    errors.push(`time_shifted 字段 ${field.id} 引用的 base_metric ${baseId} 不存在`);
+                }
+                const shift = String(field.source?.shift ?? "");
+                if (!TIME_SHIFTED_SHIFT_MODES.has(shift)) {
+                    errors.push(`time_shifted 字段 ${field.id} 的 shift ${shift} 无效（仅支持 chain / yoy）`);
+                }
+                const lookback = Number(field.source?.lookback ?? 1);
+                if (!Number.isInteger(lookback) || lookback < 1) {
+                    errors.push(`time_shifted 字段 ${field.id} 的 lookback 必须是 >=1 的整数`);
+                }
+                const operation = String(field.source?.operation ?? "subtract");
+                if (!TIME_SHIFTED_OPERATIONS.has(operation)) {
+                    errors.push(`time_shifted 字段 ${field.id} 的 operation ${operation} 无效（仅支持 ${[...TIME_SHIFTED_OPERATIONS].join(" / ")}）`);
+                }
+                // time_shifted + comparison are mutually exclusive
+                if (plan.comparison?.enabled) {
+                    errors.push(`time_shifted 字段 ${field.id} 与 comparison（环比/同比全量对比）互斥；请选择其中一种方式`);
+                }
             }
             else {
                 errors.push(`字段 ${field.id} 使用未知来源种类 ${kind}`);
@@ -2207,6 +2267,517 @@ if (!ctx.isPreview && __comp.modes.length) {
 `;
     const original = String(plan.script_report.source ?? "");
     plan.script_report.source = wrapper + original + "\n" + trailer;
+}
+/** Scan configuration.fields for time_shifted declarations and extract query metadata. */
+function collectTimeShiftedDecls(configuration) {
+    // Build a map of metric ID → output_column from declarative config sources
+    const metricColumnMap = new Map();
+    // From query_groups (legacy declarative format for sql/group_queries)
+    for (const g of configuration.query_groups ?? []) {
+        for (const m of g.metrics ?? []) {
+            const col = String(m.output_column ?? m.field ?? m.id ?? "");
+            metricColumnMap.set(String(m.id), col.includes(".") ? col.split(".").pop() ?? col : col);
+        }
+    }
+    // From top-level fields
+    for (const f of configuration.fields ?? []) {
+        const col = String(f.output_column ?? f.id ?? "");
+        metricColumnMap.set(String(f.id), col);
+    }
+    // From group_queries (newer declarative format)
+    for (const q of configuration.group_queries?.queries ?? []) {
+        for (const f of q.fields ?? []) {
+            const col = String(f.id ?? "");
+            metricColumnMap.set(col, col);
+        }
+    }
+    const decls = [];
+    for (const candidate of configuration.fields ?? []) {
+        if (candidate.source?.kind !== "time_shifted")
+            continue;
+        const source = normalizeTimeShiftedSource(candidate.source);
+        const baseMetric = String(source.base_metric);
+        decls.push({
+            id: String(candidate.id ?? ""),
+            label: String(candidate.label ?? candidate.id ?? ""),
+            base_metric: baseMetric,
+            base_column: metricColumnMap.get(baseMetric) ?? baseMetric,
+            shift: String(source.shift),
+            lookback: Number(source.lookback),
+            operation: String(source.operation),
+        });
+    }
+    if (!decls.length)
+        return { groups: [], queryMeta: null };
+    // Extract query metadata from the first query_group for SQL generation.
+    let queryMeta = null;
+    const qg = (configuration.query_groups ?? [])[0];
+    if (qg) {
+        const alias = String(qg.primary_alias ?? "t0");
+        queryMeta = {
+            primary_alias: alias,
+            primary_table: String(qg.primary_table ?? ""),
+            profile_id: String(qg.profile_id ?? ""),
+            database: String(qg.database ?? ""),
+            group_by: (qg.group_by ?? []).map((g) => String(g).includes(".") ? String(g).split(".").pop() ?? String(g) : String(g)),
+            metrics: (qg.metrics ?? []),
+            metricColumns: metricColumnMap,
+            system_conditions: [],
+            time_filter: (qg.time_filter ?? null),
+            filters: (qg.filters ?? []),
+            order_by: (qg.order_by ?? []),
+        };
+        // Extract system conditions
+        const ld = qg.system_conditions?.logical_delete;
+        if (ld) {
+            const items = Array.isArray(ld) ? ld : [ld];
+            for (const item of items) {
+                queryMeta.system_conditions.push({
+                    alias: String(item.field ?? "").includes(".")
+                        ? String(item.field).split(".")[0]
+                        : alias,
+                    field: String(item.field ?? "").includes(".")
+                        ? String(item.field).split(".").pop() ?? ""
+                        : String(item.field ?? ""),
+                    operator: String(item.operator ?? "eq"),
+                    value: item.value ?? 0,
+                });
+            }
+        }
+        // Tenant binding
+        const tb = qg.tenant_binding;
+        if (tb?.field) {
+            queryMeta.system_conditions.push({
+                alias: String(tb.field).includes(".") ? String(tb.field).split(".")[0] : alias,
+                field: String(tb.field).includes(".") ? String(tb.field).split(".").pop() ?? "" : String(tb.field),
+                operator: "eq",
+                value: null, // bound at runtime
+            });
+        }
+        // Business exclusions
+        for (const excl of (qg.business_exclusions ?? [])) {
+            const field = String(excl.field ?? "");
+            queryMeta.system_conditions.push({
+                alias: field.includes(".") ? field.split(".")[0] : alias,
+                field: field.includes(".") ? field.split(".").pop() ?? "" : field,
+                operator: String(excl.operator ?? "eq"),
+                values: excl.values ?? [],
+                placement: String(excl.placement ?? "WHERE"),
+            });
+        }
+    }
+    return { groups: groupTimeShiftedFields(decls), queryMeta };
+}
+/** Group time-shifted field declarations by (shift, lookback) to minimize extra queries. */
+function groupTimeShiftedFields(decls) {
+    const groups = new Map();
+    for (const d of decls) {
+        const key = `${d.shift}:${d.lookback}`;
+        if (!groups.has(key)) {
+            groups.set(key, {
+                shift: d.shift,
+                lookback: d.lookback,
+                effectiveLookback: d.shift === "yoy" ? 12 : d.lookback,
+                fields: [],
+            });
+        }
+        groups.get(key).fields.push(d);
+    }
+    return [...groups.values()];
+}
+/**
+ * Validate base_metrics exist in plan.fields or declarative config metrics,
+ * and inject time_shifted fields AND missing base_metric stubs into plan.fields
+ * so the FIELD_NOT_FOUND blocker resolution picks them up and buildSql can
+ * generate complete SQL.
+ */
+function resolveTimeShiftedMetrics(plan, decls, configMetricIds, configMetricColumns) {
+    const existingIds = new Set((plan.fields ?? []).map((f) => String(f.id)));
+    const errors = [];
+    for (const d of decls) {
+        if (!existingIds.has(d.base_metric) && !configMetricIds.has(d.base_metric)) {
+            errors.push(`time_shifted 字段 ${d.id}（${d.label}）引用的 base_metric ${d.base_metric} 不在 plan.fields 或声明式配置指标中`);
+        }
+        // Inject the base metric as a plan field if it's only in declarative config.
+        if (!existingIds.has(d.base_metric) && configMetricIds.has(d.base_metric)) {
+            const colInfo = configMetricColumns.get(d.base_metric);
+            plan.fields.push({
+                id: d.base_metric,
+                label: d.base_metric,
+                output_column: colInfo?.column ?? d.base_metric,
+                output_type: "number",
+                source: {
+                    kind: "column",
+                    alias: colInfo?.alias ?? "t0",
+                    field: colInfo?.field ?? d.base_metric,
+                },
+                roles: ["output", "metric"],
+            });
+            existingIds.add(d.base_metric);
+        }
+        // Inject the time_shifted field itself.
+        if (existingIds.has(d.id))
+            continue;
+        plan.fields.push({
+            id: d.id,
+            label: d.label,
+            output_type: "number",
+            source: {
+                kind: "time_shifted",
+                base_metric: d.base_metric,
+                shift: d.shift,
+                lookback: d.lookback,
+                operation: d.operation,
+            },
+            roles: ["output", "metric"],
+        });
+        existingIds.add(d.id);
+    }
+    if (errors.length)
+        throw new Error(errors.join("；"));
+    plan._has_time_shifted = decls.length > 0;
+}
+/**
+ * Generate the TypeScript script source for time-shifted metrics.
+ * The script:
+ *  1. Defines a shiftMonths helper (reused from comparison wrapper)
+ *  2. For each shift group, builds an index Map<groupKey, row> from
+ *     queryStreamWithFilters with shifted filters
+ *  3. Streams the main query, looks up shifted indexes, computes deltas, emits
+ */
+function buildTimeShiftedScriptSource(plan, shiftGroups, periodParam) {
+    // Resolve group key for time-shifted index lookup. Priority:
+    //  1. semantic_plan.dimensions[0].id (e.g. "shipper_name")
+    //  2. result_grain.keys[0] (model format)
+    //  3. First group_by column from query_groups/group_queries
+    //  4. Fallback "id"
+    const groupKeyRaw = plan.semantic_plan?.dimensions?.[0]?.id ??
+        plan.result_grain?.keys?.[0];
+    const groupKey = groupKeyRaw
+        ? typeof groupKeyRaw === "string"
+            ? groupKeyRaw.split(".").pop() ?? groupKeyRaw // "t0.shipper_name" → "shipper_name"
+            : groupKeyRaw?.field ?? groupKeyRaw?.name ?? String(groupKeyRaw)
+        : "id";
+    // Resolve each time_shifted field's base metric to its output column name.
+    // base_column is resolved during collectTimeShiftedDecls from the declarative config.
+    const fieldMap = new Map((plan.fields ?? []).map((f) => [String(f.id), f]));
+    const resolveColumn = (decl) => {
+        // Prefer the pre-resolved column from the declarative config.
+        if (decl.base_column)
+            return decl.base_column;
+        // Fallback: look up in plan.fields.
+        const f = fieldMap.get(decl.base_metric);
+        if (!f)
+            return decl.base_metric;
+        return String(f.output_column ??
+            f.source?.field ??
+            f.source?.expression ??
+            f.id ??
+            decl.base_metric);
+    };
+    const resolveLabel = (baseMetricId) => {
+        const f = fieldMap.get(baseMetricId);
+        return f ? String(f.label ?? baseMetricId) : baseMetricId;
+    };
+    const lines = [];
+    lines.push("// === AUTO-GENERATED: time-shifted metrics script ===");
+    lines.push("// shiftMonths: offset a period filter's {from,to} range by N months.");
+    lines.push("function shiftMonths(filterValue, months) {");
+    lines.push("  if (!filterValue) return filterValue;");
+    lines.push("  let range = filterValue;");
+    lines.push("  let wrapperObj = null;");
+    lines.push("  if (typeof range === 'object' && range !== null && !Array.isArray(range) && 'value' in range) {");
+    lines.push("    wrapperObj = range;");
+    lines.push("    range = range.value;");
+    lines.push("  }");
+    lines.push("  if (!range || typeof range !== 'object' || !range.from || !range.to) return filterValue;");
+    lines.push("  const shift = (ym) => {");
+    lines.push("    const [y, m] = String(ym).split('-').map(Number);");
+    lines.push("    if (!Number.isFinite(y) || !Number.isFinite(m)) return ym;");
+    lines.push("    const total = y * 12 + (m - 1) + months;");
+    lines.push("    const ny = Math.floor(total / 12);");
+    lines.push("    const nm = (total % 12) + 1;");
+    lines.push("    const padded = `${String(ny).padStart(4, '0')}-${String(nm).padStart(2, '0')}`;");
+    lines.push("    const rest = String(ym).slice(7);");
+    lines.push("    return rest ? padded + rest : padded + '-01';");
+    lines.push("  };");
+    lines.push("  const shifted = { ...range, from: shift(String(range.from)), to: shift(String(range.to)) };");
+    lines.push("  return wrapperObj ? { ...wrapperObj, value: shifted } : shifted;");
+    lines.push("}");
+    lines.push("");
+    lines.push("export async function run(ctx) {");
+    lines.push(`  const periodValue = ctx.filters?.[${JSON.stringify(periodParam)}];`);
+    lines.push("");
+    // Build a shifted index for each shift group
+    for (const g of shiftGroups) {
+        const indexName = `${g.shift}Index`;
+        const monthsBack = g.effectiveLookback;
+        const label = g.shift === "chain" ? "环比" : "同比";
+        lines.push(`  // Build ${label} index (shift back ${monthsBack} month(s))`);
+        lines.push(`  let ${indexName} = null;`);
+        lines.push("  if (periodValue) {");
+        lines.push(`    const ${g.shift}Filters = { ...ctx.filters, ${JSON.stringify(periodParam)}: shiftMonths(periodValue, ${-monthsBack}) };`);
+        lines.push(`    const ${g.shift}Map = new Map();`);
+        lines.push(`    for await (const row of ctx.queryStreamWithFilters('main', ${g.shift}Filters)) {`);
+        lines.push(`      ${g.shift}Map.set(row[${JSON.stringify(groupKey)}], row);`);
+        lines.push("    }");
+        lines.push(`    ${indexName} = ${g.shift}Map;`);
+        lines.push("  }");
+        lines.push("");
+    }
+    // Stream main + merge
+    lines.push("  // Stream main query and merge time-shifted values");
+    lines.push("  for await (const row of ctx.queryStream('main', ctx.filters)) {");
+    lines.push(`    const key = row[${JSON.stringify(groupKey)}];`);
+    lines.push("");
+    // Generate merge + compute logic
+    const usedBaseMetrics = new Set();
+    for (const g of shiftGroups) {
+        const indexName = `${g.shift}Index`;
+        lines.push(`    const ${g.shift}Row = ${indexName}?.get(key);`);
+        if (g.fields.length > 0) {
+            lines.push(`    if (${g.shift}Row) {`);
+            for (const f of g.fields) {
+                const col = resolveColumn(f);
+                const baseLabel = resolveLabel(f.base_metric);
+                // Reference the base metric's output column name on the current row
+                lines.push(`      // ${f.label} = current ${baseLabel} - ${g.shift} ${baseLabel}`);
+                if (f.operation === "subtract") {
+                    lines.push(`      row[${JSON.stringify(f.id)}] = (row[${JSON.stringify(col)}] ?? 0) - (${g.shift}Row[${JSON.stringify(col)}] ?? 0);`);
+                }
+                else if (f.operation === "divide") {
+                    lines.push(`      row[${JSON.stringify(f.id)}] = ${g.shift}Row[${JSON.stringify(col)}] != 0 ? (row[${JSON.stringify(col)}] ?? 0) / ${g.shift}Row[${JSON.stringify(col)}] : null;`);
+                }
+                else if (f.operation === "percent_change") {
+                    lines.push(`      row[${JSON.stringify(f.id)}] = ${g.shift}Row[${JSON.stringify(col)}] != 0 ? ((row[${JSON.stringify(col)}] ?? 0) - ${g.shift}Row[${JSON.stringify(col)}]) / ${g.shift}Row[${JSON.stringify(col)}] * 100 : null;`);
+                }
+            }
+            lines.push("    }");
+        }
+        lines.push("");
+    }
+    lines.push("    ctx.emit(row);");
+    lines.push("  }");
+    lines.push("}");
+    return lines.join("\n") + "\n";
+}
+/**
+ * Build a script_report structure from a plan that has time_shifted metrics.
+ * Generates a proper aggregated SQL query from the query metadata, locks sources,
+ * and creates a generated script that handles querying + merging + computing
+ * time-shifted fields.
+ */
+function buildScriptReportFromTimeShiftedPlan(plan, shiftGroups, periodParam, queryMeta) {
+    const primaryTable = plan.source?.primary_table;
+    const db = queryMeta?.database ?? String(primaryTable?.database ?? "");
+    const table = queryMeta?.primary_table ?? String(primaryTable?.table ?? "");
+    const alias = queryMeta?.primary_alias ?? String(primaryTable?.alias ?? "t0");
+    const profileId = queryMeta?.profile_id ?? String(primaryTable?.profile_id ?? "");
+    const dialect = dialectForPlan(plan);
+    // Build GROUP BY from queryMeta or semantic_plan.dimensions
+    const groupByCols = queryMeta?.group_by?.length
+        ? queryMeta.group_by
+        : (plan.semantic_plan?.dimensions ?? [])
+            .map((d) => String(d.id ?? ""));
+    const groupByIdents = groupByCols.map((col) => columnExpression(alias, col, dialect));
+    // Build SELECT list: dimension columns + aggregated metrics
+    const selectParts = [];
+    const addedCols = new Set();
+    // 1. Dimension columns (plain, no aggregation)
+    for (const col of groupByCols) {
+        if (addedCols.has(col))
+            continue;
+        selectParts.push(`${columnExpression(alias, col, dialect)} AS ${quoteIdentifier(col, dialect)}`);
+        addedCols.add(col);
+    }
+    // 2. ALL metric columns from queryMeta (incl. those not referenced by time_shifted)
+    const metricMap = new Map();
+    const metricIds = [];
+    for (const m of queryMeta?.metrics ?? []) {
+        const mid = String(m.id);
+        metricMap.set(mid, m);
+        metricIds.push(mid);
+    }
+    // 3. Also include plan.fields that are NOT time_shifted and NOT already in group_by
+    //    (e.g., extra dimension columns from inspectReport)
+    for (const field of plan.fields ?? []) {
+        const kind = String(field.source?.kind ?? "");
+        if (kind === "time_shifted")
+            continue;
+        if (kind === "computed")
+            continue;
+        const fid = String(field.id ?? "");
+        const colName = String(field.output_column ?? fid);
+        // Skip if already in GROUP BY or metrics
+        if (addedCols.has(colName))
+            continue;
+        if (metricMap.has(fid))
+            continue;
+        if (groupByCols.includes(colName) || groupByCols.includes(fid))
+            continue;
+        // Extra non-grouped, non-metric columns: wrap in MAX() to be safe in GROUP BY
+        if (kind === "column" || kind === "boolean_flag") {
+            const fName = String(field.source?.field ?? colName);
+            const fAlias = String(field.source?.alias ?? alias);
+            selectParts.push(`MAX(${columnExpression(fAlias, fName, dialect)}) AS ${quoteIdentifier(colName, dialect)}`);
+            addedCols.add(colName);
+        }
+        else if (kind === "sql_expression") {
+            selectParts.push(`${String(field.source?.expression ?? colName)} AS ${quoteIdentifier(colName, dialect)}`);
+            addedCols.add(colName);
+        }
+    }
+    // 4. Process ALL metrics from queryMeta
+    for (const mid of metricIds) {
+        const metricDef = metricMap.get(mid);
+        if (!metricDef)
+            continue;
+        const colName = String(metricDef.output_column ?? mid);
+        if (addedCols.has(colName))
+            continue;
+        // Look up aggregation info from queryMeta
+        const agg = String(metricDef.aggregation ?? "").toLowerCase();
+        const rawField = String(metricDef.field ?? "");
+        const fieldParts = rawField.includes(".") ? rawField.split(".") : [alias, rawField];
+        const fAlias = fieldParts[0] ?? alias;
+        const fName = fieldParts[fieldParts.length - 1] ?? rawField;
+        const colRef = columnExpression(fAlias, fName, dialect);
+        const cond = metricDef.condition ? String(metricDef.condition) : null;
+        // Re-quote column references in AI-authored condition strings.
+        const quotedCond = cond
+            ? cond.replace(/\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/gi, (_m, a, f) => `${dialect.quoteChar}${a}${dialect.quoteChar}.${dialect.quoteChar}${f}${dialect.quoteChar}`)
+            : null;
+        let expr;
+        if (agg === "count_distinct") {
+            expr = quotedCond
+                ? `COUNT(DISTINCT CASE WHEN ${quotedCond} THEN ${colRef} END)`
+                : `COUNT(DISTINCT ${colRef})`;
+        }
+        else if (agg === "sum") {
+            expr = quotedCond ? `SUM(CASE WHEN ${quotedCond} THEN ${colRef} ELSE 0 END)` : `SUM(${colRef})`;
+        }
+        else if (agg === "max") {
+            expr = quotedCond ? `MAX(CASE WHEN ${quotedCond} THEN ${colRef} END)` : `MAX(${colRef})`;
+        }
+        else if (agg === "min") {
+            expr = quotedCond ? `MIN(CASE WHEN ${quotedCond} THEN ${colRef} END)` : `MIN(${colRef})`;
+        }
+        else if (agg === "avg") {
+            expr = quotedCond ? `AVG(CASE WHEN ${quotedCond} THEN ${colRef} END)` : `AVG(${colRef})`;
+        }
+        else if (agg === "group_concat" || agg === "group_concat_distinct") {
+            const distinct = agg === "group_concat_distinct" ? "DISTINCT " : "";
+            expr = quotedCond
+                ? `GROUP_CONCAT(${distinct}CASE WHEN ${quotedCond} THEN ${colRef} END)`
+                : `GROUP_CONCAT(${distinct}${colRef})`;
+        }
+        else {
+            expr = colRef; // fallback: plain column reference
+        }
+        selectParts.push(`${expr} AS ${quoteIdentifier(colName, dialect)}`);
+        addedCols.add(colName);
+    }
+    if (!selectParts.length) {
+        throw new Error("time_shifted 报表没有可查询字段");
+    }
+    const selectList = selectParts.map((s) => `  ${s}`).join(",\n");
+    // Build WHERE clauses from system conditions
+    const whereParts = [];
+    for (const sc of queryMeta?.system_conditions ?? []) {
+        const scAlias = String(sc.alias ?? alias);
+        const scField = String(sc.field ?? "");
+        if (!scField)
+            continue;
+        const scOp = String(sc.operator ?? "eq");
+        const scVal = sc.value;
+        const scVals = sc.values;
+        const placement = String(sc.placement ?? "WHERE");
+        if (placement !== "WHERE")
+            continue; // only WHERE for now
+        const colRef = columnExpression(scAlias, scField, dialect);
+        if (scVals && Array.isArray(scVals) && scVals.length) {
+            const vals = scVals.map((v) => `'${String(v).replace(/'/g, "''")}'`).join(", ");
+            whereParts.push(`${colRef} ${scOp === "NOT IN" ? "NOT IN" : "IN"} (${vals})`);
+        }
+        else if (scVal !== null && scVal !== undefined) {
+            whereParts.push(`${colRef} ${scOp === "eq" ? "=" : scOp} ${typeof scVal === "number" ? scVal : `'${String(scVal).replace(/'/g, "''")}'`}`);
+        }
+        // null value = bound at runtime (e.g. tenant_id), skip
+    }
+    // Build FROM clause
+    const fromTable = db
+        ? `${quoteIdentifier(db, dialect)}.${quoteIdentifier(table, dialect)}`
+        : quoteIdentifier(table, dialect);
+    // Assemble SQL
+    const sqlLines = [`SELECT`, selectList, `FROM ${fromTable} AS ${quoteIdentifier(alias, dialect)}`];
+    if (whereParts.length) {
+        sqlLines.push(`WHERE ${whereParts.join("\n  AND ")}`);
+    }
+    sqlLines.push(`GROUP BY ${groupByIdents.join(", ")}`);
+    // ORDER BY
+    const orderCols = queryMeta?.order_by?.length
+        ? queryMeta.order_by.map((o) => {
+            const f = String(o.field ?? "").includes(".")
+                ? String(o.field).split(".").pop() ?? ""
+                : String(o.field ?? "");
+            const dir = String(o.direction ?? "ASC");
+            return `${quoteIdentifier(f, dialect)} ${dir}`;
+        })
+        : groupByCols.map((col) => `${quoteIdentifier(col, dialect)} ASC`);
+    sqlLines.push(`ORDER BY ${orderCols.join(", ")}`);
+    const mainSql = sqlLines.join("\n") + "\n";
+    const dialectId = String(plan.knowledge?.profile_engines?.[profileId] ?? plan.sql_dialect ?? "mysql");
+    // Lock sources from the plan
+    const availableCols = availableColumnsForPlan(plan);
+    const availableFields = new Set();
+    for (const cols of availableCols.values()) {
+        for (const c of cols)
+            availableFields.add(c);
+    }
+    const sources = [{
+            profile_id: profileId,
+            database: db,
+            table,
+            alias,
+            fields: [...availableFields].sort(),
+        }];
+    // Generate the script source
+    const scriptSource = buildTimeShiftedScriptSource(plan, shiftGroups, periodParam);
+    // Build script_report structure
+    plan.script_report = {
+        queries: [
+            {
+                id: "main",
+                mode: "stream",
+                profile_id: profileId,
+                database: db,
+                sql_dialect: dialectId,
+                sql: mainSql,
+                sources,
+            },
+        ],
+        source: scriptSource,
+        resource_budget: {
+            max_queries: 12,
+            max_query_rows: 1_000_000,
+            max_index_rows: 100_000,
+            max_batch_keys: 2_000,
+            max_output_rows: 500_000,
+            max_memory_mb: 512,
+            timeout_seconds: 300,
+            stream_batch_rows: 128,
+        },
+    };
+    // Rewrite field sources for the knowledge lock.
+    for (const field of plan.fields ?? []) {
+        const kind = String(field.source?.kind ?? "");
+        if (kind === "time_shifted")
+            continue;
+        field.source = {
+            kind: "script",
+            lineage: field.source,
+        };
+    }
 }
 function finalizePlanningDocuments(plan, configuration) {
     const strategy = plan.script_report
@@ -4199,6 +4770,35 @@ export async function finalizeStagedPackage(options) {
             }
         }
     }
+    // Extract metric field IDs from query_groups so that:
+    // 1. time_shifted base_metric references can be validated
+    // 2. FIELD_NOT_FOUND blockers are resolved
+    // 3. buildTimeShiftedScriptSource knows the output column names
+    //
+    // We add lightweight field stubs — full sql_expression resolution (with conditions,
+    // aggregation functions, etc.) is handled by the existing query_groups→group_queries
+    // normalization path in configurePlan. These stubs are just for blocker resolution.
+    if (Array.isArray(configuration.query_groups)) {
+        const qgFields = [];
+        for (const g of configuration.query_groups) {
+            for (const m of (g.metrics ?? [])) {
+                const mid = String(m.id ?? "");
+                if (!mid)
+                    continue;
+                // Only add if not already in configuration.fields (dedup)
+                if ((configuration.fields ?? []).some((f) => String(f.id) === mid))
+                    continue;
+                qgFields.push({
+                    id: mid,
+                    label: String(m.label ?? mid),
+                    output_column: String(m.output_column ?? mid),
+                    output_type: "number",
+                    source: { kind: "column", alias: String(g.primary_alias ?? "t0"), field: String(m.field ?? "").split(".").pop() ?? "" },
+                });
+            }
+        }
+        configuration.fields = [...(configuration.fields ?? []), ...qgFields];
+    }
     if (strategy !== "script")
         delete configuration.script_report;
     if (strategy === "script")
@@ -4398,6 +4998,15 @@ export async function finalizeStagedPackage(options) {
         await configurePlan(planPath, paths.configuration);
         await approvePlan(planPath, options.reviewedBy);
         await generatePackage({ workspace, plan: planPath, out: candidateRoot, register: false });
+        // Clean up internal metadata that configurePlan stored on the plan.
+        try {
+            const updatedPlan = await readJson(planPath);
+            if (updatedPlan._time_shifted) {
+                delete updatedPlan._time_shifted;
+                await writeJson(planPath, updatedPlan);
+            }
+        }
+        catch { /* best-effort cleanup */ }
         const packageValidation = await validatePackage(candidateRoot);
         if (!packageValidation.valid)
             throw new Error(`报表包静态校验失败：${packageValidation.errors.join("；")}`);
@@ -4570,10 +5179,40 @@ export async function configurePlan(planPathValue, configurationPathValue) {
     // These are transform- or expression-produced (环比/同比 deltas, ratios, …) and
     // do NOT exist in the report's required_fields lineage, so the override loop
     // above (which only mutates existing plan.fields by id) skips them. Only
-    // computed / sql_expression kinds may be added here — a brand-new `column`
-    // field must still flow through required_fields + knowledge resolution so its
-    // lineage is locked, so we reject it. Existing ids are handled by the loop and
+    // computed / sql_expression / time_shifted kinds may be added here — a brand-new
+    // `column` field must still flow through required_fields + knowledge resolution so
+    // its lineage is locked, so we reject it. Existing ids are handled by the loop and
     // are not re-added.
+    //
+    // Time-shifted fields are collected before this loop (via collectTimeShiftedDecls)
+    // and injected into plan.fields by resolveTimeShiftedMetrics so blocker resolution
+    // picks them up. They are skipped here.
+    const { groups: tsDecls, queryMeta: tsQueryMeta } = collectTimeShiftedDecls(configuration);
+    if (tsDecls.length > 0) {
+        // Build set of metric IDs and column info from declarative config for base_metric
+        // validation and injection into plan.fields.
+        const configMetricIds = new Set();
+        const configMetricColumns = new Map();
+        if (tsQueryMeta) {
+            for (const m of tsQueryMeta.metrics) {
+                const mid = String(m.id);
+                const col = String(m.output_column ?? m.field ?? mid);
+                const rawField = String(m.field ?? "").includes(".")
+                    ? String(m.field ?? "")
+                    : `${tsQueryMeta.primary_alias}.${String(m.field ?? mid)}`;
+                const fieldParts = rawField.split(".");
+                const fieldName = fieldParts.pop() ?? rawField;
+                const fieldAlias = fieldParts.pop() ?? tsQueryMeta.primary_alias;
+                configMetricIds.add(mid);
+                configMetricColumns.set(mid, { column: col, alias: fieldAlias, field: fieldName });
+            }
+        }
+        for (const f of configuration.fields ?? []) {
+            configMetricIds.add(String(f.id));
+        }
+        const allDecls = tsDecls.flatMap((g) => g.fields);
+        resolveTimeShiftedMetrics(plan, allDecls, configMetricIds, configMetricColumns);
+    }
     const existingFieldIds = new Set((plan.fields ?? []).map((f) => f.id));
     const maxOrder = (plan.fields ?? []).reduce((max, f) => Math.max(max, Number(f.order ?? 0)), 0);
     let appendedOrder = maxOrder;
@@ -4581,6 +5220,12 @@ export async function configurePlan(planPathValue, configurationPathValue) {
         if (existingFieldIds.has(candidate.id))
             continue;
         const kind = candidate.source?.kind;
+        // time_shifted fields are resolved above; skip them here.
+        // Metric stubs from query_groups (kind=column) are also skipped — their full
+        // sql_expression resolution happens via applyGroupQueries for group_queries
+        // strategy, or via the declarative config for sql strategy.
+        if (kind === "time_shifted" || kind === "column")
+            continue;
         if (kind !== "computed" &&
             kind !== "sql_expression" &&
             !(kind === "script" && plan.script_report)) {
@@ -4767,6 +5412,30 @@ export async function configurePlan(planPathValue, configurationPathValue) {
     // source so it emits multiple sheets (本期/环比/同比) via independent queries.
     if (plan.comparison?.enabled && plan.script_report) {
         wrapScriptForComparison(plan);
+    }
+    // When time_shifted fields exist and we haven't already built a script (comparison
+    // may have set script_report above), store metadata in the plan so generatePackage
+    // can auto-generate the script at the right time (when SQL + source data is ready).
+    if (plan._has_time_shifted && tsDecls.length > 0 && !plan.script_report) {
+        const periodParam = String(plan.comparison?.period_param ??
+            (plan.default_period_candidates?.length
+                ? plan.default_period_candidates[0]?.field
+                : tsQueryMeta?.time_filter?.field
+                    ? String(tsQueryMeta.time_filter.field ?? "").includes(".")
+                        ? String(tsQueryMeta.time_filter.field).split(".").pop() ?? "create_time"
+                        : String(tsQueryMeta.time_filter.field ?? "create_time")
+                    : "create_time"));
+        const existingParam = (plan.parameters ?? []).find((p) => p.id === periodParam);
+        if (existingParam && !existingParam.required) {
+            existingParam.required = true;
+        }
+        // Store deferred script generation metadata including query info for SQL generation.
+        plan._time_shifted = {
+            shiftGroups: tsDecls,
+            periodParam,
+            queryMeta: tsQueryMeta,
+        };
+        delete plan._has_time_shifted;
     }
     finalizePlanningDocuments(plan, configuration);
     const fieldKinds = new Set((plan.fields ?? []).map((field) => field.source?.kind));
@@ -5524,6 +6193,29 @@ export async function generatePackage(options) {
     const modelErrors = await validateAttachedReportModel(plan, resolvedPlanPath);
     if (modelErrors.length)
         throw new Error(`报表模型校验失败：\n${modelErrors.join("\n")}`);
+    // Deferred time_shifted script generation: configurePlan stored metadata because
+    // the plan wasn't ready for SQL generation at that point. Now build the script.
+    if (plan._time_shifted) {
+        const ts = plan._time_shifted;
+        // Build the script_report from the plan (now fully configured).
+        buildScriptReportFromTimeShiftedPlan(plan, ts.shiftGroups, ts.periodParam, ts.queryMeta);
+        delete plan._time_shifted;
+        // Update execution plan: finalizePlanningDocuments ran before the script was
+        // built, so it set strategy="sql". Patch it now that script_report exists.
+        plan.execution_plan = {
+            ...(plan.execution_plan ?? {}),
+            strategy: "script",
+            steps: plan.script_report?.queries?.length
+                ? plan.script_report.queries.map((q, i) => ({
+                    id: `Q${i + 1}`,
+                    type: String(q.mode ?? "stream") === "stream" ? "query_stream" : "load_index",
+                    description: `执行查询 ${String(q.id)}（${String(q.mode ?? "stream")}）`,
+                    query_id: String(q.id),
+                }))
+                : [{ id: "Q1", type: "query_stream", description: "执行主查询（含时间偏移）" }],
+            rationale: "包含 time_shifted 跨期计算字段，自动生成脚本执行",
+        };
+    }
     if (plan.script_report) {
         return generateScriptPackage(workspace, plan, packageRoot, options.register !== false);
     }

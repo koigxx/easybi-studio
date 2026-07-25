@@ -693,6 +693,42 @@ function componentFor(valueType: string, operators: string[]): string {
 /** Comparison (环比/同比) modes the runtime knows how to look back for. */
 const COMPARISON_MODES = new Set(["chain", "yoy"]);
 
+/** Time-shifted metric (单字段跨期计算) supported shift modes. */
+const TIME_SHIFTED_SHIFT_MODES = new Set(["chain", "yoy"]);
+/** Time-shifted metric supported operations between current and shifted value. */
+const TIME_SHIFTED_OPERATIONS = new Set(["subtract", "divide", "percent_change"]);
+
+/**
+ * Normalize and validate a time_shifted field source declaration.
+ * Expected shape:
+ *   { kind: "time_shifted", base_metric: "field_xxx", shift: "chain"|"yoy",
+ *     lookback: number, operation: "subtract"|"divide"|"percent_change" }
+ */
+function normalizeTimeShiftedSource(raw: unknown): JsonRecord {
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error("time_shifted source 必须是对象");
+  }
+  const s = raw as JsonRecord;
+  if (String(s.kind) !== "time_shifted") throw new Error("time_shifted source.kind 必须是 time_shifted");
+  const baseMetric = String(s.base_metric ?? "").trim();
+  if (!baseMetric) throw new Error("time_shifted source.base_metric 不能为空");
+  const shift = String(s.shift ?? "").trim();
+  if (!TIME_SHIFTED_SHIFT_MODES.has(shift)) {
+    throw new Error(`time_shifted source.shift 必须是 chain 或 yoy，收到：${shift}`);
+  }
+  const lookback = Number(s.lookback ?? 1);
+  if (!Number.isInteger(lookback) || lookback < 1) {
+    throw new Error(`time_shifted source.lookback 必须是 >=1 的整数，收到：${s.lookback}`);
+  }
+  const operation = String(s.operation ?? "subtract").trim();
+  if (!TIME_SHIFTED_OPERATIONS.has(operation)) {
+    throw new Error(
+      `time_shifted source.operation 必须是 ${[...TIME_SHIFTED_OPERATIONS].join(" / ")}，收到：${operation}`,
+    );
+  }
+  return { kind: "time_shifted", base_metric: baseMetric, shift, lookback, operation };
+}
+
 /**
  * Normalize a configuration `comparison` block into the plan/manifest shape.
  * `chain` = 环比（对比上一个月），`yoy` = 同比（对比去年同月）。`period_param` is the
@@ -1449,6 +1485,36 @@ function validatePlanV2(plan: JsonRecord): string[] {
       } else if (kind === "script" && plan.script_report) {
         // Produced by the isolated v3 report script through ctx.emit. Physical
         // lineage, when known, is preserved under source.lineage and query locks.
+      } else if (kind === "time_shifted") {
+        // Time-shifted metric: must reference an existing base metric.
+        const baseId = String(field.source?.base_metric ?? "");
+        if (!baseId) {
+          errors.push(`time_shifted 字段 ${field.id} 缺少 base_metric`);
+        } else if (!(plan.fields ?? []).some((f: JsonRecord) => String(f.id) === baseId)) {
+          errors.push(
+            `time_shifted 字段 ${field.id} 引用的 base_metric ${baseId} 不存在`,
+          );
+        }
+        const shift = String(field.source?.shift ?? "");
+        if (!TIME_SHIFTED_SHIFT_MODES.has(shift)) {
+          errors.push(`time_shifted 字段 ${field.id} 的 shift ${shift} 无效（仅支持 chain / yoy）`);
+        }
+        const lookback = Number(field.source?.lookback ?? 1);
+        if (!Number.isInteger(lookback) || lookback < 1) {
+          errors.push(`time_shifted 字段 ${field.id} 的 lookback 必须是 >=1 的整数`);
+        }
+        const operation = String(field.source?.operation ?? "subtract");
+        if (!TIME_SHIFTED_OPERATIONS.has(operation)) {
+          errors.push(
+            `time_shifted 字段 ${field.id} 的 operation ${operation} 无效（仅支持 ${[...TIME_SHIFTED_OPERATIONS].join(" / ")}）`,
+          );
+        }
+        // time_shifted + comparison are mutually exclusive
+        if (plan.comparison?.enabled) {
+          errors.push(
+            `time_shifted 字段 ${field.id} 与 comparison（环比/同比全量对比）互斥；请选择其中一种方式`,
+          );
+        }
       } else {
         errors.push(`字段 ${field.id} 使用未知来源种类 ${kind}`);
       }
@@ -1961,6 +2027,493 @@ async function applyEnrichments(
     });
   }
   plan.enrichments = enrichments;
+}
+
+// ---------------------------------------------------------------------------
+// Group-queries script report generation
+// ---------------------------------------------------------------------------
+
+interface GroupQueryMetricDef {
+  id: string;
+  output_column: string;
+  label: string;
+  aggregation: string;
+  /** Fully qualified field reference, e.g. "t0.id", "t2.id". */
+  field: string;
+  /** Optional SQL condition, e.g. "t0.status = 'BE_ALLOCATED'". */
+  condition: string | null;
+}
+
+/**
+ * Extract structured metric definitions from the declarative config's
+ * `query_groups[].metrics[]`. Returns a Map keyed by group query id.
+ */
+function collectGroupQueryMetrics(
+  queryGroups: JsonRecord[],
+): Map<string, GroupQueryMetricDef[]> {
+  const result = new Map<string, GroupQueryMetricDef[]>();
+  for (const g of queryGroups) {
+    const gid = String((g as JsonRecord).id ?? "");
+    const defs: GroupQueryMetricDef[] = [];
+    for (const m of (g as JsonRecord).metrics ?? []) {
+      const mj = m as JsonRecord;
+      defs.push({
+        id: String(mj.id ?? ""),
+        output_column: String(mj.output_column ?? mj.id ?? ""),
+        label: String(mj.label ?? mj.id ?? ""),
+        aggregation: String(mj.aggregation ?? "count_distinct"),
+        field: String(mj.field ?? ""),
+        condition: mj.condition ? String(mj.condition) : null,
+      });
+    }
+    if (defs.length) result.set(gid, defs);
+  }
+  return result;
+}
+
+/** Collect all unique column references needed for raw-data queries. */
+function collectRequiredColumns(
+  mergeKey: string,
+  metricDefs: GroupQueryMetricDef[],
+): { alias: string; name: string }[] {
+  const seen = new Map<string, { alias: string; name: string }>();
+  // Merge key (only when non-empty)
+  if (mergeKey) {
+    const mkParts = mergeKey.includes(".") ? mergeKey.split(".") : ["t0", mergeKey];
+    const mkAlias = mkParts[0]!;
+    const mkName = mkParts[mkParts.length - 1]!;
+    if (mkName) seen.set(`${mkAlias}.${mkName}`, { alias: mkAlias, name: mkName });
+  }
+
+  for (const m of metricDefs) {
+    // Dedup field
+    if (m.field) {
+      const parts = m.field.includes(".") ? m.field.split(".") : ["t0", m.field];
+      const alias = parts[0]!;
+      const name = parts[parts.length - 1]!;
+      const key = `${alias}.${name}`;
+      if (!seen.has(key)) seen.set(key, { alias, name });
+    }
+    // Condition columns: extract alias.field patterns
+    if (m.condition) {
+      const re = /\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/gi;
+      let match;
+      while ((match = re.exec(m.condition)) !== null) {
+        const alias = match[1]!;
+        const name = match[2]!;
+        const key = `${alias}.${name}`;
+        if (!seen.has(key)) seen.set(key, { alias, name });
+      }
+    }
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Generate a raw-data (non-aggregated) SQL query for a single group-query sibling.
+ * Returns just the columns needed for in-memory dedup + conditional counting —
+ * no GROUP BY, no aggregation functions.
+ */
+function buildGroupQueryRawSql(
+  sibling: JsonRecord,
+  plan: JsonRecord,
+  metricDefs: GroupQueryMetricDef[],
+  mergeKeys: string[],
+): string {
+  const dialect = dialectForPlan(plan);
+  const primary = sibling.source?.primary_table as JsonRecord | undefined;
+  if (!primary) throw new Error("group_queries sibling 缺少主表");
+
+  // Collect required columns: merge keys + metric dedup/condition fields
+  const allCols: { alias: string; name: string }[] = [];
+  for (const mk of mergeKeys) {
+    allCols.push(...collectRequiredColumns(mk, []));
+  }
+  allCols.push(...collectRequiredColumns("", metricDefs));
+
+  // Deduplicate by alias.name
+  const uniqueCols = new Map<string, { alias: string; name: string }>();
+  for (const col of allCols) {
+    const key = `${col.alias}.${col.name}`;
+    if (!uniqueCols.has(key)) uniqueCols.set(key, col);
+  }
+
+  const selectParts: string[] = [];
+  for (const col of uniqueCols.values()) {
+    selectParts.push(
+      `  ${columnExpression(col.alias, col.name, dialect)} AS ${quoteIdentifier(col.name, dialect)}`,
+    );
+  }
+
+  // FROM + JOINs — reuse from sibling.source
+  const sourceTables = new Map<string, JsonRecord>(
+    (sibling.source?.tables ?? [primary]).map((t: JsonRecord) => [t.alias, t]),
+  );
+  // Build a column Map from sibling's source tables for reference resolution
+  const siblingColumns = new Map<string, Set<string>>();
+  for (const t of sibling.source?.tables ?? [primary]) {
+    const fields = (t as JsonRecord).available_fields ?? (t as JsonRecord).fields ?? [];
+    siblingColumns.set(
+      String((t as JsonRecord).alias ?? ""),
+      new Set(fields.map(String)),
+    );
+  }
+
+  const joinLines = (sibling.source?.joins ?? []).map((joinItem: JsonRecord) => {
+    const alias = assertAlias(joinItem.alias);
+    const table = sourceTables.get(alias);
+    if (!table) throw new Error(`JOIN 引用了未知表：${alias}`);
+    const predicates = (joinItem.on ?? []).map((condition: JsonRecord) => {
+      const left = normalizeColumnReference(condition.left, siblingColumns);
+      const right = normalizeColumnReference(condition.right, siblingColumns);
+      return `${columnExpression(left.alias, left.field, dialect)} = ${columnExpression(right.alias, right.field, dialect)}`;
+    });
+    // Dedup by (alias, field) — knowledge may duplicate the same condition
+    const seenCondKeys = new Set<string>();
+    for (const condition of joinItem.conditions ?? []) {
+      const condKey = `${condition.alias ?? alias}.${condition.field}`;
+      if (seenCondKeys.has(condKey)) continue;
+      seenCondKeys.add(condKey);
+
+      const op = condition.operator === "eq" ? "=" : condition.operator;
+      // Normalize value: prefer numeric form for numbers; avoids mixed 0 / '0' duplicates
+      const rawVal = condition.value;
+      const numVal = Number(rawVal);
+      const val = (typeof rawVal === "number" || (typeof rawVal === "string" && rawVal !== "" && !isNaN(numVal)))
+        ? String(numVal)
+        : typeof rawVal === "string"
+          ? `'${String(rawVal).replace(/'/g, "''")}'`
+          : String(rawVal ?? 0);
+      predicates.push(
+        `${columnExpression(condition.alias ?? alias, condition.field, dialect)} ${op} ${val}`,
+      );
+    }
+    return `${String(joinItem.type).toUpperCase()} JOIN ${quoteIdentifier(
+      table.database,
+      dialect,
+    )}.${quoteIdentifier(table.table, dialect)} AS ${alias}\n  ON ${predicates.join("\n  AND ")}`;
+  });
+
+  // WHERE — embed system conditions as literals (script queries don't use separate bindings)
+  const system = (Array.isArray(sibling.system_conditions) ? sibling.system_conditions : []).map(
+    (c: JsonRecord) => {
+      const op = c.operator === "eq" ? "=" : c.operator;
+      const val = typeof c.value === "string" ? `'${c.value.replace(/'/g, "''")}'` : String(c.value ?? 0);
+      return `  ${c.expression} ${op} ${val}`;
+    },
+  );
+  const whereLines = (system.length ? system : ["  1 = 1"]).join("\n  AND ");
+
+  // ORDER BY: merge key columns
+  const orderParts = mergeKeys.map((mk) => {
+    const parts = mk.includes(".") ? mk.split(".") : ["t0", mk];
+    const name = parts[parts.length - 1]!;
+    return `${quoteIdentifier(name, dialect)} ASC`;
+  });
+
+  return [
+    "SELECT",
+    selectParts.join(",\n"),
+    `FROM ${quoteIdentifier(primary.database, dialect)}.${quoteIdentifier(primary.table, dialect)} AS ${assertAlias(primary.alias)}`,
+    ...joinLines,
+    "WHERE",
+    whereLines,
+    ...(orderParts.length ? [`ORDER BY ${orderParts.join(", ")}`] : []),
+    "",
+  ].join("\n");
+}
+
+/**
+ * Generate TypeScript script source for group_queries: streams raw data from each
+ * sibling query, does in-memory COUNT DISTINCT with conditional dedup, then
+ * full-outer-merges results on the shared merge key(s).
+ */
+function buildGroupQueriesScriptSource(
+  plan: JsonRecord,
+  metricDefsByGroup: Map<string, GroupQueryMetricDef[]>,
+  mergeKeys: string[],
+): string {
+  const groupIds = [...metricDefsByGroup.keys()];
+  // Extract the bare column name from a merge key ("t0.customer_name" → "customer_name")
+  const mergeKeyNames = mergeKeys.map((mk) => {
+    const parts = mk.includes(".") ? mk.split(".") : ["t0", mk];
+    return parts[parts.length - 1]!;
+  });
+  const primaryKey = mergeKeyNames[0]!;
+
+  const lines: string[] = [
+    "// === AUTO-GENERATED: group_queries script ===\n// In-memory COUNT DISTINCT + conditional dedup + full-outer-merge.",
+    "export async function run(ctx) {",
+  ];
+
+  // Emit metric definition tables as comments and as inline config
+  for (const gid of groupIds) {
+    const defs = metricDefsByGroup.get(gid) ?? [];
+    lines.push(`  // --- Group: ${gid} (${defs.length} metrics) ---`);
+    for (const d of defs) {
+      const condDesc = d.condition ? ` WHERE ${d.condition}` : "";
+      lines.push(`  //   ${d.id} (→${d.output_column}): ${d.aggregation}(${d.field})${condDesc}`);
+    }
+  }
+  lines.push("");
+
+  // Declare per-group storage: Map<mergeKey, { sets: Record<metricId, Set<dedupVal>> }>
+  for (const gid of groupIds) {
+    lines.push(`  // ${gid}: Map<mergeKey, { sets: Record<string, Set<string>> }>`);
+    lines.push(`  const ${gid}Map = new Map();`);
+  }
+  lines.push("");
+
+  // Stream each group's raw data query
+  for (const gid of groupIds) {
+    const defs = metricDefsByGroup.get(gid) ?? [];
+    lines.push(`  // === Stream ${gid} raw data ===`);
+    lines.push(`  for await (const row of ctx.queryStream("${gid}", ctx.filters)) {`);
+    // Build composite merge key expression
+    if (mergeKeyNames.length === 1) {
+      lines.push(`    const key = String(row[${JSON.stringify(primaryKey)}] ?? "");`);
+    } else {
+      const keyExpr = mergeKeyNames.map((k) => `String(row[${JSON.stringify(k)}] ?? "")`).join(" + '|' + ");
+      lines.push(`    const key = ${keyExpr};`);
+    }
+    // Ensure group entry with per-metric dedup Sets
+    lines.push(`    if (!${gid}Map.has(key)) {`);
+    lines.push(`      ${gid}Map.set(key, { sets: {} });`);
+    lines.push(`    }`);
+    lines.push(`    const grp = ${gid}Map.get(key);`);
+
+    // Process each metric's dedup + condition
+    for (const d of defs) {
+      const fieldParts = d.field.includes(".") ? d.field.split(".") : ["t0", d.field];
+      const fieldName = fieldParts[fieldParts.length - 1]!;
+      const dedupCol = `row[${JSON.stringify(fieldName)}]`;
+
+      // Build condition check
+      let condCheck = "true";
+      if (d.condition) {
+        // Parse condition like "t0.status = 'BE_ALLOCATED'"
+        // Extract column name from condition for the script
+        const condMatch = d.condition.match(/^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*=\s*'([^']*)'$/i);
+        if (condMatch) {
+          const condField = condMatch[2]!;
+          const condValue = condMatch[3]!;
+          condCheck = `String(row[${JSON.stringify(condField)}] ?? "") === ${JSON.stringify(condValue)}`;
+        } else {
+          // Fallback: use the raw condition as a comment, always count
+          condCheck = "true /* condition: " + d.condition + " */";
+        }
+      }
+
+      const metricId = JSON.stringify(d.id);
+      const dedupVal = `String(${dedupCol} ?? "")`;
+      lines.push(`    // ${d.label}: ${d.aggregation}(${d.field})${d.condition ? " WHERE " + d.condition : ""}`);
+      lines.push(`    if (${condCheck}) {`);
+      lines.push(`      if (!grp.sets[${metricId}]) grp.sets[${metricId}] = new Set();`);
+      lines.push(`      const s_${d.id} = ${dedupVal};`);
+      lines.push(`      if (!grp.sets[${metricId}].has(s_${d.id})) {`);
+      lines.push(`        grp.sets[${metricId}].add(s_${d.id});`);
+      lines.push(`      }`);
+      lines.push(`    }`);
+    }
+    lines.push(`  }`);
+    lines.push("");
+  }
+
+  // Full-outer-merge
+  lines.push(`  // === Full-outer-merge on ${primaryKey} ===`);
+  if (groupIds.length === 1) {
+    lines.push(`  for (const [key, grp] of ${groupIds[0]}Map) {`);
+    if (mergeKeyNames.length === 1) {
+      lines.push(`    const row = { ${JSON.stringify(primaryKey)}: key };`);
+    } else {
+      // Composite key: need to split the key back into components
+      lines.push(`    const keyParts = key.split("|");`);
+      const rowParts = mergeKeyNames.map((k, i) => `      ${JSON.stringify(k)}: keyParts[${i}] ?? ""`);
+      lines.push(`    const row = {`);
+      lines.push(rowParts.join(",\n"));
+      lines.push(`    };`);
+    }
+    for (const d of metricDefsByGroup.get(groupIds[0]!) ?? []) {
+      lines.push(`    row[${JSON.stringify(d.id)}] = grp.sets[${JSON.stringify(d.id)}]?.size ?? 0;`);
+    }
+    lines.push(`    ctx.emit(row);`);
+    lines.push(`  }`);
+  } else {
+    // Multiple groups: collect all keys, build merged rows
+    lines.push(`  const allKeys = new Set([`);
+    for (const gid of groupIds) {
+      lines.push(`    ...${gid}Map.keys(),`);
+    }
+    lines.push(`  ]);`);
+    lines.push("");
+    lines.push(`  for (const key of allKeys) {`);
+    if (mergeKeyNames.length === 1) {
+      lines.push(`    const row = { ${JSON.stringify(primaryKey)}: key };`);
+    } else {
+      lines.push(`    const keyParts = key.split("|");`);
+      const rowParts = mergeKeyNames.map((k, i) => `      ${JSON.stringify(k)}: keyParts[${i}] ?? ""`);
+      lines.push(`    const row = {`);
+      lines.push(rowParts.join(",\n"));
+      lines.push(`    };`);
+    }
+    for (const gid of groupIds) {
+      lines.push(`    const ${gid}Grp = ${gid}Map.get(key);`);
+      for (const d of metricDefsByGroup.get(gid) ?? []) {
+        lines.push(`    row[${JSON.stringify(d.id)}] = ${gid}Grp?.sets[${JSON.stringify(d.id)}]?.size ?? 0;`);
+      }
+    }
+    lines.push(`    ctx.emit(row);`);
+    lines.push(`  }`);
+  }
+  lines.push("}");
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+/**
+ * Build a complete script_report from a group_queries plan, switching the report
+ * from v2 SQL aggregation to v3 script-based in-memory computation.
+ */
+function buildScriptReportFromGroupQueriesPlan(
+  plan: JsonRecord,
+  queryGroups: JsonRecord[],
+): void {
+  if (!plan.group_queries?.queries?.length) return;
+
+  const metricDefsByGroup = collectGroupQueryMetrics(queryGroups);
+  if (!metricDefsByGroup.size) return;
+
+  const mergeKeys: string[] = (plan.group_queries.merge_keys ?? []).map(String);
+  const dialect = dialectForPlan(plan);
+
+  // Build one query entry per sibling — raw-data SQL, no aggregation
+  const queries: JsonRecord[] = [];
+
+  for (const sibling of plan.group_queries.queries as JsonRecord[]) {
+    const gid = String(sibling.id ?? "");
+    const defs = metricDefsByGroup.get(gid);
+    if (!defs || !defs.length) continue;
+
+    const sql = buildGroupQueryRawSql(sibling, plan, defs, mergeKeys);
+    const primary = sibling.source?.primary_table as JsonRecord | undefined;
+
+    // Collect source table aliases and fields from this sibling
+    const siblingSources: JsonRecord[] = [];
+    for (const table of sibling.source?.tables ?? [primary]) {
+      if (!table) continue;
+      const alias = String((table as JsonRecord).alias ?? "");
+      // Use all available fields from the sibling's source tables to cover:
+      // merge keys, JOIN ON columns, system conditions, and metric fields.
+      const tableFields = (table as JsonRecord).available_fields ?? [];
+      const fields = [...new Set(tableFields.map(String))];
+
+      // Dedup by alias
+      const existing = siblingSources.find((s) => String((s as JsonRecord).alias ?? "") === alias);
+      if (existing) {
+        // Merge fields
+        const existingFields = new Set((existing as JsonRecord).fields?.map(String) ?? []);
+        for (const f of fields) existingFields.add(f);
+        (existing as JsonRecord).fields = [...existingFields];
+        continue;
+      }
+
+      siblingSources.push({
+        profile_id: String((table as JsonRecord).profile_id ?? ""),
+        database: String((table as JsonRecord).database ?? ""),
+        table: String((table as JsonRecord).table ?? ""),
+        alias,
+        fields: [...new Set(fields)],
+      });
+    }
+
+    queries.push({
+      id: gid,
+      mode: "stream",
+      profile_id: String(primary?.profile_id ?? ""),
+      database: String(primary?.database ?? ""),
+      sql_dialect: dialect.id,
+      sql,
+      sources: siblingSources,
+    });
+  }
+
+  if (!queries.length) return;
+
+  // Generate script source
+  const scriptSource = buildGroupQueriesScriptSource(plan, metricDefsByGroup, mergeKeys);
+
+  // Build resource_budget
+  const resource_budget = {
+    max_queries: queries.length + 4,
+    max_query_rows: 1000000,
+    max_index_rows: 100000,
+    max_batch_keys: 2000,
+    max_output_rows: 500000,
+    max_memory_mb: 512,
+    timeout_seconds: 300,
+    stream_batch_rows: 128,
+  };
+
+  plan.script_report = {
+    queries,
+    source: scriptSource,
+    resource_budget,
+  };
+
+  // Inject all group-query fields into plan.fields so they appear in fields.json.
+  // Merge-key dimension fields + all metric fields from every sibling.
+  plan.fields = plan.fields ?? [];
+  const existingFieldIds = new Set(plan.fields.map((f: JsonRecord) => String(f.id)));
+  let fieldOrder = plan.fields.reduce((max: number, f: JsonRecord) => Math.max(max, Number((f as JsonRecord).order ?? 0)), 0);
+
+  // 1. Merge-key dimension fields from the first sibling's merge key columns
+  for (const sibling of plan.group_queries.queries as JsonRecord[]) {
+    for (const f of sibling.fields ?? []) {
+      const fid = String((f as JsonRecord).id ?? "");
+      if (existingFieldIds.has(fid)) continue;
+      // Check if this is a merge key (column kind) or metric field
+      const kind = (f as JsonRecord).source?.kind;
+      if (kind === "column" && mergeKeys.includes(fid)) {
+        // Merge key dimension — needs to be in plan.fields
+        fieldOrder += 1;
+        plan.fields.push({
+          id: fid,
+          label: (f as JsonRecord).label ?? fid,
+          order: fieldOrder,
+          output_type: "string",
+          source: { kind: "script", lineage: { ...(f as JsonRecord).source } },
+          roles: ["group", "output"],
+        });
+        existingFieldIds.add(fid);
+      }
+    }
+  }
+
+  // 2. All metric fields from metric definitions
+  for (const gid of metricDefsByGroup.keys()) {
+    for (const d of metricDefsByGroup.get(gid) ?? []) {
+      if (existingFieldIds.has(d.id)) continue;
+      fieldOrder += 1;
+      plan.fields.push({
+        id: d.id,
+        label: d.label,
+        order: fieldOrder,
+        output_type: "number",
+        source: { kind: "script", lineage: { kind: "column", alias: d.field.includes(".") ? d.field.split(".")[0] : "t0", field: d.field.includes(".") ? d.field.split(".").pop() : d.field } },
+        roles: ["output", "metric"],
+      });
+      existingFieldIds.add(d.id);
+    }
+  }
+
+  // Rewrite all field sources to script lineage
+  for (const field of plan.fields ?? []) {
+    const kind = String((field as JsonRecord).source?.kind ?? "");
+    if (kind === "time_shifted" || kind === "computed") continue;
+    const originalSource = { ...(field as JsonRecord).source };
+    (field as JsonRecord).source = { kind: "script", lineage: originalSource };
+  }
 }
 
 /**
@@ -2489,6 +3042,609 @@ if (!ctx.isPreview && __comp.modes.length) {
 
   const original = String(plan.script_report.source ?? "");
   plan.script_report.source = wrapper + original + "\n" + trailer;
+}
+
+// ---------------------------------------------------------------------------
+// Time-shifted metrics (单字段跨期计算)
+// ---------------------------------------------------------------------------
+
+interface TimeShiftedDecl {
+  id: string;
+  label: string;
+  base_metric: string;
+  /** Resolved output column name of the base metric in the SQL result. */
+  base_column: string;
+  shift: string;
+  lookback: number;
+  operation: string;
+}
+
+interface TimeShiftGroup {
+  shift: string;
+  lookback: number;
+  effectiveLookback: number; // chain=lookback, yoy=12
+  fields: TimeShiftedDecl[];
+}
+
+/** Query metadata extracted from declarative config for SQL generation. */
+interface TimeShiftedQueryMeta {
+  primary_alias: string;
+  primary_table: string;
+  profile_id: string;
+  database: string;
+  group_by: string[];
+  metrics: JsonRecord[];
+  metricColumns: Map<string, string>;
+  system_conditions: JsonRecord[];
+  time_filter: JsonRecord | null;
+  filters: JsonRecord[];
+  order_by: JsonRecord[];
+}
+
+/** Scan configuration.fields for time_shifted declarations and extract query metadata. */
+function collectTimeShiftedDecls(configuration: JsonRecord): {
+  groups: TimeShiftGroup[];
+  queryMeta: TimeShiftedQueryMeta | null;
+} {
+  // Build a map of metric ID → output_column from declarative config sources
+  const metricColumnMap = new Map<string, string>();
+  // From query_groups (legacy declarative format for sql/group_queries)
+  for (const g of configuration.query_groups ?? []) {
+    for (const m of (g as JsonRecord).metrics ?? []) {
+      const col = String((m as JsonRecord).output_column ?? (m as JsonRecord).field ?? (m as JsonRecord).id ?? "");
+      metricColumnMap.set(String((m as JsonRecord).id), col.includes(".") ? col.split(".").pop() ?? col : col);
+    }
+  }
+  // From top-level fields
+  for (const f of configuration.fields ?? []) {
+    const col = String((f as JsonRecord).output_column ?? (f as JsonRecord).id ?? "");
+    metricColumnMap.set(String((f as JsonRecord).id), col);
+  }
+  // From group_queries (newer declarative format)
+  for (const q of configuration.group_queries?.queries ?? []) {
+    for (const f of (q as JsonRecord).fields ?? []) {
+      const col = String((f as JsonRecord).id ?? "");
+      metricColumnMap.set(col, col);
+    }
+  }
+
+  const decls: TimeShiftedDecl[] = [];
+  for (const candidate of configuration.fields ?? []) {
+    if ((candidate as JsonRecord).source?.kind !== "time_shifted") continue;
+    const source = normalizeTimeShiftedSource((candidate as JsonRecord).source);
+    const baseMetric = String(source.base_metric);
+    decls.push({
+      id: String((candidate as JsonRecord).id ?? ""),
+      label: String((candidate as JsonRecord).label ?? (candidate as JsonRecord).id ?? ""),
+      base_metric: baseMetric,
+      base_column: metricColumnMap.get(baseMetric) ?? baseMetric,
+      shift: String(source.shift),
+      lookback: Number(source.lookback),
+      operation: String(source.operation),
+    });
+  }
+  if (!decls.length) return { groups: [], queryMeta: null };
+
+  // Extract query metadata from the first query_group for SQL generation.
+  let queryMeta: TimeShiftedQueryMeta | null = null;
+  const qg = (configuration.query_groups ?? [])[0] as JsonRecord | undefined;
+  if (qg) {
+    const alias = String(qg.primary_alias ?? "t0");
+    queryMeta = {
+      primary_alias: alias,
+      primary_table: String(qg.primary_table ?? ""),
+      profile_id: String(qg.profile_id ?? ""),
+      database: String(qg.database ?? ""),
+      group_by: (qg.group_by ?? []).map((g: unknown) =>
+        String(g).includes(".") ? String(g).split(".").pop() ?? String(g) : String(g),
+      ),
+      metrics: (qg.metrics ?? []) as JsonRecord[],
+      metricColumns: metricColumnMap,
+      system_conditions: [],
+      time_filter: (qg.time_filter ?? null) as JsonRecord | null,
+      filters: (qg.filters ?? []) as JsonRecord[],
+      order_by: (qg.order_by ?? []) as JsonRecord[],
+    };
+    // Extract system conditions
+    const ld = (qg.system_conditions as JsonRecord)?.logical_delete;
+    if (ld) {
+      const items = Array.isArray(ld) ? ld : [ld];
+      for (const item of items as JsonRecord[]) {
+        queryMeta.system_conditions.push({
+          alias: String((item as JsonRecord).field ?? "").includes(".")
+            ? String((item as JsonRecord).field).split(".")[0]
+            : alias,
+          field: String((item as JsonRecord).field ?? "").includes(".")
+            ? String((item as JsonRecord).field).split(".").pop() ?? ""
+            : String((item as JsonRecord).field ?? ""),
+          operator: String((item as JsonRecord).operator ?? "eq"),
+          value: (item as JsonRecord).value ?? 0,
+        });
+      }
+    }
+    // Tenant binding
+    const tb = (qg.tenant_binding as JsonRecord);
+    if (tb?.field) {
+      queryMeta.system_conditions.push({
+        alias: String(tb.field).includes(".") ? String(tb.field).split(".")[0] : alias,
+        field: String(tb.field).includes(".") ? String(tb.field).split(".").pop() ?? "" : String(tb.field),
+        operator: "eq",
+        value: null, // bound at runtime
+      });
+    }
+    // Business exclusions
+    for (const excl of (qg.business_exclusions ?? []) as JsonRecord[]) {
+      const field = String(excl.field ?? "");
+      queryMeta.system_conditions.push({
+        alias: field.includes(".") ? field.split(".")[0] : alias,
+        field: field.includes(".") ? field.split(".").pop() ?? "" : field,
+        operator: String(excl.operator ?? "eq"),
+        values: excl.values ?? [],
+        placement: String(excl.placement ?? "WHERE"),
+      });
+    }
+  }
+
+  return { groups: groupTimeShiftedFields(decls), queryMeta };
+}
+
+/** Group time-shifted field declarations by (shift, lookback) to minimize extra queries. */
+function groupTimeShiftedFields(decls: TimeShiftedDecl[]): TimeShiftGroup[] {
+  const groups = new Map<string, TimeShiftGroup>();
+  for (const d of decls) {
+    const key = `${d.shift}:${d.lookback}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        shift: d.shift,
+        lookback: d.lookback,
+        effectiveLookback: d.shift === "yoy" ? 12 : d.lookback,
+        fields: [],
+      });
+    }
+    groups.get(key)!.fields.push(d);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * Validate base_metrics exist in plan.fields or declarative config metrics,
+ * and inject time_shifted fields AND missing base_metric stubs into plan.fields
+ * so the FIELD_NOT_FOUND blocker resolution picks them up and buildSql can
+ * generate complete SQL.
+ */
+function resolveTimeShiftedMetrics(
+  plan: JsonRecord,
+  decls: TimeShiftedDecl[],
+  configMetricIds: Set<string>,
+  configMetricColumns: Map<string, { column: string; alias: string; field: string }>,
+): void {
+  plan.fields = plan.fields ?? [];
+  const existingIds = new Set(plan.fields.map((f: JsonRecord) => String(f.id)));
+
+  const errors: string[] = [];
+  for (const d of decls) {
+    if (!existingIds.has(d.base_metric) && !configMetricIds.has(d.base_metric)) {
+      errors.push(
+        `time_shifted 字段 ${d.id}（${d.label}）引用的 base_metric ${d.base_metric} 不在 plan.fields 或声明式配置指标中`,
+      );
+    }
+    // Inject the base metric as a plan field if it's only in declarative config.
+    if (!existingIds.has(d.base_metric) && configMetricIds.has(d.base_metric)) {
+      const colInfo = configMetricColumns.get(d.base_metric);
+      plan.fields.push({
+        id: d.base_metric,
+        label: d.base_metric,
+        output_column: colInfo?.column ?? d.base_metric,
+        output_type: "number",
+        source: {
+          kind: "column",
+          alias: colInfo?.alias ?? "t0",
+          field: colInfo?.field ?? d.base_metric,
+        },
+        roles: ["output", "metric"],
+      });
+      existingIds.add(d.base_metric);
+    }
+    // Inject the time_shifted field itself.
+    if (existingIds.has(d.id)) continue;
+    plan.fields.push({
+      id: d.id,
+      label: d.label,
+      output_type: "number",
+      source: {
+        kind: "time_shifted",
+        base_metric: d.base_metric,
+        shift: d.shift,
+        lookback: d.lookback,
+        operation: d.operation,
+      },
+      roles: ["output", "metric"],
+    });
+    existingIds.add(d.id);
+  }
+  if (errors.length) throw new Error(errors.join("；"));
+
+  (plan as JsonRecord)._has_time_shifted = decls.length > 0;
+}
+
+/**
+ * Generate the TypeScript script source for time-shifted metrics.
+ * The script:
+ *  1. Defines a shiftMonths helper (reused from comparison wrapper)
+ *  2. For each shift group, builds an index Map<groupKey, row> from
+ *     queryStreamWithFilters with shifted filters
+ *  3. Streams the main query, looks up shifted indexes, computes deltas, emits
+ */
+function buildTimeShiftedScriptSource(
+  plan: JsonRecord,
+  shiftGroups: TimeShiftGroup[],
+  periodParam: string,
+  groupByKeys: string[],
+): string {
+  // Resolve group key columns for time-shifted index lookup. Priority:
+  //  1. groupByKeys parameter (from queryMeta or plan dims, already stripped of alias prefix)
+  //  2. semantic_plan.dimensions[0].id
+  //  3. result_grain.keys[0] (model format)
+  //  4. Fallback "id"
+  let groupKeys: string[] = groupByKeys.length
+    ? groupByKeys
+    : ((plan.semantic_plan as JsonRecord)?.dimensions as JsonRecord[] ?? [])
+        .map((d: JsonRecord) => String(d.id ?? "").includes(".") ? String(d.id).split(".").pop() ?? String(d.id) : String(d.id));
+  if (!groupKeys.length) {
+    const grainKey = (plan.result_grain as JsonRecord)?.keys?.[0];
+    if (grainKey) {
+      const gk = typeof grainKey === "string" ? grainKey : (grainKey as JsonRecord)?.field ?? (grainKey as JsonRecord)?.name ?? String(grainKey);
+      groupKeys = [gk.includes(".") ? gk.split(".").pop() ?? gk : gk];
+    }
+  }
+  if (!groupKeys.length) groupKeys = ["id"];
+  // Resolve each time_shifted field's base metric to its output column name.
+  // base_column is resolved during collectTimeShiftedDecls from the declarative config.
+  const fieldMap = new Map((plan.fields ?? []).map((f: JsonRecord) => [String(f.id), f]));
+  const resolveColumn = (decl: TimeShiftedDecl): string => {
+    // Prefer the pre-resolved column from the declarative config.
+    if (decl.base_column) return decl.base_column;
+    // Fallback: look up in plan.fields.
+    const f = fieldMap.get(decl.base_metric);
+    if (!f) return decl.base_metric;
+    return String(
+      (f as JsonRecord).output_column ??
+      (f as JsonRecord).source?.field ??
+      (f as JsonRecord).source?.expression ??
+      (f as JsonRecord).id ??
+      decl.base_metric,
+    );
+  };
+  const resolveLabel = (baseMetricId: string): string => {
+    const f = fieldMap.get(baseMetricId);
+    return f ? String((f as JsonRecord).label ?? baseMetricId) : baseMetricId;
+  };
+
+  // Build key expression for Map lookups
+  const keyExpr = groupKeys.length === 1
+    ? `row[${JSON.stringify(groupKeys[0])}]`
+    : groupKeys.map((k) => `row[${JSON.stringify(k)}]`).join(" + '|' + ");
+  const keyExprQuoted = groupKeys.length === 1
+    ? `row[${JSON.stringify(groupKeys[0])}]`
+    : groupKeys.map((k) => `row[${JSON.stringify(k)}]`).join(" + \"|\" + ");
+
+  const lines: string[] = [];
+  lines.push("// === AUTO-GENERATED: time-shifted metrics script ===");
+  lines.push("// shiftMonths: offset a period filter's {from,to} range by N months.");
+  lines.push("function shiftMonths(filterValue, months) {");
+  lines.push("  if (!filterValue) return filterValue;");
+  lines.push("  let range = filterValue;");
+  lines.push("  let wrapperObj = null;");
+  lines.push("  if (typeof range === 'object' && range !== null && !Array.isArray(range) && 'value' in range) {");
+  lines.push("    wrapperObj = range;");
+  lines.push("    range = range.value;");
+  lines.push("  }");
+  lines.push("  if (!range || typeof range !== 'object' || !range.from || !range.to) return filterValue;");
+  lines.push("  const shift = (ym) => {");
+  lines.push("    const [y, m] = String(ym).split('-').map(Number);");
+  lines.push("    if (!Number.isFinite(y) || !Number.isFinite(m)) return ym;");
+  lines.push("    const total = y * 12 + (m - 1) + months;");
+  lines.push("    const ny = Math.floor(total / 12);");
+  lines.push("    const nm = (total % 12) + 1;");
+  lines.push("    const padded = `${String(ny).padStart(4, '0')}-${String(nm).padStart(2, '0')}`;");
+  lines.push("    const rest = String(ym).slice(7);");
+  lines.push("    return rest ? padded + rest : padded + '-01';");
+  lines.push("  };");
+  lines.push("  const shifted = { ...range, from: shift(String(range.from)), to: shift(String(range.to)) };");
+  lines.push("  return wrapperObj ? { ...wrapperObj, value: shifted } : shifted;");
+  lines.push("}");
+  lines.push("");
+  lines.push("export async function run(ctx) {");
+  lines.push(`  const periodValue = ctx.filters?.[${JSON.stringify(periodParam)}];`);
+  lines.push("");
+
+  // Build a shifted index for each shift group
+  for (const g of shiftGroups) {
+    const indexName = `${g.shift}Index`;
+    const monthsBack = g.effectiveLookback;
+    const label = g.shift === "chain" ? "环比" : "同比";
+    lines.push(`  // Build ${label} index (shift back ${monthsBack} month(s))`);
+    lines.push(`  let ${indexName} = null;`);
+    lines.push("  if (periodValue) {");
+    lines.push(`    const ${g.shift}Filters = { ...ctx.filters, ${JSON.stringify(periodParam)}: shiftMonths(periodValue, ${-monthsBack}) };`);
+    lines.push(`    const ${g.shift}Map = new Map();`);
+    lines.push(`    for await (const row of ctx.queryStreamWithFilters('main', ${g.shift}Filters)) {`);
+    lines.push(`      ${g.shift}Map.set(${keyExpr}, row);`);
+    lines.push("    }");
+    lines.push(`    ${indexName} = ${g.shift}Map;`);
+    lines.push("  }");
+    lines.push("");
+  }
+
+  // Stream main + merge
+  lines.push("  // Stream main query and merge time-shifted values");
+  lines.push("  for await (const row of ctx.queryStream('main', ctx.filters)) {");
+  lines.push(`    const key = ${keyExprQuoted};`);
+  lines.push("");
+
+  // Generate merge + compute logic
+  const usedBaseMetrics = new Set<string>();
+  for (const g of shiftGroups) {
+    const indexName = `${g.shift}Index`;
+    lines.push(`    const ${g.shift}Row = ${indexName}?.get(key);`);
+    if (g.fields.length > 0) {
+      lines.push(`    if (${g.shift}Row) {`);
+      for (const f of g.fields) {
+        const col = resolveColumn(f);
+        const baseLabel = resolveLabel(f.base_metric);
+        // Reference the base metric's output column name on the current row
+        lines.push(`      // ${f.label} = current ${baseLabel} - ${g.shift} ${baseLabel}`);
+        if (f.operation === "subtract") {
+          lines.push(`      row[${JSON.stringify(f.id)}] = (row[${JSON.stringify(col)}] ?? 0) - (${g.shift}Row[${JSON.stringify(col)}] ?? 0);`);
+        } else if (f.operation === "divide") {
+          lines.push(`      row[${JSON.stringify(f.id)}] = ${g.shift}Row[${JSON.stringify(col)}] != 0 ? (row[${JSON.stringify(col)}] ?? 0) / ${g.shift}Row[${JSON.stringify(col)}] : null;`);
+        } else if (f.operation === "percent_change") {
+          lines.push(`      row[${JSON.stringify(f.id)}] = ${g.shift}Row[${JSON.stringify(col)}] != 0 ? ((row[${JSON.stringify(col)}] ?? 0) - ${g.shift}Row[${JSON.stringify(col)}]) / ${g.shift}Row[${JSON.stringify(col)}] * 100 : null;`);
+        }
+      }
+      lines.push("    }");
+    }
+    lines.push("");
+  }
+
+  lines.push("    ctx.emit(row);");
+  lines.push("  }");
+  lines.push("}");
+
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Build a script_report structure from a plan that has time_shifted metrics.
+ * Generates a proper aggregated SQL query from the query metadata, locks sources,
+ * and creates a generated script that handles querying + merging + computing
+ * time-shifted fields.
+ */
+function buildScriptReportFromTimeShiftedPlan(
+  plan: JsonRecord,
+  shiftGroups: TimeShiftGroup[],
+  periodParam: string,
+  queryMeta: TimeShiftedQueryMeta | null,
+): void {
+  const primaryTable = plan.source?.primary_table as JsonRecord | undefined;
+  const db = queryMeta?.database ?? String(primaryTable?.database ?? "");
+  const table = queryMeta?.primary_table ?? String(primaryTable?.table ?? "");
+  const alias = queryMeta?.primary_alias ?? String(primaryTable?.alias ?? "t0");
+  const profileId = queryMeta?.profile_id ?? String(primaryTable?.profile_id ?? "");
+  const dialect = dialectForPlan(plan);
+
+  // Build GROUP BY from queryMeta or semantic_plan.dimensions
+  const groupByCols: string[] = queryMeta?.group_by?.length
+    ? queryMeta.group_by
+    : ((plan.semantic_plan as JsonRecord)?.dimensions as JsonRecord[] ?? [])
+        .map((d: JsonRecord) => String(d.id ?? ""));
+  const groupByIdents = groupByCols.map((col) => columnExpression(alias, col, dialect));
+
+  // Build SELECT list: dimension columns + aggregated metrics
+  const selectParts: string[] = [];
+  const addedCols = new Set<string>();
+
+  // 1. Dimension columns (plain, no aggregation)
+  for (const col of groupByCols) {
+    if (addedCols.has(col)) continue;
+    selectParts.push(`${columnExpression(alias, col, dialect)} AS ${quoteIdentifier(col, dialect)}`);
+    addedCols.add(col);
+  }
+
+  // 2. ALL metric columns from queryMeta (incl. those not referenced by time_shifted)
+  const metricMap = new Map<string, JsonRecord>();
+  const metricIds: string[] = [];
+  for (const m of queryMeta?.metrics ?? []) {
+    const mid = String((m as JsonRecord).id);
+    metricMap.set(mid, m as JsonRecord);
+    metricIds.push(mid);
+  }
+
+  // 3. Also include plan.fields that are NOT time_shifted and NOT already in group_by
+  //    (e.g., extra dimension columns from inspectReport)
+  for (const field of plan.fields ?? []) {
+    const kind = String((field as JsonRecord).source?.kind ?? "");
+    if (kind === "time_shifted") continue;
+    if (kind === "computed") continue;
+
+    const fid = String((field as JsonRecord).id ?? "");
+    const colName = String((field as JsonRecord).output_column ?? fid);
+
+    // Skip if already in GROUP BY or metrics
+    if (addedCols.has(colName)) continue;
+    if (metricMap.has(fid)) continue;
+    if (groupByCols.includes(colName) || groupByCols.includes(fid)) continue;
+
+    // Extra non-grouped, non-metric columns: wrap in MAX() to be safe in GROUP BY
+    if (kind === "column" || kind === "boolean_flag") {
+      const fName = String((field as JsonRecord).source?.field ?? colName);
+      const fAlias = String((field as JsonRecord).source?.alias ?? alias);
+      selectParts.push(
+        `MAX(${columnExpression(fAlias, fName, dialect)}) AS ${quoteIdentifier(colName, dialect)}`,
+      );
+      addedCols.add(colName);
+    } else if (kind === "sql_expression") {
+      selectParts.push(
+        `${String((field as JsonRecord).source?.expression ?? colName)} AS ${quoteIdentifier(colName, dialect)}`,
+      );
+      addedCols.add(colName);
+    }
+  }
+
+  // 4. Process ALL metrics from queryMeta
+  for (const mid of metricIds) {
+    const metricDef = metricMap.get(mid);
+    if (!metricDef) continue;
+    const colName = String(metricDef.output_column ?? mid);
+    if (addedCols.has(colName)) continue;
+
+    // Look up aggregation info from queryMeta
+      const agg = String(metricDef.aggregation ?? "").toLowerCase();
+      const rawField = String(metricDef.field ?? "");
+      const fieldParts = rawField.includes(".") ? rawField.split(".") : [alias, rawField];
+      const fAlias = fieldParts[0] ?? alias;
+      const fName = fieldParts[fieldParts.length - 1] ?? rawField;
+      const colRef = columnExpression(fAlias, fName, dialect);
+      const cond = metricDef.condition ? String(metricDef.condition) : null;
+
+      // Re-quote column references in AI-authored condition strings.
+      const quotedCond = cond
+        ? cond.replace(/\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/gi, (_m, a, f) =>
+            `${dialect.quoteChar}${a}${dialect.quoteChar}.${dialect.quoteChar}${f}${dialect.quoteChar}`)
+        : null;
+
+      let expr: string;
+      if (agg === "count_distinct") {
+        expr = quotedCond
+          ? `COUNT(DISTINCT CASE WHEN ${quotedCond} THEN ${colRef} END)`
+          : `COUNT(DISTINCT ${colRef})`;
+      } else if (agg === "sum") {
+        expr = quotedCond ? `SUM(CASE WHEN ${quotedCond} THEN ${colRef} ELSE 0 END)` : `SUM(${colRef})`;
+      } else if (agg === "max") {
+        expr = quotedCond ? `MAX(CASE WHEN ${quotedCond} THEN ${colRef} END)` : `MAX(${colRef})`;
+      } else if (agg === "min") {
+        expr = quotedCond ? `MIN(CASE WHEN ${quotedCond} THEN ${colRef} END)` : `MIN(${colRef})`;
+      } else if (agg === "avg") {
+        expr = quotedCond ? `AVG(CASE WHEN ${quotedCond} THEN ${colRef} END)` : `AVG(${colRef})`;
+      } else if (agg === "group_concat" || agg === "group_concat_distinct") {
+        const distinct = agg === "group_concat_distinct" ? "DISTINCT " : "";
+        expr = quotedCond
+          ? `GROUP_CONCAT(${distinct}CASE WHEN ${quotedCond} THEN ${colRef} END)`
+          : `GROUP_CONCAT(${distinct}${colRef})`;
+      } else {
+        expr = colRef; // fallback: plain column reference
+      }
+      selectParts.push(`${expr} AS ${quoteIdentifier(colName, dialect)}`);
+      addedCols.add(colName);
+  }
+
+  if (!selectParts.length) {
+    throw new Error("time_shifted 报表没有可查询字段");
+  }
+  const selectList = selectParts.map((s) => `  ${s}`).join(",\n");
+
+  // Build WHERE clauses from system conditions
+  const whereParts: string[] = [];
+  for (const sc of queryMeta?.system_conditions ?? []) {
+    const scAlias = String((sc as JsonRecord).alias ?? alias);
+    const scField = String((sc as JsonRecord).field ?? "");
+    if (!scField) continue;
+    const scOp = String((sc as JsonRecord).operator ?? "eq");
+    const scVal = (sc as JsonRecord).value;
+    const scVals = (sc as JsonRecord).values;
+    const placement = String((sc as JsonRecord).placement ?? "WHERE");
+    if (placement !== "WHERE") continue; // only WHERE for now
+
+    const colRef = columnExpression(scAlias, scField, dialect);
+    if (scVals && Array.isArray(scVals) && (scVals as unknown[]).length) {
+      const vals = (scVals as unknown[]).map((v) => `'${String(v).replace(/'/g, "''")}'`).join(", ");
+      whereParts.push(`${colRef} ${scOp === "NOT IN" ? "NOT IN" : "IN"} (${vals})`);
+    } else if (scVal !== null && scVal !== undefined) {
+      whereParts.push(`${colRef} ${scOp === "eq" ? "=" : scOp} ${typeof scVal === "number" ? scVal : `'${String(scVal).replace(/'/g, "''")}'`}`);
+    }
+    // null value = bound at runtime (e.g. tenant_id), skip
+  }
+
+  // Build FROM clause
+  const fromTable = db
+    ? `${quoteIdentifier(db, dialect)}.${quoteIdentifier(table, dialect)}`
+    : quoteIdentifier(table, dialect);
+
+  // Assemble SQL
+  const sqlLines = [`SELECT`, selectList, `FROM ${fromTable} AS ${quoteIdentifier(alias, dialect)}`];
+  if (whereParts.length) {
+    sqlLines.push(`WHERE ${whereParts.join("\n  AND ")}`);
+  }
+  sqlLines.push(`GROUP BY ${groupByIdents.join(", ")}`);
+
+  // ORDER BY
+  const orderCols: string[] = queryMeta?.order_by?.length
+    ? (queryMeta.order_by as JsonRecord[]).map((o: JsonRecord) => {
+        const f = String((o as JsonRecord).field ?? "").includes(".")
+          ? String((o as JsonRecord).field).split(".").pop() ?? ""
+          : String((o as JsonRecord).field ?? "");
+        const dir = String((o as JsonRecord).direction ?? "ASC");
+        return `${quoteIdentifier(f, dialect)} ${dir}`;
+      })
+    : groupByCols.map((col) => `${quoteIdentifier(col, dialect)} ASC`);
+  sqlLines.push(`ORDER BY ${orderCols.join(", ")}`);
+
+  const mainSql = sqlLines.join("\n") + "\n";
+
+  const dialectId = String(plan.knowledge?.profile_engines?.[profileId] ?? plan.sql_dialect ?? "mysql");
+
+  // Lock sources from the plan
+  const availableCols = availableColumnsForPlan(plan);
+  const availableFields = new Set<string>();
+  for (const cols of availableCols.values()) {
+    for (const c of cols) availableFields.add(c);
+  }
+  const sources: JsonRecord[] = [{
+    profile_id: profileId,
+    database: db,
+    table,
+    alias,
+    fields: [...availableFields].sort(),
+  }];
+
+  // Generate the script source
+  const scriptSource = buildTimeShiftedScriptSource(plan, shiftGroups, periodParam, groupByCols);
+
+  // Build script_report structure
+  plan.script_report = {
+    queries: [
+      {
+        id: "main",
+        mode: "stream",
+        profile_id: profileId,
+        database: db,
+        sql_dialect: dialectId,
+        sql: mainSql,
+        sources,
+      },
+    ],
+    source: scriptSource,
+    resource_budget: {
+      max_queries: 12,
+      max_query_rows: 1_000_000,
+      max_index_rows: 100_000,
+      max_batch_keys: 2_000,
+      max_output_rows: 500_000,
+      max_memory_mb: 512,
+      timeout_seconds: 300,
+      stream_batch_rows: 128,
+    },
+  };
+
+  // Rewrite field sources for the knowledge lock.
+  for (const field of plan.fields ?? []) {
+    const kind = String((field as JsonRecord).source?.kind ?? "");
+    if (kind === "time_shifted") continue;
+    (field as JsonRecord).source = {
+      kind: "script",
+      lineage: (field as JsonRecord).source,
+    };
+  }
 }
 
 function finalizePlanningDocuments(plan: JsonRecord, configuration: JsonRecord): void {
@@ -4593,6 +5749,33 @@ export async function finalizeStagedPackage(options: {
       }
     }
   }
+  // Extract metric field IDs from query_groups so that:
+  // 1. time_shifted base_metric references can be validated
+  // 2. FIELD_NOT_FOUND blockers are resolved
+  // 3. buildTimeShiftedScriptSource knows the output column names
+  //
+  // We add lightweight field stubs — full sql_expression resolution (with conditions,
+  // aggregation functions, etc.) is handled by the existing query_groups→group_queries
+  // normalization path in configurePlan. These stubs are just for blocker resolution.
+  if (Array.isArray(configuration.query_groups)) {
+    const qgFields: JsonRecord[] = [];
+    for (const g of configuration.query_groups as JsonRecord[]) {
+      for (const m of (g.metrics ?? []) as JsonRecord[]) {
+        const mid = String(m.id ?? "");
+        if (!mid) continue;
+        // Only add if not already in configuration.fields (dedup)
+        if ((configuration.fields ?? []).some((f: JsonRecord) => String(f.id) === mid)) continue;
+        qgFields.push({
+          id: mid,
+          label: String(m.label ?? mid),
+          output_column: String(m.output_column ?? mid),
+          output_type: "number",
+          source: { kind: "column", alias: String(g.primary_alias ?? "t0"), field: String(m.field ?? "").split(".").pop() ?? "" },
+        });
+      }
+    }
+    configuration.fields = [...(configuration.fields ?? []), ...qgFields];
+  }
   if (strategy !== "script") delete configuration.script_report;
   if (strategy === "script") configuration.script_report = {
     queries: await Promise.all((model.query_contracts ?? []).map(async (contract: JsonRecord) => ({
@@ -4796,14 +5979,43 @@ export async function finalizeStagedPackage(options: {
     await configurePlan(planPath, paths.configuration);
     await approvePlan(planPath, options.reviewedBy);
     await generatePackage({ workspace, plan: planPath, out: candidateRoot, register: false });
+    // Clean up internal metadata that configurePlan stored on the plan, and sync the
+    // execution_plan strategy in case generatePackage switched us to script.
+    try {
+      const candidateManifest = await readJson(join(candidateRoot, "report.manifest.json"));
+      const updatedPlan = await readJson(planPath);
+      let changed = false;
+      if ((updatedPlan as JsonRecord)._time_shifted) {
+        delete (updatedPlan as JsonRecord)._time_shifted;
+        changed = true;
+      }
+      if (String(candidateManifest.execution_model ?? "").includes("script") && String((updatedPlan as JsonRecord).execution_plan?.strategy) !== "script") {
+        (updatedPlan as JsonRecord).execution_plan = {
+          ...((updatedPlan as JsonRecord).execution_plan ?? {}),
+          strategy: "script",
+        };
+        changed = true;
+      }
+      if (changed) await writeJson(planPath, updatedPlan);
+      // Also sync the standalone execution-plan.json so re-runs of the pipeline
+      // see the updated strategy (validateStagedArtifacts reads this file).
+      try {
+        const standaloneEp = await readJson(paths.executionPlan);
+        if (String(standaloneEp.strategy ?? "") !== String((updatedPlan as JsonRecord).execution_plan?.strategy ?? "")) {
+          await writeJson(paths.executionPlan, { ...standaloneEp, ...(updatedPlan as JsonRecord).execution_plan });
+        }
+      } catch { /* best-effort */ }
+    } catch { /* best-effort cleanup */ }
     const packageValidation = await validatePackage(candidateRoot);
     if (!packageValidation.valid) throw new Error(`报表包静态校验失败：${packageValidation.errors.join("；")}`);
     await mkdir(dirname(finalRoot), { recursive: true });
     await rename(candidateRoot, finalRoot);
     published = true;
-    await updateReportIndex(workspace, await readJson(join(finalRoot, "report.manifest.json")), finalRoot);
+    const manifest = await readJson(join(finalRoot, "report.manifest.json"));
+    await updateReportIndex(workspace, manifest, finalRoot);
     if (movedPrevious) await rm(previousRoot, { recursive: true, force: true });
-    const result = { ok: true, phase: strategy === "script" ? "script" : "query", strategy, report_id: model.report?.id, package: finalRoot };
+    const actualStrategy = String(manifest?.execution_model ?? "").includes("script") ? "script" : strategy;
+    const result = { ok: true, phase: actualStrategy === "script" ? "script" : "query", strategy: actualStrategy, report_id: model.report?.id, package: finalRoot };
     await writeJson(paths.result, result);
     return result;
   } catch (error) {
@@ -4882,6 +6094,11 @@ export async function configurePlan(
   // runtime. Resolved from knowledge here; stored in plan.group_queries.
   if (configuration.group_queries) {
     await applyGroupQueries(plan, configuration.group_queries);
+    // Auto-generate a v3 script report from group_queries: raw-data SQL per sibling
+    // + in-memory COUNT DISTINCT dedup + full-outer-merge on merge_keys.
+    if (Array.isArray(configuration.query_groups) && configuration.query_groups.length) {
+      buildScriptReportFromGroupQueriesPlan(plan, configuration.query_groups as JsonRecord[]);
+    }
   }
   if (configuration.script_report) {
     await applyScriptReport(plan, configuration.script_report);
@@ -4972,10 +6189,42 @@ export async function configurePlan(
   // These are transform- or expression-produced (环比/同比 deltas, ratios, …) and
   // do NOT exist in the report's required_fields lineage, so the override loop
   // above (which only mutates existing plan.fields by id) skips them. Only
-  // computed / sql_expression kinds may be added here — a brand-new `column`
-  // field must still flow through required_fields + knowledge resolution so its
-  // lineage is locked, so we reject it. Existing ids are handled by the loop and
+  // computed / sql_expression / time_shifted kinds may be added here — a brand-new
+  // `column` field must still flow through required_fields + knowledge resolution so
+  // its lineage is locked, so we reject it. Existing ids are handled by the loop and
   // are not re-added.
+  //
+  // Time-shifted fields are collected before this loop (via collectTimeShiftedDecls)
+  // and injected into plan.fields by resolveTimeShiftedMetrics so blocker resolution
+  // picks them up. They are skipped here.
+  plan.fields = plan.fields ?? [];
+  const { groups: tsDecls, queryMeta: tsQueryMeta } = collectTimeShiftedDecls(configuration);
+  if (tsDecls.length > 0) {
+    // Build set of metric IDs and column info from declarative config for base_metric
+    // validation and injection into plan.fields.
+    const configMetricIds = new Set<string>();
+    const configMetricColumns = new Map<string, { column: string; alias: string; field: string }>();
+    if (tsQueryMeta) {
+      for (const m of tsQueryMeta.metrics) {
+        const mid = String((m as JsonRecord).id);
+        const col = String((m as JsonRecord).output_column ?? (m as JsonRecord).field ?? mid);
+        const rawField = String((m as JsonRecord).field ?? "").includes(".")
+          ? String((m as JsonRecord).field ?? "")
+          : `${tsQueryMeta.primary_alias}.${String((m as JsonRecord).field ?? mid)}`;
+        const fieldParts = rawField.split(".");
+        const fieldName = fieldParts.pop() ?? rawField;
+        const fieldAlias = fieldParts.pop() ?? tsQueryMeta.primary_alias;
+        configMetricIds.add(mid);
+        configMetricColumns.set(mid, { column: col, alias: fieldAlias, field: fieldName });
+      }
+    }
+    for (const f of configuration.fields ?? []) {
+      configMetricIds.add(String((f as JsonRecord).id));
+    }
+    const allDecls = tsDecls.flatMap((g) => g.fields);
+    resolveTimeShiftedMetrics(plan, allDecls, configMetricIds, configMetricColumns);
+  }
+
   const existingFieldIds = new Set((plan.fields ?? []).map((f: JsonRecord) => f.id));
   const maxOrder = (plan.fields ?? []).reduce(
     (max: number, f: JsonRecord) => Math.max(max, Number(f.order ?? 0)),
@@ -4985,6 +6234,11 @@ export async function configurePlan(
   for (const candidate of configuration.fields ?? []) {
     if (existingFieldIds.has(candidate.id)) continue;
     const kind = candidate.source?.kind;
+    // time_shifted fields are resolved above; skip them here.
+    // Metric stubs from query_groups (kind=column) are also skipped — their full
+    // sql_expression resolution happens via applyGroupQueries for group_queries
+    // strategy, or via the declarative config for sql strategy.
+    if (kind === "time_shifted" || kind === "column") continue;
     if (
       kind !== "computed" &&
       kind !== "sql_expression" &&
@@ -5209,7 +6463,37 @@ export async function configurePlan(
     wrapScriptForComparison(plan);
   }
 
+  // When time_shifted fields exist and we haven't already built a script (comparison
+  // may have set script_report above), store metadata in the plan so generatePackage
+  // can auto-generate the script at the right time (when SQL + source data is ready).
+  if ((plan as JsonRecord)._has_time_shifted && tsDecls.length > 0 && !plan.script_report) {
+    const periodParam = String(
+      plan.comparison?.period_param ??
+      (plan.default_period_candidates?.length
+        ? (plan.default_period_candidates as JsonRecord[])[0]?.field
+        : tsQueryMeta?.time_filter?.field
+          ? String((tsQueryMeta.time_filter as JsonRecord).field ?? "").includes(".")
+            ? String((tsQueryMeta.time_filter as JsonRecord).field).split(".").pop() ?? "create_time"
+            : String((tsQueryMeta.time_filter as JsonRecord).field ?? "create_time")
+          : "create_time"),
+    );
+    const existingParam = (plan.parameters ?? []).find(
+      (p: JsonRecord) => p.id === periodParam,
+    );
+    if (existingParam && !existingParam.required) {
+      existingParam.required = true;
+    }
+    // Store deferred script generation metadata including query info for SQL generation.
+    (plan as JsonRecord)._time_shifted = {
+      shiftGroups: tsDecls,
+      periodParam,
+      queryMeta: tsQueryMeta,
+    };
+    delete (plan as JsonRecord)._has_time_shifted;
+  }
+
   finalizePlanningDocuments(plan, configuration);
+  plan.custom_logic = plan.custom_logic ?? { required: false, mode: "identity", group_keys: [], max_group_rows: 100000 };
   const fieldKinds = new Set(
     (plan.fields ?? []).map((field: JsonRecord) => field.source?.kind),
   );
@@ -5405,7 +6689,7 @@ function buildSql(plan: JsonRecord): string {
       "\n  AND ",
     )}`;
   });
-  const system = (plan.system_conditions ?? []).map(
+  const system = (Array.isArray(plan.system_conditions) ? plan.system_conditions : []).map(
     (condition: JsonRecord) =>
       `  ${condition.expression} ${condition.operator === "eq" ? "=" : condition.operator} :${condition.id}`,
   );
@@ -5632,7 +6916,7 @@ function buildBindings(plan: JsonRecord): JsonRecord {
         : {}),
     })),
     context: plan.context_bindings,
-    system: [...plan.system_conditions, ...joinSystem, ...havingSystem],
+    system: [...(Array.isArray(plan.system_conditions) ? plan.system_conditions : []), ...joinSystem, ...havingSystem],
     ...(plan.enrichments?.length ? { enrichments: buildEnrichmentBindings(plan) } : {}),
   };
 }
@@ -5883,7 +7167,7 @@ function lockedSources(plan: JsonRecord): JsonRecord[] {
       add(condition.alias ?? joinItem.alias, condition.field);
     }
   }
-  for (const condition of plan.system_conditions ?? []) {
+  for (const condition of Array.isArray(plan.system_conditions) ? plan.system_conditions : []) {
     addExpression(condition.expression);
   }
   for (const parameter of plan.parameters ?? []) {
@@ -6114,6 +7398,39 @@ export async function generatePackage(options: {
   }
   const modelErrors = await validateAttachedReportModel(plan, resolvedPlanPath);
   if (modelErrors.length) throw new Error(`报表模型校验失败：\n${modelErrors.join("\n")}`);
+  // Deferred time_shifted script generation: configurePlan stored metadata because
+  // the plan wasn't ready for SQL generation at that point. Now build the script.
+  if ((plan as JsonRecord)._time_shifted) {
+    const ts = (plan as JsonRecord)._time_shifted as {
+      shiftGroups: TimeShiftGroup[];
+      periodParam: string;
+      queryMeta: TimeShiftedQueryMeta | null;
+    };
+    // Build the script_report from the plan (now fully configured).
+    buildScriptReportFromTimeShiftedPlan(
+      plan,
+      ts.shiftGroups,
+      ts.periodParam,
+      ts.queryMeta,
+    );
+    delete (plan as JsonRecord)._time_shifted;
+    // Update execution plan: finalizePlanningDocuments ran before the script was
+    // built, so it set strategy="sql". Patch it now that script_report exists.
+    plan.execution_plan = {
+      ...(plan.execution_plan ?? {}),
+      strategy: "script",
+      steps: (plan.script_report as JsonRecord)?.queries?.length
+        ? (plan.script_report as JsonRecord).queries.map((q: JsonRecord, i: number) => ({
+            id: `Q${i + 1}`,
+            type: String((q as JsonRecord).mode ?? "stream") === "stream" ? "query_stream" : "load_index",
+            description: `执行查询 ${String((q as JsonRecord).id)}（${String((q as JsonRecord).mode ?? "stream")}）`,
+            query_id: String((q as JsonRecord).id),
+          }))
+        : [{ id: "Q1", type: "query_stream", description: "执行主查询（含时间偏移）" }],
+      rationale: "包含 time_shifted 跨期计算字段，自动生成脚本执行",
+    };
+  }
+
   if (plan.script_report) {
     return generateScriptPackage(workspace, plan, packageRoot, options.register !== false);
   }
