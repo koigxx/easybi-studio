@@ -3,10 +3,13 @@ import {
   AlertCircle,
   CheckCircle2,
   Database,
+  Edit3,
+  FileText,
   Link2,
   Plus,
   Save,
   Search,
+  Table2,
   Trash2,
   X,
 } from 'lucide-react';
@@ -15,8 +18,18 @@ import {
   type AvailableField,
   type ReportModelComparison,
   type ReportModelDetail,
+  type ReportModelFilter,
+  type ReportModelMetric,
   type ReportModelRelationship,
 } from '../api.js';
+
+type EditorTab = 'fields' | 'sources' | 'comparison';
+
+const TAB_DEFS: { id: EditorTab; label: string; icon: typeof Table2 }[] = [
+  { id: 'fields', label: '字段目录', icon: FileText },
+  { id: 'sources', label: '数据源', icon: Database },
+  { id: 'comparison', label: '环比/同比', icon: Edit3 },
+];
 
 const RELATION_TYPES = [
   ['left', '左连接'],
@@ -45,7 +58,20 @@ export function ReportModelEditor({
   const [saving, setSaving] = useState(false);
   const [changed, setChanged] = useState(false);
   const [savedAny, setSavedAny] = useState(false);
+  const [activeTab, setActiveTab] = useState<EditorTab>('fields');
   // Per-source add-field picker state: sourceId -> { loading, fields, open, search }
+  const [metricEdits, setMetricEdits] = useState<
+    Array<{ id: string; sourceField?: string; sourceAlias?: string; dedupKey?: string }>
+  >([]);
+  const [filterEditsDirty, setFilterEditsDirty] = useState(false);
+  // Working copy of filters for the FiltersTab (mutated in place, saved on submit)
+  const [filterEdits, setFilterEdits] = useState<ReportModelFilter[]>([]);
+  useEffect(() => {
+    if (model && !filterEditsDirty) setFilterEdits(structuredClone(model.filters));
+  }, [model, filterEditsDirty]);
+  // Track merged state (metricEdits + filterEditsDirty count as changes)
+  const hasMetricOrFilterEdits = metricEdits.length > 0 || filterEditsDirty;
+  const effectiveChanged = changed || hasMetricOrFilterEdits;
   const [pickers, setPickers] = useState<
     Record<string, { loading: boolean; fields: AvailableField[]; open: boolean; search: string }>
   >({});
@@ -179,10 +205,14 @@ export function ReportModelEditor({
         })),
         model.relationships,
         model.comparison,
+        metricEdits.length ? metricEdits : undefined,
+        filterEditsDirty ? filterEdits : undefined,
       );
       setModel(saved);
       setChanged(false);
       setSavedAny(true);
+      setMetricEdits([]);
+      setFilterEditsDirty(false);
       setStatus('模型已校验并重新确认；后续生成报表将使用此模型');
     } catch (e) {
       setError(String((e as Error).message ?? e));
@@ -204,7 +234,7 @@ export function ReportModelEditor({
             <button
               className="ide-btn ide-btn-sm ide-btn-primary"
               onClick={() => void save()}
-              disabled={!model || saving || !changed}
+              disabled={!model || saving || !effectiveChanged}
             >
               <Save className="w-3.5 h-3.5" />
               {saving ? '校验中…' : '保存并确认模型'}
@@ -212,7 +242,7 @@ export function ReportModelEditor({
             <button
               className="ide-btn ide-btn-sm ide-btn-ghost"
               onClick={() => onClose(savedAny)}
-              title={changed ? '有未保存修改' : '关闭'}
+              title={effectiveChanged ? '有未保存修改' : '关闭'}
             >
               <X className="w-4 h-4" />
             </button>
@@ -268,294 +298,671 @@ export function ReportModelEditor({
                 </div>
               </div>
 
-              <section>
-                <div style={{ marginBottom: 8 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>表与字段</div>
-                  <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
-                    管理该报表使用的物理字段。可从知识库添加新字段，或删除已选字段。
-                  </div>
-                </div>
-                <div
-                  style={{
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
-                    gap: 10,
+              {/* Tab navigation */}
+              <div style={{ display: 'flex', gap: 0, borderBottom: '1px solid var(--ide-border-subtle)' }}>
+                {TAB_DEFS.map((tab) => {
+                  const Icon = tab.icon;
+                  const active = activeTab === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      className="ide-btn ide-btn-ghost ide-btn-sm"
+                      style={{
+                        padding: '7px 14px',
+                        borderRadius: 0,
+                        borderBottom: active ? '2px solid var(--ide-text-primary)' : '2px solid transparent',
+                        color: active ? 'var(--ide-text-primary)' : 'var(--ide-text-tertiary)',
+                        fontWeight: active ? 600 : 400,
+                        fontSize: 12,
+                      }}
+                      onClick={() => setActiveTab(tab.id)}
+                    >
+                      <Icon className="w-3.5 h-3.5" />
+                      {tab.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Tab 1: 字段目录 — 统一展示所有输出字段的映射 */}
+              {activeTab === 'fields' && model.queryContracts && (
+                <FieldDirectoryTab
+                  model={model}
+                  metricEdits={metricEdits}
+                  filterEdits={filterEdits}
+                  onMetricEdit={(edit) => {
+                    setMetricEdits((prev) => {
+                      const existing = prev.findIndex((e) => e.id === edit.id);
+                      if (existing >= 0) {
+                        const next = [...prev];
+                        next[existing] = { ...next[existing]!, ...edit };
+                        return next;
+                      }
+                      return [...prev, edit];
+                    });
                   }}
-                >
-                  {model.sources.map((source) => {
-                    const picker = pickers[source.id];
-                    const searchFilter = (picker?.search ?? '').trim().toLowerCase();
-                    const visible = (picker?.fields ?? []).filter(
-                      (f) => !searchFilter || f.name.toLowerCase().includes(searchFilter) || f.label.includes(searchFilter),
-                    );
-                    return (
-                      <div key={source.id} className="ide-card" style={{ padding: 0, overflow: 'visible', position: 'relative' }}>
-                        <div
-                          style={{
-                            padding: '10px 12px',
-                            borderBottom: '1px solid var(--ide-border-subtle)',
-                            background: 'var(--ide-bg-chrome)',
-                            display: 'flex',
-                            justifyContent: 'space-between',
-                            alignItems: 'center',
-                            gap: 8,
-                          }}
-                        >
-                          <div style={{ minWidth: 0 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                              <Database className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)' }} />
-                              <strong style={{ fontSize: 12.5 }}>{source.alias || source.id}</strong>
-                              <span className="ide-badge ide-badge-neutral">{source.fields.length}</span>
-                            </div>
-                            <div
-                              className="ide-text-mono"
-                              style={{ marginTop: 3, fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
-                            >
-                              {source.profileId} / {source.database}.{source.table}
-                            </div>
-                          </div>
-                          <button
-                            className="ide-btn ide-btn-sm"
-                            onClick={() => void openPicker(source.id)}
-                            title="从知识库添加字段"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
+                  onFiltersChange={(next) => {
+                    setFilterEdits(next);
+                    setFilterEditsDirty(true);
+                  }}
+                />
+              )}
 
-                        {/* Add-field picker — slides out to the right */}
-                        {picker?.open && (
-                          <div
-                            style={{
-                              position: 'absolute',
-                              top: 0,
-                              left: 'calc(100% + 8px)',
-                              width: 280,
-                              maxHeight: 360,
-                              zIndex: 50,
-                              background: '#fff',
-                              border: '1px solid var(--ide-border-default)',
-                              borderRadius: 6,
-                              boxShadow: '0 8px 24px rgba(0,0,0,.2)',
-                              display: 'flex',
-                              flexDirection: 'column',
-                              overflow: 'hidden',
-                            }}
-                          >
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 10px 8px', borderBottom: '1px solid var(--ide-border-subtle)', flexShrink: 0 }}>
-                              <Search className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)', flexShrink: 0 }} />
-                              <input
-                                className="ide-input"
-                                style={{ flex: 1, fontSize: 12, padding: '3px 6px' }}
-                                placeholder="搜索字段名或中文名…"
-                                value={picker.search}
-                                onChange={(e) =>
-                                  setPickers((prev) => ({
-                                    ...prev,
-                                    [source.id]: { ...prev[source.id]!, search: e.target.value },
-                                  }))
-                                }
-                                autoFocus
-                              />
-                              <button
-                                className="ide-btn ide-btn-sm ide-btn-ghost"
-                                onClick={() =>
-                                  setPickers((prev) => ({
-                                    ...prev,
-                                    [source.id]: { ...prev[source.id]!, open: false, search: '' },
-                                  }))
-                                }
-                                title="关闭"
-                              >
-                                <X className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                            {picker.loading ? (
-                              <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: '8px 10px', display: 'block' }}>
-                                加载中…
-                              </span>
-                            ) : (
-                              <div className="ide-scroll" style={{ flex: 1, overflowY: 'auto', padding: '4px 6px' }}>
-                                {visible.length === 0 ? (
-                                  <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: '4px 6px', display: 'block' }}>
-                                    {picker.search ? '无匹配字段' : '该表全部字段已添加'}
-                                  </span>
-                                ) : (
-                                  visible.map((f) => (
-                                    <button
-                                      key={f.name}
-                                      className="ide-btn ide-btn-ghost ide-btn-sm"
-                                      style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 10px', lineHeight: 1.3 , marginBottom: '20px',}}
-                                      onClick={() => addField(source.id, f)}
-                                    >
-                                      <span style={{ display: 'block', fontSize: 12 }}>{f.label}</span>
-                                      <span style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
-                                        <span className="ide-text-mono">{f.name}</span>
-                                        {f.nativeType && <span style={{ marginLeft: 6 }}>{f.nativeType}</span>}
-                                      </span>
-                                    </button>
-                                  ))
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        )}
-
-                        {/* Selected fields */}
-                        <div className="ide-scroll" style={{ maxHeight: 260, overflowY: 'auto' }}>
-                          {source.fields.map((field) => (
+              {/* Tab 2: 数据源 — 表字段管理 + 关联关系 */}
+              {activeTab === 'sources' && (
+                <>
+                  <section>
+                    <div style={{ marginBottom: 8 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600 }}>表与字段</div>
+                      <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
+                        管理该报表使用的物理字段。可从知识库添加新字段，或修改字段角色。
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                        gap: 10,
+                      }}
+                    >
+                      {model.sources.map((source) => {
+                        const picker = pickers[source.id];
+                        const searchFilter = (picker?.search ?? '').trim().toLowerCase();
+                        const visible = (picker?.fields ?? []).filter(
+                          (f) => !searchFilter || f.name.toLowerCase().includes(searchFilter) || f.label.includes(searchFilter),
+                        );
+                        return (
+                          <div key={source.id} className="ide-card" style={{ padding: 0, overflow: 'visible', position: 'relative' }}>
                             <div
-                              key={field.name}
                               style={{
+                                padding: '10px 12px',
+                                borderBottom: '1px solid var(--ide-border-subtle)',
+                                background: 'var(--ide-bg-chrome)',
                                 display: 'flex',
                                 justifyContent: 'space-between',
                                 alignItems: 'center',
-                                padding: '5px 10px',
+                                gap: 8,
                               }}
                             >
-                              <span style={{ minWidth: 0 }}>
-                                <span style={{ display: 'block', fontSize: 12 }}>{field.label || field.name}</span>
-                                <span
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                                  <Database className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)' }} />
+                                  <strong style={{ fontSize: 12.5 }}>{source.alias || source.id}</strong>
+                                  <span className="ide-badge ide-badge-neutral">{source.fields.length}</span>
+                                </div>
+                                <div
                                   className="ide-text-mono"
-                                  style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
+                                  style={{ marginTop: 3, fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
                                 >
-                                  {field.name}
-                                </span>
-                              </span>
+                                  {source.profileId} / {source.database}.{source.table}
+                                </div>
+                              </div>
                               <button
-                                className="ide-btn ide-btn-sm ide-btn-ghost"
-                                title="删除字段"
-                                onClick={() => removeField(source.id, field.name)}
+                                className="ide-btn ide-btn-sm"
+                                onClick={() => void openPicker(source.id)}
+                                title="从知识库添加字段"
                               >
-                                <Trash2 className="w-3.5 h-3.5" style={{ color: 'var(--state-error)' }} />
+                                <Plus className="w-3.5 h-3.5" />
                               </button>
                             </div>
-                          ))}
+
+                            {/* Add-field picker */}
+                            {picker?.open && (
+                              <div
+                                style={{
+                                  position: 'absolute',
+                                  top: 0,
+                                  left: 'calc(100% + 8px)',
+                                  width: 280,
+                                  maxHeight: 360,
+                                  zIndex: 50,
+                                  background: '#fff',
+                                  border: '1px solid var(--ide-border-default)',
+                                  borderRadius: 6,
+                                  boxShadow: '0 8px 24px rgba(0,0,0,.2)',
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  overflow: 'hidden',
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '10px 10px 8px', borderBottom: '1px solid var(--ide-border-subtle)', flexShrink: 0 }}>
+                                  <Search className="w-3.5 h-3.5" style={{ color: 'var(--ide-text-tertiary)', flexShrink: 0 }} />
+                                  <input
+                                    className="ide-input"
+                                    style={{ flex: 1, fontSize: 12, padding: '3px 6px' }}
+                                    placeholder="搜索字段名或中文名…"
+                                    value={picker.search}
+                                    onChange={(e) =>
+                                      setPickers((prev) => ({
+                                        ...prev,
+                                        [source.id]: { ...prev[source.id]!, search: e.target.value },
+                                      }))
+                                    }
+                                    autoFocus
+                                  />
+                                  <button
+                                    className="ide-btn ide-btn-sm ide-btn-ghost"
+                                    onClick={() =>
+                                      setPickers((prev) => ({
+                                        ...prev,
+                                        [source.id]: { ...prev[source.id]!, open: false, search: '' },
+                                      }))
+                                    }
+                                    title="关闭"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                                {picker.loading ? (
+                                  <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: '8px 10px', display: 'block' }}>
+                                    加载中…
+                                  </span>
+                                ) : (
+                                  <div className="ide-scroll" style={{ flex: 1, overflowY: 'auto', padding: '4px 6px' }}>
+                                    {visible.length === 0 ? (
+                                      <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: '4px 6px', display: 'block' }}>
+                                        {picker.search ? '无匹配字段' : '该表全部字段已添加'}
+                                      </span>
+                                    ) : (
+                                      visible.map((f) => (
+                                        <button
+                                          key={f.name}
+                                          className="ide-btn ide-btn-ghost ide-btn-sm"
+                                          style={{ display: 'block', width: '100%', textAlign: 'left', padding: '5px 10px', lineHeight: 1.3, marginBottom: '20px' }}
+                                          onClick={() => addField(source.id, f)}
+                                        >
+                                          <span style={{ display: 'block', fontSize: 12 }}>{f.label}</span>
+                                          <span style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                                            <span className="ide-text-mono">{f.name}</span>
+                                            {f.nativeType && <span style={{ marginLeft: 6 }}>{f.nativeType}</span>}
+                                          </span>
+                                        </button>
+                                      ))
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Selected fields with role badges */}
+                            <div className="ide-scroll" style={{ maxHeight: 260, overflowY: 'auto' }}>
+                              {source.fields.map((field) => (
+                                <div
+                                  key={field.name}
+                                  style={{
+                                    display: 'flex',
+                                    justifyContent: 'space-between',
+                                    alignItems: 'center',
+                                    padding: '5px 10px',
+                                  }}
+                                >
+                                  <span style={{ minWidth: 0, flex: 1 }}>
+                                    <span style={{ display: 'block', fontSize: 12 }}>{field.label || field.name}</span>
+                                    <span
+                                      className="ide-text-mono"
+                                      style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
+                                    >
+                                      {field.name}
+                                    </span>
+                                  </span>
+                                  <button
+                                    className="ide-btn ide-btn-sm ide-btn-ghost"
+                                    title="删除字段"
+                                    onClick={() => removeField(source.id, field.name)}
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" style={{ color: 'var(--state-error)' }} />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+
+                  <section>
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        marginBottom: 8,
+                      }}
+                    >
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 600 }}>关联关系</div>
+                        <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
+                          每条关系连接两个已选字段；基数影响去重和扇出风险判断。
                         </div>
                       </div>
-                    );
-                  })}
-                </div>
-              </section>
-
-              <section>
-                <div
-                  style={{
-                    display: 'flex',
-                    justifyContent: 'space-between',
-                    alignItems: 'center',
-                    marginBottom: 8,
-                  }}
-                >
-                  <div>
-                    <div style={{ fontSize: 13, fontWeight: 600 }}>关联关系</div>
-                    <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
-                      每条关系连接两个已选字段；基数影响去重和扇出风险判断。
+                      <button className="ide-btn ide-btn-sm" onClick={addRelationship}>
+                        <Plus className="w-3.5 h-3.5" />
+                        添加关联
+                      </button>
                     </div>
-                  </div>
-                  <button className="ide-btn ide-btn-sm" onClick={addRelationship}>
-                    <Plus className="w-3.5 h-3.5" />
-                    添加关联
-                  </button>
-                </div>
-                {model.relationships.length === 0 ? (
-                  <div className="ide-card" style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>
-                    单表模型或暂未配置关联关系。
-                  </div>
-                ) : (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-                    {model.relationships.map((rel, index) => (
-                      <div
-                        key={`${index}-${rel.from}-${rel.to}`}
-                        className="ide-card"
-                        style={{
-                          display: 'grid',
-                          gridTemplateColumns: 'minmax(180px, 1fr) 24px minmax(180px, 1fr) 110px 90px 30px',
-                          gap: 7,
-                          alignItems: 'center',
-                          padding: 8,
-                        }}
-                      >
-                        <select
-                          className="ide-select"
-                          value={rel.from}
-                          onChange={(e) => updateRelationship(index, { from: e.target.value })}
-                        >
-                          {endpoints.map((ep) => (
-                            <option key={ep.value} value={ep.value}>{ep.label}</option>
-                          ))}
-                        </select>
-                        <Link2 className="w-4 h-4" style={{ color: 'var(--ide-text-tertiary)' }} />
-                        <select
-                          className="ide-select"
-                          value={rel.to}
-                          onChange={(e) => updateRelationship(index, { to: e.target.value })}
-                        >
-                          {endpoints.map((ep) => (
-                            <option key={ep.value} value={ep.value}>{ep.label}</option>
-                          ))}
-                        </select>
-                        <select
-                          className="ide-select"
-                          value={rel.type}
-                          onChange={(e) => updateRelationship(index, { type: e.target.value })}
-                        >
-                          {RELATION_TYPES.map(([value, label]) => (
-                            <option key={value} value={value}>{label}</option>
-                          ))}
-                        </select>
-                        <select
-                          className="ide-select ide-text-mono"
-                          value={rel.cardinality}
-                          onChange={(e) =>
-                            updateRelationship(index, {
-                              cardinality: e.target.value,
-                              fanoutRisk: e.target.value === '1:n' || e.target.value === 'n:n',
-                            })
-                          }
-                        >
-                          {CARDINALITIES.map((v) => <option key={v}>{v}</option>)}
-                        </select>
-                        <button
-                          className="ide-btn ide-btn-sm ide-btn-ghost"
-                          title="删除关联"
-                          onClick={() => mutate((draft) => void draft.relationships.splice(index, 1))}
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                    {model.relationships.length === 0 ? (
+                      <div className="ide-card" style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>
+                        单表模型或暂未配置关联关系。
                       </div>
-                    ))}
-                  </div>
-                )}
-              </section>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                        {model.relationships.map((rel, index) => (
+                          <div
+                            key={`${index}-${rel.from}-${rel.to}`}
+                            className="ide-card"
+                            style={{
+                              display: 'grid',
+                              gridTemplateColumns: 'minmax(180px, 1fr) 24px minmax(180px, 1fr) 110px 90px 30px',
+                              gap: 7,
+                              alignItems: 'center',
+                              padding: 8,
+                            }}
+                          >
+                            <select
+                              className="ide-select"
+                              value={rel.from}
+                              onChange={(e) => updateRelationship(index, { from: e.target.value })}
+                            >
+                              {endpoints.map((ep) => (
+                                <option key={ep.value} value={ep.value}>{ep.label}</option>
+                              ))}
+                            </select>
+                            <Link2 className="w-4 h-4" style={{ color: 'var(--ide-text-tertiary)' }} />
+                            <select
+                              className="ide-select"
+                              value={rel.to}
+                              onChange={(e) => updateRelationship(index, { to: e.target.value })}
+                            >
+                              {endpoints.map((ep) => (
+                                <option key={ep.value} value={ep.value}>{ep.label}</option>
+                              ))}
+                            </select>
+                            <select
+                              className="ide-select"
+                              value={rel.type}
+                              onChange={(e) => updateRelationship(index, { type: e.target.value })}
+                            >
+                              {RELATION_TYPES.map(([value, label]) => (
+                                <option key={value} value={value}>{label}</option>
+                              ))}
+                            </select>
+                            <select
+                              className="ide-select ide-text-mono"
+                              value={rel.cardinality}
+                              onChange={(e) =>
+                                updateRelationship(index, {
+                                  cardinality: e.target.value,
+                                  fanoutRisk: e.target.value === '1:n' || e.target.value === 'n:n',
+                                })
+                              }
+                            >
+                              {CARDINALITIES.map((v) => <option key={v}>{v}</option>)}
+                            </select>
+                            <button
+                              className="ide-btn ide-btn-sm ide-btn-ghost"
+                              title="删除关联"
+                              onClick={() => mutate((draft) => void draft.relationships.splice(index, 1))}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                </>
+              )}
 
-              <section>
-                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>筛选与指标（模型摘要）</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                  <div className="ide-card">
-                    <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', marginBottom: 5 }}>筛选条件</div>
-                    <div style={{ fontSize: 12 }}>
-                      {model.filters.length ? `${model.filters.length} 项，沿用建模确认口径` : '无'}
-                    </div>
-                  </div>
-                  <div className="ide-card">
-                    <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', marginBottom: 5 }}>指标</div>
-                    <div style={{ fontSize: 12 }}>
-                      {model.metrics.length ? `${model.metrics.length} 项，沿用建模确认口径` : '无'}
-                    </div>
-                  </div>
-                </div>
-              </section>
-
-              {/* Comparison (环比/同比) configuration */}
-              <ComparisonSection
-                model={model}
-                onChange={(comparison) => mutate((draft) => { draft.comparison = comparison; })}
-              />
+              {/* Tab 3: 环比/同比 */}
+              {activeTab === 'comparison' && (
+                <ComparisonSection
+                  model={model}
+                  onChange={(comparison) => mutate((draft) => { draft.comparison = comparison; })}
+                />
+              )}
             </>
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+type MetricEdit = { id: string; sourceField?: string; sourceAlias?: string; dedupKey?: string };
+
+function formatSqlFormula(m: ReportModelMetric): string {
+  const agg = m.aggregation === 'count_distinct' ? 'COUNT(DISTINCT' : m.aggregation.toUpperCase() + '(';
+  const end = m.aggregation === 'count_distinct' ? ')' : ')';
+  const dedup = m.dedupKey || `${m.sourceAlias}.${m.sourceField}`;
+  let formula = `${agg} ${dedup}${end}`;
+  if (m.condition) formula += ` WHERE ${m.condition}`;
+  return formula;
+}
+
+/** Unified field directory — the primary view showing all output fields, their DB mappings, and filters. */
+function FieldDirectoryTab({
+  model,
+  metricEdits,
+  filterEdits,
+  onMetricEdit,
+  onFiltersChange,
+}: {
+  model: ReportModelDetail;
+  metricEdits: MetricEdit[];
+  filterEdits: ReportModelFilter[];
+  onMetricEdit: (edit: MetricEdit) => void;
+  onFiltersChange: (next: ReportModelFilter[]) => void;
+}): JSX.Element {
+  const [editingMetricId, setEditingMetricId] = useState<string | null>(null);
+  const [showNewFilter, setShowNewFilter] = useState(false);
+  const [draftFilter, setDraftFilter] = useState<Partial<ReportModelFilter>>({});
+
+  const fieldOptions = useMemo(() => {
+    const opts: { value: string; label: string }[] = [];
+    for (const s of model.sources) {
+      for (const f of s.fields) {
+        const val = `${s.alias}.${f.name}`;
+        if (!opts.some((o) => o.value === val)) {
+          opts.push({ value: val, label: `${s.alias}.${f.name} (${f.label || f.name})` });
+        }
+      }
+    }
+    return opts.sort((a, b) => a.label.localeCompare(b.label));
+  }, [model.sources]);
+
+  function addFilter(): void {
+    if (!draftFilter.id || !draftFilter.label) return;
+    const vt = draftFilter.valueType ?? 'datetime_range';
+    const isString = vt === 'string';
+    onFiltersChange([...filterEdits, {
+      id: draftFilter.id,
+      label: draftFilter.label ?? draftFilter.id,
+      valueType: vt,
+      operators: draftFilter.operators ?? (isString ? ['contains'] : ['between']),
+      defaultOperator: draftFilter.defaultOperator ?? (isString ? 'contains' : 'between'),
+      required: draftFilter.required ?? false,
+      sqlBinding: {
+        expression: draftFilter.sqlBinding?.expression ?? '',
+        clause: draftFilter.sqlBinding?.clause ?? 'where',
+        valueAdapter: draftFilter.sqlBinding?.valueAdapter ?? (isString ? 'contains' : 'direct'),
+      },
+      component: draftFilter.component ?? (isString ? 'text-contains' : 'datetime-range'),
+    }]);
+    setShowNewFilter(false);
+    setDraftFilter({});
+  }
+
+  function removeFilter(index: number): void {
+    onFiltersChange(filterEdits.filter((_, i) => i !== index));
+  }
+
+  // Build a unified list of all output fields: group keys first, then metrics,
+  // matching the natural output order from the query contracts.
+  const outputFields = useMemo(() => {
+    const seen = new Set<string>();
+    const fields: Array<{
+      name: string;
+      label: string;
+      type: string;
+      source: string;
+      kind: 'dimension' | 'metric';
+      formula?: string;
+      metric?: ReportModelMetric;
+    }> = [];
+    for (const qc of model.queryContracts ?? []) {
+      for (const col of qc.outputColumns) {
+        if (seen.has(col.name)) continue;
+        seen.add(col.name);
+        if (col.role === 'group_key') {
+          fields.push({ name: col.name, label: col.label, type: col.type, source: col.source, kind: 'dimension' });
+        } else {
+          const m = model.metrics.find((mm) => mm.label === col.label || mm.id === col.name);
+          fields.push({
+            name: col.name,
+            label: col.label,
+            type: col.type,
+            source: col.source,
+            kind: 'metric',
+            formula: m ? formatSqlFormula(m) : undefined,
+            metric: m,
+          });
+        }
+      }
+    }
+    return fields;
+  }, [model.queryContracts, model.metrics]);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+      {/* ===== 输出字段 ===== */}
+      <section>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: 'var(--ide-text-secondary)' }}>
+          输出字段
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', marginBottom: 8 }}>
+          报表会输出以下 {outputFields.length} 个字段，展示每个字段的来源表和列。
+        </div>
+        {outputFields.length === 0 ? (
+          <div className="ide-card" style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: 10 }}>加载中…</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {/* Table header */}
+            <div style={{
+              display: 'grid', gridTemplateColumns: '40px 140px 70px 200px 1fr', gap: 10, alignItems: 'center',
+              padding: '4px 12px', fontSize: 10.5, color: 'var(--ide-text-tertiary)', fontWeight: 600,
+            }}>
+              <span>#</span><span>字段名</span><span>类型</span><span>来源列</span><span>计算方式 / 说明</span>
+            </div>
+            {outputFields.map((f, i) => (
+              <div key={f.name} className="ide-card" style={{
+                display: 'grid', gridTemplateColumns: '40px 140px 70px 200px 1fr', gap: 10, alignItems: 'flex-start',
+                padding: '7px 12px', fontSize: 12,
+              }}>
+                <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 10.5 }}>{i + 1}</span>
+                <div>
+                  <div style={{ fontWeight: 500 }}>{f.label}</div>
+                  <div className="ide-text-mono" style={{ fontSize: 10, color: 'var(--ide-text-tertiary)' }}>{f.name}</div>
+                </div>
+                <span className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>{f.type}</span>
+                <div>
+                  {f.kind === 'dimension' ? (
+                    <span className="ide-text-mono" style={{ fontSize: 11 }}>{f.source}</span>
+                  ) : (
+                    <>
+                      <span className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                        {f.source || (f.metric ? `${f.metric.sourceAlias}.${f.metric.sourceField}` : '—')}
+                      </span>
+                      {f.metric && (
+                        <button className="ide-btn ide-btn-sm ide-btn-ghost" style={{ marginLeft: 6, padding: '0 4px' }}
+                          onClick={() => setEditingMetricId(editingMetricId === f.metric!.id ? null : f.metric!.id)}
+                          title="编辑来源映射">
+                          <Edit3 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+                <div>
+                  {f.kind === 'dimension' ? (
+                    <span style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>直接引用</span>
+                  ) : (
+                    <>
+                      <div className="ide-text-mono" style={{ fontSize: 10.5, lineHeight: 1.4 }}>{f.formula}</div>
+                      {editingMetricId === f.metric?.id && f.metric && (() => {
+                        const m = f.metric;
+                        const edit = metricEdits.find((e) => e.id === m.id);
+                        const srcAlias = edit?.sourceAlias ?? m.sourceAlias;
+                        const srcField = edit?.sourceField ?? m.sourceField;
+                        const dedup = edit?.dedupKey ?? m.dedupKey;
+                        return (
+                          <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                            <select className="ide-select" style={{ fontSize: 10.5 }}
+                              value={`${srcAlias}.${srcField}`}
+                              onChange={(e) => {
+                                const parts = e.target.value.split('.');
+                                onMetricEdit({ id: m.id, sourceAlias: parts[0], sourceField: parts.slice(1).join('.') });
+                              }}>
+                              {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
+                            </select>
+                            <select className="ide-select" style={{ fontSize: 10.5 }}
+                              value={dedup}
+                              onChange={(e) => onMetricEdit({ id: m.id, dedupKey: e.target.value })}>
+                              {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
+                            </select>
+                          </div>
+                        );
+                      })()}
+                    </>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* ===== 筛选器 ===== */}
+      <section>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: 'var(--ide-text-secondary)' }}>
+          筛选器
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', marginBottom: 8 }}>
+          查询时可用的筛选条件。时间类型可指定粒度（精确到秒 / 天 / 月）。
+        </div>
+
+        {filterEdits.length === 0 && !showNewFilter ? (
+          <div className="ide-card" style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: 10 }}>
+            暂无筛选器。
+            <button className="ide-btn ide-btn-sm ide-btn-ghost" style={{ marginLeft: 8 }}
+              onClick={() => setShowNewFilter(true)}><Plus className="w-3 h-3" />添加</button>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {/* Header */}
+            <div style={{
+              display: 'grid', gridTemplateColumns: '130px 180px 80px 100px 110px 70px 30px', gap: 8, alignItems: 'center',
+              padding: '4px 12px', fontSize: 10.5, color: 'var(--ide-text-tertiary)', fontWeight: 600,
+            }}>
+              <span>名称</span><span>来源列</span><span>类型</span><span>匹配方式</span><span>操作符</span><span>必填</span><span></span>
+            </div>
+            {filterEdits.map((f, i) => (
+              <div key={f.id} className="ide-card" style={{
+                display: 'grid', gridTemplateColumns: '130px 180px 80px 100px 110px 70px 30px', gap: 8, alignItems: 'center',
+                padding: '7px 12px', fontSize: 11.5,
+              }}>
+                <div>
+                  <div style={{ fontWeight: 500 }}>{f.label}</div>
+                  <div className="ide-text-mono" style={{ fontSize: 10, color: 'var(--ide-text-tertiary)' }}>{f.id}</div>
+                </div>
+                <div className="ide-text-mono" style={{ fontSize: 10.5 }}>{f.sqlBinding.expression || '(未设置)'}</div>
+                <div>
+                  <select className="ide-select" style={{ fontSize: 10.5, width: '100%' }}
+                    value={f.valueType}
+                    onChange={(e) => {
+                      const vt = e.target.value;
+                      const isTime = vt === 'datetime_range' || vt === 'date_range';
+                      onFiltersChange(filterEdits.map((ff, ii) => ii === i ? {
+                        ...ff,
+                        valueType: vt,
+                        // Reset operators+component when switching type category
+                        operators: isTime ? ['between', 'gte', 'lte'] : vt === 'string' ? ['contains'] : ['eq'],
+                        defaultOperator: isTime ? 'between' : vt === 'string' ? 'contains' : 'eq',
+                        component: isTime ? 'datetime-range' : vt === 'string' ? 'text-contains' : 'text',
+                      } as ReportModelFilter : ff));
+                    }}>
+                    <option value="datetime_range">时间范围</option>
+                    <option value="date_range">日期范围</option>
+                    <option value="string">文本</option>
+                    <option value="number">数值</option>
+                  </select>
+                </div>
+                <div>
+                  <select className="ide-select" style={{ fontSize: 10.5, width: '100%' }}
+                    value={f.component ?? (f.valueType === 'string' ? 'text-contains' : 'datetime-range')}
+                    onChange={(e) => {
+                      const comp = e.target.value;
+                      const isFuzzy = comp === 'text-contains' || comp === 'text-fuzzy';
+                      const isTimeGranularity = comp === 'date-range-day' || comp === 'date-range-month';
+                      onFiltersChange(filterEdits.map((ff, ii) => ii === i ? {
+                        ...ff,
+                        component: comp,
+                        ...(comp === 'text-exact' ? { operators: ['eq'], defaultOperator: 'eq' } : {}),
+                        ...(isFuzzy ? { operators: ['contains', 'eq'], defaultOperator: 'contains' } : {}),
+                        ...(isTimeGranularity ? { operators: ['between'], defaultOperator: 'between' } : {}),
+                      } as ReportModelFilter : ff));
+                    }}>
+                    {f.valueType === 'datetime_range' ? (
+                      <>
+                        <option value="datetime-range">精确到秒</option>
+                        <option value="date-range-day">精确到天</option>
+                        <option value="date-range-month">精确到月</option>
+                      </>
+                    ) : f.valueType === 'date_range' ? (
+                      <>
+                        <option value="date-range-day">精确到天</option>
+                        <option value="date-range-month">精确到月</option>
+                      </>
+                    ) : f.valueType === 'string' ? (
+                      <>
+                        <option value="text-contains">模糊匹配</option>
+                        <option value="text-exact">精确匹配</option>
+                      </>
+                    ) : (
+                      <option value={f.component}>{f.component || '默认'}</option>
+                    )}
+                  </select>
+                </div>
+                <div style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                  {f.operators.join(', ')}
+                </div>
+                <div>
+                  <input type="checkbox" checked={f.required}
+                    onChange={(e) => onFiltersChange(filterEdits.map((ff, ii) => ii === i ? { ...ff, required: e.target.checked } as ReportModelFilter : ff))}
+                    style={{ cursor: 'pointer' }} />
+                </div>
+                <button className="ide-btn ide-btn-sm ide-btn-ghost" title="删除" onClick={() => removeFilter(i)}>
+                  <Trash2 className="w-3.5 h-3.5" style={{ color: 'var(--state-error)' }} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* New filter form */}
+        {showNewFilter && (
+          <div className="ide-card" style={{ padding: 10, marginTop: 6, border: '1px solid var(--ide-border-default)' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, fontSize: 11 }}>
+              <label>
+                <span style={{ color: 'var(--ide-text-tertiary)' }}>参数 ID</span>
+                <input className="ide-input" style={{ width: '100%', marginTop: 2, fontSize: 11 }} value={draftFilter.id ?? ''} onChange={(e) => setDraftFilter((p) => ({ ...p, id: e.target.value }))} placeholder="如 create_time" />
+              </label>
+              <label>
+                <span style={{ color: 'var(--ide-text-tertiary)' }}>标签</span>
+                <input className="ide-input" style={{ width: '100%', marginTop: 2, fontSize: 11 }} value={draftFilter.label ?? ''} onChange={(e) => setDraftFilter((p) => ({ ...p, label: e.target.value }))} placeholder="如 创建时间" />
+              </label>
+              <label>
+                <span style={{ color: 'var(--ide-text-tertiary)' }}>来源列</span>
+                <select className="ide-select" style={{ width: '100%', marginTop: 2, fontSize: 11 }} value={draftFilter.sqlBinding?.expression ?? ''} onChange={(e) => setDraftFilter((p) => ({ ...p, sqlBinding: { ...(p.sqlBinding ?? { expression: '', clause: 'where', valueAdapter: 'direct' }), expression: e.target.value } }))}>
+                  <option value="">请选择</option>
+                  {fieldOptions.map((o) => (<option key={o.value} value={`${o.value.split('.')[0]}.\`${o.value.split('.').slice(1).join('.')}\``}>{o.label}</option>))}
+                </select>
+              </label>
+            </div>
+            <div style={{ marginTop: 8, display: 'flex', gap: 6 }}>
+              <button className="ide-btn ide-btn-sm ide-btn-primary" onClick={addFilter}>添加</button>
+              <button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={() => { setShowNewFilter(false); setDraftFilter({}); }}>取消</button>
+            </div>
+          </div>
+        )}
+
+        {!showNewFilter && (
+          <button className="ide-btn ide-btn-sm ide-btn-ghost" style={{ alignSelf: 'flex-start', marginTop: 4 }}
+            onClick={() => setShowNewFilter(true)}>
+            <Plus className="w-3.5 h-3.5" />添加筛选器
+          </button>
+        )}
+      </section>
     </div>
   );
 }

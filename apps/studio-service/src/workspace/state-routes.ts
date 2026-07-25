@@ -125,6 +125,25 @@ export function registerWorkspaceStateRoutes(
         period_param: string;
         lookback_months: number;
       } | null;
+      metricEdits?: Array<{
+        id: string;
+        sourceField?: string;
+        sourceAlias?: string;
+        dedupKey?: string;
+      }>;
+      filterEdits?: Array<{
+        id: string;
+        delete?: boolean;
+        label?: string;
+        valueType?: string;
+        operators?: string[];
+        defaultOperator?: string;
+        required?: boolean;
+        expression?: string;
+        clause?: string;
+        valueAdapter?: string;
+        component?: string;
+      }>;
     };
   }>('/api/easybi/projects/:projectId/reports/model', async (request, reply) => {
     const project = service.get(request.params.projectId);
@@ -160,6 +179,8 @@ export function registerWorkspaceStateRoutes(
           sources: body.sources,
           relationships: body.relationships,
           comparison: body.comparison,
+          metricEdits: body.metricEdits,
+          filterEdits: body.filterEdits,
         }),
       );
     } catch (err) {

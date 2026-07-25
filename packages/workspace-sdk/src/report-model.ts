@@ -247,6 +247,62 @@ export interface ReportModelComparison {
   lookback_months: number;
 }
 
+export interface ReportModelMetric {
+  id: string;
+  label: string;
+  entity: string;
+  aggregation: string;
+  sourceTable: string;
+  sourceAlias: string;
+  sourceField: string;
+  dedupKey: string;
+  condition: string | null;
+  evidence: string;
+  confidence: string;
+}
+
+export interface ReportModelFilter {
+  id: string;
+  label: string;
+  valueType: string;
+  operators: string[];
+  defaultOperator: string;
+  required: boolean;
+  sqlBinding: {
+    expression: string;
+    clause: string;
+    valueAdapter: string;
+  };
+  component: string;
+}
+
+export interface ReportModelTimeSemantics {
+  status: string;
+  alias: string;
+  table: string;
+  field: string;
+  nativeType: string;
+  required: boolean;
+  description: string;
+  parameterName: string;
+}
+
+export interface ReportModelQueryContract {
+  id: string;
+  purpose: string;
+  entity: string;
+  outputColumns: Array<{
+    name: string;
+    label: string;
+    type: string;
+    role: string;
+    source: string;
+    aggregation?: string;
+    condition?: string | null;
+    nullable?: boolean;
+  }>;
+}
+
 export interface ReportModelDetail {
   reportId: string;
   reportName: string;
@@ -257,8 +313,10 @@ export interface ReportModelDetail {
   resultGrain: { description: string; keys: string[] };
   sources: EditableModelSource[];
   relationships: EditableModelRelationship[];
-  filters: JsonRecord[];
-  metrics: JsonRecord[];
+  filters: ReportModelFilter[];
+  metrics: ReportModelMetric[];
+  timeSemantics: ReportModelTimeSemantics | null;
+  queryContracts: ReportModelQueryContract[];
   comparison: ReportModelComparison | null;
   errors: string[];
 }
@@ -303,7 +361,7 @@ export async function readReportModel(
       (field: JsonRecord | string): { name: string; role: string } =>
         typeof field === 'string' ? { name: field, role: 'source' } : { name: fieldName(field), role: String((field as JsonRecord).role ?? 'source') },
     );
-    const selectedNames = new Set(selectedFields.map((f) => f.name));
+    const selectedNames = new Set(selectedFields.map((f: { name: string }) => f.name));
     const table =
       allTables.find((item) => sourceKey(item.physical ?? {}) === sourceKey(source)) ??
       compactTables.find((item: JsonRecord) => sourceKey(item.physical ?? {}) === sourceKey(source));
@@ -316,8 +374,8 @@ export async function readReportModel(
       alias: String(source.alias),
       purpose: String(source.purpose ?? ''),
       fields: selectedFields
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map(({ name, role }) => {
+        .sort((a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name))
+        .map(({ name, role }: { name: string; role: string }) => {
           const known = available.find((field) => physicalFieldName(field) === name);
           return {
             name,
@@ -359,8 +417,60 @@ export async function readReportModel(
       fanoutRisk: Boolean(relationship.fanout_risk),
     };
     }),
-    filters: model.filters ?? [],
-    metrics: model.metrics ?? [],
+    filters: (model.filters ?? []).map((f: JsonRecord): ReportModelFilter => ({
+      id: String(f.id ?? ''),
+      label: String(f.label ?? f.id ?? ''),
+      valueType: String(f.value_type ?? ''),
+      operators: Array.isArray(f.operators) ? f.operators.map(String) : [],
+      defaultOperator: String(f.default_operator ?? ''),
+      required: Boolean(f.required),
+      sqlBinding: {
+        expression: String(f.sql_binding?.expression ?? ''),
+        clause: String(f.sql_binding?.clause ?? 'where'),
+        valueAdapter: String(f.sql_binding?.value_adapter ?? 'direct'),
+      },
+      component: String(f.component ?? ''),
+    })),
+    metrics: (model.metrics ?? []).map((m: JsonRecord): ReportModelMetric => ({
+      id: String(m.id ?? ''),
+      label: String(m.label ?? m.id ?? ''),
+      entity: String(m.entity ?? ''),
+      aggregation: String(m.aggregation ?? ''),
+      sourceTable: String(m.source_table ?? ''),
+      sourceAlias: String(m.source_alias ?? ''),
+      sourceField: String(m.source_field ?? ''),
+      dedupKey: String(m.dedup_key ?? ''),
+      condition: m.condition ? String(m.condition) : null,
+      evidence: String(m.evidence ?? ''),
+      confidence: String(m.confidence ?? 'hypothesis'),
+    })),
+    timeSemantics: model.time_semantics && typeof model.time_semantics === 'object'
+      ? {
+          status: String(model.time_semantics.status ?? ''),
+          alias: String(model.time_semantics.field?.alias ?? ''),
+          table: String(model.time_semantics.field?.table ?? ''),
+          field: String(model.time_semantics.field?.field ?? ''),
+          nativeType: String(model.time_semantics.native_type ?? ''),
+          required: Boolean(model.time_semantics.required),
+          description: String(model.time_semantics.description ?? ''),
+          parameterName: String(model.time_semantics.parameter_name ?? ''),
+        }
+      : null,
+    queryContracts: (model.query_contracts ?? []).map((qc: JsonRecord): ReportModelQueryContract => ({
+      id: String(qc.id ?? ''),
+      purpose: String(qc.purpose ?? ''),
+      entity: String(qc.entity ?? ''),
+      outputColumns: ((qc.output_contract ?? qc.output ?? []) as JsonRecord[]).map((col: JsonRecord) => ({
+        name: String(col.name ?? ''),
+        label: String(col.label ?? col.name ?? ''),
+        type: String(col.type ?? ''),
+        role: String(col.role ?? ''),
+        source: String(col.source ?? ''),
+        ...(col.aggregation ? { aggregation: String(col.aggregation) } : {}),
+        ...(col.condition !== undefined ? { condition: col.condition ? String(col.condition) : null } : {}),
+        ...(col.nullable !== undefined ? { nullable: Boolean(col.nullable) } : {}),
+      })),
+    })),
     comparison: model.comparison && typeof model.comparison === 'object'
       ? {
           enabled: Boolean(model.comparison.enabled),
@@ -379,6 +489,28 @@ export interface ReportModelEdit {
   sources: Array<{ id: string; fields: Array<{ name: string; role?: string }> }>;
   relationships: EditableModelRelationship[];
   comparison?: ReportModelComparison | null;
+  /** Per-metric source field mapping edits: { id, sourceField, dedupKey, sourceAlias? } */
+  metricEdits?: Array<{
+    id: string;
+    sourceField?: string;
+    sourceAlias?: string;
+    dedupKey?: string;
+  }>;
+  /** Filter configuration edits: add, update, or remove filters */
+  filterEdits?: Array<{
+    id: string;
+    /** Set to true to delete this filter */
+    delete?: boolean;
+    label?: string;
+    valueType?: string;
+    operators?: string[];
+    defaultOperator?: string;
+    required?: boolean;
+    expression?: string;
+    clause?: string;
+    valueAdapter?: string;
+    component?: string;
+  }>;
 }
 
 export async function writeReportModel(
@@ -488,6 +620,101 @@ export async function writeReportModel(
       if (selected) source.fields = selected;
     }
   }
+  // Apply metric source field mapping edits.
+  if (Array.isArray(edit.metricEdits) && edit.metricEdits.length) {
+    const metrics = model.metrics ?? [];
+    for (const medit of edit.metricEdits) {
+      const metric = metrics.find((m: JsonRecord) => String(m.id) === medit.id);
+      if (!metric) continue;
+      if (medit.sourceField) metric.source_field = medit.sourceField;
+      if (medit.sourceAlias) metric.source_alias = medit.sourceAlias;
+      if (medit.dedupKey) metric.dedup_key = medit.dedupKey;
+      // Update query_contract output columns to match
+      for (const contract of model.query_contracts ?? []) {
+        for (const col of (contract.output_contract ?? contract.output ?? [])) {
+          if (String((col as JsonRecord).name ?? '') === String(metric.output_column ?? metric.id)) {
+            if (medit.dedupKey) (col as JsonRecord).source = medit.dedupKey;
+            if (medit.sourceField) {
+              const from = (col as JsonRecord).condition
+                ? String((col as JsonRecord).condition).replace(/^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/, `${medit.sourceAlias ?? metric.source_alias}.${medit.sourceField}`)
+                : undefined;
+              if (from) (col as JsonRecord).condition = from;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Apply filter configuration edits.
+  if (Array.isArray(edit.filterEdits) && edit.filterEdits.length) {
+    let filters = (model.filters ?? []) as JsonRecord[];
+    const parameters = (model.parameters ?? []) as JsonRecord[];
+    for (const fedit of edit.filterEdits) {
+      if (fedit.delete) {
+        filters = filters.filter((f: JsonRecord) => String(f.id) !== fedit.id);
+        // Also remove from parameters
+        const paramIdx = parameters.findIndex((p: JsonRecord) => String(p.id) === fedit.id);
+        if (paramIdx >= 0) parameters.splice(paramIdx, 1);
+        continue;
+      }
+      const existing = filters.find((f: JsonRecord) => String(f.id) === fedit.id);
+      const filterEntry: JsonRecord = existing ?? { id: fedit.id };
+      if (fedit.label) filterEntry.label = fedit.label;
+      if (fedit.valueType) filterEntry.value_type = fedit.valueType;
+      if (fedit.operators) filterEntry.operators = fedit.operators;
+      if (fedit.defaultOperator) filterEntry.default_operator = fedit.defaultOperator;
+      if (fedit.required !== undefined) filterEntry.required = fedit.required;
+      if (fedit.component) filterEntry.component = fedit.component;
+      if (fedit.expression || fedit.clause || fedit.valueAdapter) {
+        filterEntry.sql_binding = {
+          ...(filterEntry.sql_binding ?? {}),
+          ...(fedit.expression ? { expression: fedit.expression } : {}),
+          ...(fedit.clause ? { clause: fedit.clause } : {}),
+          ...(fedit.valueAdapter ? { value_adapter: fedit.valueAdapter } : {}),
+        };
+      }
+      if (!existing) filters.push(filterEntry);
+
+      // Sync to parameters
+      const param = parameters.find((p: JsonRecord) => String(p.id) === fedit.id);
+      if (param) {
+        if (fedit.label) param.label = fedit.label;
+        if (fedit.valueType) param.value_type = fedit.valueType;
+        if (fedit.operators) param.operators = fedit.operators;
+        if (fedit.defaultOperator) param.default_operator = fedit.defaultOperator;
+        if (fedit.required !== undefined) param.required = fedit.required;
+        if (fedit.component) param.component = fedit.component;
+        if (fedit.expression || fedit.clause || fedit.valueAdapter) {
+          param.sql_binding = {
+            ...(param.sql_binding ?? {}),
+            ...(fedit.expression ? { expression: fedit.expression } : {}),
+            ...(fedit.clause ? { clause: fedit.clause } : {}),
+            ...(fedit.valueAdapter ? { value_adapter: fedit.valueAdapter } : {}),
+          };
+        }
+      } else if (!fedit.delete) {
+        // Create new parameter for a new filter
+        parameters.push({
+          id: fedit.id,
+          label: fedit.label ?? fedit.id,
+          value_type: fedit.valueType ?? 'string',
+          operators: fedit.operators ?? ['eq'],
+          default_operator: fedit.defaultOperator ?? 'eq',
+          required: fedit.required ?? false,
+          component: fedit.component ?? 'text',
+          sql_binding: {
+            expression: fedit.expression ?? '',
+            clause: fedit.clause ?? 'where',
+            value_adapter: fedit.valueAdapter ?? 'direct',
+          },
+        });
+      }
+    }
+    model.filters = filters;
+    model.parameters = parameters;
+  }
+
   // Write comparison settings from the editor into the model.
   if (edit.comparison) {
     model.comparison = {

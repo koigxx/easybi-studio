@@ -397,6 +397,20 @@ export const workspaceApi = {
     sources: ReportModelEditSource[],
     relationships: ReportModelRelationship[],
     comparison?: ReportModelComparison | null,
+    metricEdits?: Array<{ id: string; sourceField?: string; sourceAlias?: string; dedupKey?: string }>,
+    filterEdits?: Array<{
+      id: string;
+      delete?: boolean;
+      label?: string;
+      valueType?: string;
+      operators?: string[];
+      defaultOperator?: string;
+      required?: boolean;
+      expression?: string;
+      clause?: string;
+      valueAdapter?: string;
+      component?: string;
+    }>,
   ) =>
     call<ReportModelDetail>('PUT', `/api/easybi/projects/${id}/reports/model`, {
       reportId,
@@ -404,6 +418,8 @@ export const workspaceApi = {
       sources,
       relationships,
       comparison,
+      metricEdits,
+      filterEdits,
     }),
   deleteReportPackage: (id: string, reportId: string, version: string) =>
     call<{ id: string; version: string; removedDir: boolean }>(
@@ -484,6 +500,63 @@ export interface ReportModelComparison {
   period_param: string;
   lookback_months: number;
 }
+
+export interface ReportModelMetric {
+  id: string;
+  label: string;
+  entity: string;
+  aggregation: string;
+  sourceTable: string;
+  sourceAlias: string;
+  sourceField: string;
+  dedupKey: string;
+  condition: string | null;
+  evidence: string;
+  confidence: string;
+}
+
+export interface ReportModelFilter {
+  id: string;
+  label: string;
+  valueType: string;
+  operators: string[];
+  defaultOperator: string;
+  required: boolean;
+  sqlBinding: {
+    expression: string;
+    clause: string;
+    valueAdapter: string;
+  };
+  component: string;
+}
+
+export interface ReportModelTimeSemantics {
+  status: string;
+  alias: string;
+  table: string;
+  field: string;
+  nativeType: string;
+  required: boolean;
+  description: string;
+  parameterName: string;
+}
+
+export interface ReportModelQueryContract {
+  id: string;
+  purpose: string;
+  entity: string;
+  outputColumns: Array<{
+    name: string;
+    label: string;
+    type: string;
+    role: string;
+    source: string;
+    aggregation?: string;
+    condition?: string | null;
+    nullable?: boolean;
+  }>;
+}
+
 export interface ReportModelDetail {
   reportId: string;
   reportName: string;
@@ -494,8 +567,10 @@ export interface ReportModelDetail {
   resultGrain: { description: string; keys: string[] };
   sources: ReportModelSource[];
   relationships: ReportModelRelationship[];
-  filters: Array<Record<string, unknown>>;
-  metrics: Array<Record<string, unknown>>;
+  filters: ReportModelFilter[];
+  metrics: ReportModelMetric[];
+  timeSemantics?: ReportModelTimeSemantics | null;
+  queryContracts?: ReportModelQueryContract[];
   comparison: ReportModelComparison | null;
   errors: string[];
 }
