@@ -5682,6 +5682,38 @@ export async function finalizeStagedPackage(options: {
       if (gid === "shipping") return raw.filter((m) => String(m.label ?? "").includes("派车单"));
       return raw.filter((m) => !String(m.label ?? "").includes("派车单"));
     };
+    // Merge user edits from model metrics into the declarative query_groups BEFORE
+    // building configuration. This ensures user-adjusted source fields, dedup keys,
+    // and conditions propagate into the generated report package.
+    const modelMetricById = new Map<string, JsonRecord>(
+      ((model as JsonRecord).metrics ?? []).map((m: JsonRecord) => [String(m.id), m]),
+    );
+    for (const g of (declarative.query_groups as JsonRecord[])) {
+      for (const dm of (g.metrics ?? []) as JsonRecord[]) {
+        const mm = modelMetricById.get(String(dm.id));
+        if (!mm) continue;
+        // dedup_key → override declarative metric's `field` (the aggregation target)
+        if (mm.dedup_key) {
+          (dm as JsonRecord).field = String(mm.dedup_key);
+        }
+        // source_alias + source_field → update the condition expression's column reference
+        if (mm.source_alias && mm.source_field) {
+          const newCol = `${String(mm.source_alias)}.${String(mm.source_field)}`;
+          const oldCondition = String((dm as JsonRecord).condition ?? "");
+          if (oldCondition) {
+            // Replace the alias.field in the condition (e.g. "t0.status = 'X'" → "t0.waybill_status = 'X'")
+            (dm as JsonRecord).condition = oldCondition.replace(
+              /^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/,
+              newCol,
+            );
+          }
+        }
+        // Also carry over source_alias/source_field for later use by collectGroupQueryMetrics
+        (dm as JsonRecord).source_alias = mm.source_alias ?? (dm as JsonRecord).source_alias;
+        (dm as JsonRecord).source_field = mm.source_field ?? (dm as JsonRecord).source_field;
+        (dm as JsonRecord).dedup_key = mm.dedup_key ?? (dm as JsonRecord).dedup_key;
+      }
+    }
     configuration.group_queries = {
       merge_keys: [gqMergeKey].filter(Boolean),
       period_param: gqPeriodParam,
@@ -5887,11 +5919,42 @@ export async function finalizeStagedPackage(options: {
             value: sc.value ?? 0,
           }));
     }
-    if (Array.isArray(declarative.filters)) {
+    // Merge user-edited filters from report-model.json into the plan parameters.
+    // Model filters take precedence over declarative config filters, allowing users
+    // to add/remove/edit filter configurations that flow into the generated package.
+    const modelFilters: JsonRecord[] = (model as JsonRecord).filters ?? [];
+    const effectiveFilters: JsonRecord[] =
+      modelFilters.length > 0
+        ? modelFilters
+        : (declarative.filters as JsonRecord[]) ?? [];
+    if (effectiveFilters.length) {
       plan.parameters = plan.parameters ?? [];
       const existingParamIds = new Set((plan.parameters ?? []).map((p: JsonRecord) => p.id));
-      for (const filter of declarative.filters as JsonRecord[]) {
-        if (existingParamIds.has(filter.id)) continue;
+      for (const filter of effectiveFilters) {
+        if (existingParamIds.has(filter.id)) {
+          // Update existing parameter with user-configured values
+          const existing = plan.parameters.find((p: JsonRecord) => p.id === filter.id);
+          if (existing) {
+            if (filter.label) existing.label = filter.label;
+            if (filter.value_type) existing.value_type = filter.value_type;
+            if (filter.component) existing.component = filter.component;
+            if (filter.operators) existing.operators = filter.operators;
+            if (filter.default_operator) existing.default_operator = filter.default_operator;
+            if (filter.required !== undefined) existing.required = filter.required;
+            if (filter.sql_binding) {
+              existing.sql_binding = {
+                ...existing.sql_binding,
+                ...filter.sql_binding,
+              };
+            }
+          }
+          continue;
+        }
+        // Derive value_adapter from component for text match mode
+        const comp = String(filter.component ?? "");
+        const isTextFuzzy = comp === "text-contains";
+        const isTextExact = comp === "text-exact";
+        const valueAdapter = isTextFuzzy ? "contains" : isTextExact ? "direct" : (filter.sql_binding?.value_adapter as string) ?? "direct";
         plan.parameters.push({
           id: filter.id,
           label: filter.label ?? filter.id,
@@ -5901,9 +5964,9 @@ export async function finalizeStagedPackage(options: {
           default_operator: filter.default_operator ?? "eq",
           required: filter.required ?? false,
           sql_binding: {
-            expression: `${filter.alias ?? "t0"}.\`${filter.field}\``,
-            clause: filter.clause ?? "where",
-            value_adapter: "direct",
+            expression: (filter.sql_binding?.expression as string) ?? `${filter.alias ?? "t0"}.\`${filter.field}\``,
+            clause: (filter.sql_binding?.clause as string) ?? filter.clause ?? "where",
+            value_adapter: valueAdapter,
           },
         });
       }

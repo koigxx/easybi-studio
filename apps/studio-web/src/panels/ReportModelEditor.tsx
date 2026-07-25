@@ -31,6 +31,26 @@ const TAB_DEFS: { id: EditorTab; label: string; icon: typeof Table2 }[] = [
   { id: 'comparison', label: '环比/同比', icon: Edit3 },
 ];
 
+const ROLE_TAG_LABEL: Record<string, string> = {
+  dedup_key: '主键',
+  join_key: '关联键',
+  time_filter: '时间列',
+  system_condition: '系统条件',
+  metric_source: '指标来源',
+  tenant_scope: '租户',
+  confirmed_reference: '已确认',
+  exclusion_filter: '排除规则',
+};
+const ROLE_TAG_STYLE: Record<string, string> = {
+  dedup_key: 'ide-badge-info',
+  join_key: 'ide-badge-success',
+  time_filter: 'ide-badge-warning',
+  system_condition: 'ide-badge-neutral',
+  metric_source: 'ide-badge-info',
+  tenant_scope: 'ide-badge-neutral',
+  exclusion_filter: 'ide-badge-warning',
+};
+
 const RELATION_TYPES = [
   ['left', '左连接'],
   ['inner', '内连接'],
@@ -497,7 +517,14 @@ export function ReportModelEditor({
                                   }}
                                 >
                                   <span style={{ minWidth: 0, flex: 1 }}>
-                                    <span style={{ display: 'block', fontSize: 12 }}>{field.label || field.name}</span>
+                                    <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                                      <span style={{ fontSize: 12 }}>{field.label || field.name}</span>
+                                      {field.role && field.role !== 'source' && (
+                                        <span className={`ide-badge ${ROLE_TAG_STYLE[field.role] ?? 'ide-badge-neutral'}`} style={{ fontSize: 9, padding: '0 4px', lineHeight: '16px' }}>
+                                          {ROLE_TAG_LABEL[field.role] ?? field.role}
+                                        </span>
+                                      )}
+                                    </span>
                                     <span
                                       className="ide-text-mono"
                                       style={{ display: 'block', fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}
@@ -706,7 +733,7 @@ function FieldDirectoryTab({
       label: string;
       type: string;
       source: string;
-      kind: 'dimension' | 'metric';
+      kind: 'dimension' | 'metric' | 'timeshifted';
       formula?: string;
       metric?: ReportModelMetric;
     }> = [];
@@ -730,8 +757,30 @@ function FieldDirectoryTab({
         }
       }
     }
+    // 2. Time-shifted comparison fields (环比/同比) — derived from comparison config
+    const comp = model.comparison;
+    if (comp?.enabled && comp.modes.length) {
+      for (const m of model.metrics) {
+        for (const mode of comp.modes) {
+          const label = mode === 'chain' ? '环比' : '同比';
+          const lookback = mode === 'chain' ? (comp.lookback_months ?? 1) : 12;
+          const unit = lookback === 1 ? '前1月' : `前${lookback}月`;
+          const name = `${m.id}_${mode}_subtract`;
+          if (seen.has(name)) continue;
+          seen.add(name);
+          fields.push({
+            name,
+            label: `${label}${m.label}`,
+            type: 'number',
+            source: `${m.id} (${m.label})`,
+            kind: 'timeshifted',
+            formula: `${m.label}(本期) - ${m.label}(${unit})`,
+          });
+        }
+      }
+    }
     return fields;
-  }, [model.queryContracts, model.metrics]);
+  }, [model.queryContracts, model.metrics, model.comparison]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -742,6 +791,15 @@ function FieldDirectoryTab({
         </div>
         <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', marginBottom: 8 }}>
           报表会输出以下 {outputFields.length} 个字段，展示每个字段的来源表和列。
+          {model.queryContracts && model.queryContracts.length > 0 && (
+            <span style={{ marginLeft: 8 }}>
+              {model.queryContracts.map((qc) => (
+                <span key={qc.id} className="ide-badge ide-badge-neutral" style={{ fontSize: 9.5, marginRight: 4 }}>
+                  {qc.id}: {qc.purpose}
+                </span>
+              ))}
+            </span>
+          )}
         </div>
         {outputFields.length === 0 ? (
           <div className="ide-card" style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', padding: 10 }}>加载中…</div>
@@ -767,52 +825,114 @@ function FieldDirectoryTab({
                 <span className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>{f.type}</span>
                 <div>
                   {f.kind === 'dimension' ? (
-                    <span className="ide-text-mono" style={{ fontSize: 11 }}>{f.source}</span>
+                    <>
+                      <span className="ide-text-mono" style={{ fontSize: 11 }}>{f.source || '—'}</span>
+                      <button className="ide-btn ide-btn-sm ide-btn-ghost" style={{ marginLeft: 6, padding: '0 4px' }}
+                        onClick={() => {
+                          // Edit dimension source: treat as metric edit on a synthetic metric
+                          const m = model.metrics.find((mm) => mm.label === f.label);
+                          if (m) setEditingMetricId(editingMetricId === m.id ? null : m.id);
+                        }}
+                        title="编辑来源映射">
+                        <Edit3 className="w-3 h-3" />
+                      </button>
+                    </>
+                  ) : f.kind === 'timeshifted' ? (
+                    <span className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                      基于 {f.source}
+                    </span>
                   ) : (
                     <>
-                      <span className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
-                        {f.source || (f.metric ? `${f.metric.sourceAlias}.${f.metric.sourceField}` : '—')}
-                      </span>
-                      {f.metric && (
-                        <button className="ide-btn ide-btn-sm ide-btn-ghost" style={{ marginLeft: 6, padding: '0 4px' }}
-                          onClick={() => setEditingMetricId(editingMetricId === f.metric!.id ? null : f.metric!.id)}
-                          title="编辑来源映射">
-                          <Edit3 className="w-3 h-3" />
-                        </button>
+                      {f.source || (f.metric?.sourceAlias && f.metric?.sourceField) ? (
+                        <span className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                          {f.source || `${f.metric!.sourceAlias}.${f.metric!.sourceField}`}
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 10.5, color: 'var(--state-warning)', fontStyle: 'italic' }}>
+                          未映射 — 点击右侧 ✏️ 补充
+                        </span>
                       )}
+                      <button className="ide-btn ide-btn-sm ide-btn-ghost" style={{ marginLeft: 6, padding: '0 4px' }}
+                        onClick={() => {
+                          if (f.metric) {
+                            setEditingMetricId(editingMetricId === f.metric.id ? null : f.metric.id);
+                          } else {
+                            // No metric model entry — create a synthetic one for editing
+                            const syntheticId = `_synth_${f.name}`;
+                            setEditingMetricId(editingMetricId === syntheticId ? null : syntheticId);
+                          }
+                        }}
+                        title="编辑来源映射">
+                        <Edit3 className="w-3 h-3" />
+                      </button>
                     </>
                   )}
                 </div>
                 <div>
                   {f.kind === 'dimension' ? (
                     <span style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>直接引用</span>
+                  ) : f.kind === 'timeshifted' ? (
+                    <div style={{ fontSize: 10.5 }}>
+                      <span className="ide-badge ide-badge-info" style={{ fontSize: 9.5, marginRight: 6 }}>脚本计算</span>
+                      <span>{f.formula}</span>
+                    </div>
                   ) : (
                     <>
                       <div className="ide-text-mono" style={{ fontSize: 10.5, lineHeight: 1.4 }}>{f.formula}</div>
+                      {f.metric?.evidence && (
+                        <div style={{ fontSize: 10, color: 'var(--ide-text-tertiary)', marginTop: 2, fontStyle: 'italic' }}>
+                          依据: {f.metric.evidence}
+                        </div>
+                      )}
                       {editingMetricId === f.metric?.id && f.metric && (() => {
                         const m = f.metric;
                         const edit = metricEdits.find((e) => e.id === m.id);
                         const srcAlias = edit?.sourceAlias ?? m.sourceAlias;
                         const srcField = edit?.sourceField ?? m.sourceField;
                         const dedup = edit?.dedupKey ?? m.dedupKey;
+                        const srcValue = srcAlias && srcField ? `${srcAlias}.${srcField}` : '';
                         return (
                           <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                             <select className="ide-select" style={{ fontSize: 10.5 }}
-                              value={`${srcAlias}.${srcField}`}
+                              value={srcValue}
                               onChange={(e) => {
+                                if (!e.target.value) return;
                                 const parts = e.target.value.split('.');
                                 onMetricEdit({ id: m.id, sourceAlias: parts[0], sourceField: parts.slice(1).join('.') });
                               }}>
+                              <option value="">选择来源字段…</option>
                               {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
                             </select>
                             <select className="ide-select" style={{ fontSize: 10.5 }}
-                              value={dedup}
-                              onChange={(e) => onMetricEdit({ id: m.id, dedupKey: e.target.value })}>
+                              value={dedup ?? ''}
+                              onChange={(e) => { if (e.target.value) onMetricEdit({ id: m.id, dedupKey: e.target.value }); }}>
+                              <option value="">选择去重键…</option>
                               {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
                             </select>
                           </div>
                         );
                       })()}
+                      {/* Edit section for fields without a model metric entry — synthetic edit */}
+                      {!f.metric && editingMetricId === `_synth_${f.name}` && (
+                        <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                          <select className="ide-select" style={{ fontSize: 10.5 }}
+                            value=""
+                            onChange={(e) => {
+                              if (!e.target.value) return;
+                              const parts = e.target.value.split('.');
+                              onMetricEdit({ id: f.name, sourceAlias: parts[0], sourceField: parts.slice(1).join('.') });
+                            }}>
+                            <option value="">选择来源字段…</option>
+                            {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
+                          </select>
+                          <select className="ide-select" style={{ fontSize: 10.5 }}
+                            value=""
+                            onChange={(e) => { if (e.target.value) onMetricEdit({ id: f.name, dedupKey: e.target.value }); }}>
+                            <option value="">选择去重键…</option>
+                            {fieldOptions.map((o) => (<option key={o.value} value={o.value}>{o.label}</option>))}
+                          </select>
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -962,6 +1082,77 @@ function FieldDirectoryTab({
             <Plus className="w-3.5 h-3.5" />添加筛选器
           </button>
         )}
+      </section>
+
+      {/* ===== 系统条件 ===== */}
+      <section>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 2, color: 'var(--ide-text-secondary)' }}>
+          系统条件（自动注入，只读）
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', marginBottom: 6 }}>
+          AI 从知识库自动识别并注入的过滤条件，确保查询结果正确。
+        </div>
+        <div className="ide-card" style={{ padding: '8px 12px', fontSize: 11.5, display: 'flex', flexDirection: 'column', gap: 5 }}>
+          {/* Logical delete */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className="ide-badge ide-badge-neutral" style={{ fontSize: 9.5 }}>逻辑删除</span>
+            {model.sources.flatMap((s) =>
+              s.fields.filter((f) => f.role === 'system_condition').map((f) => `${s.alias}.${f.name} = 0`)
+            ).length > 0 ? (
+              model.sources.flatMap((s) =>
+                s.fields.filter((f) => f.role === 'system_condition').map((f) => (
+                  <span key={`${s.alias}.${f.name}`} className="ide-text-mono" style={{ fontSize: 11 }}>
+                    {s.alias}.{f.name} = 0
+                  </span>
+                ))
+              )
+            ) : (
+              <span className="ide-text-mono" style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>is_delete = 0</span>
+            )}
+          </div>
+          {/* Tenant isolation */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span className="ide-badge ide-badge-neutral" style={{ fontSize: 9.5 }}>租户隔离</span>
+            {model.sources.flatMap((s) =>
+              s.fields.filter((f) => f.role === 'tenant_scope').map((f) => `${s.alias}.${f.name}`)
+            ).length > 0 ? (
+              <span className="ide-text-mono" style={{ fontSize: 11 }}>
+                {model.sources.flatMap((s) =>
+                  s.fields.filter((f) => f.role === 'tenant_scope').map((f) => `${s.alias}.${f.name}`)
+                ).join(', ')} = :tenantId
+              </span>
+            ) : (
+              <span className="ide-text-mono" style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>tenant_id = :tenantId（请求上下文注入）</span>
+            )}
+          </div>
+          {/* Exclusion rules */}
+          {model.sources.flatMap((s) =>
+            s.fields.filter((f) => f.role === 'exclusion_filter')
+          ).length > 0 && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="ide-badge ide-badge-warning" style={{ fontSize: 9.5 }}>排除规则</span>
+              {model.sources.flatMap((s) =>
+                s.fields.filter((f) => f.role === 'exclusion_filter').map((f) => (
+                  <span key={`${s.alias}.${f.name}`} className="ide-text-mono" style={{ fontSize: 11 }}>
+                    {s.alias}.{f.name} = 0
+                  </span>
+                ))
+              )}
+            </div>
+          )}
+          {/* Time semantics */}
+          {model.timeSemantics && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="ide-badge ide-badge-info" style={{ fontSize: 9.5 }}>时间筛选列</span>
+              <span className="ide-text-mono" style={{ fontSize: 11 }}>
+                {model.timeSemantics.alias}.{model.timeSemantics.field}
+              </span>
+              <span style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+                ({model.timeSemantics.nativeType}{model.timeSemantics.required ? ', 必填' : ', 可选'})
+              </span>
+            </div>
+          )}
+        </div>
       </section>
     </div>
   );
