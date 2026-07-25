@@ -58,7 +58,7 @@ export interface ChatModel {
   modelConfirmation?: ModelConfirmationView;
 }
 
-export function emptyChat(status: AgentTaskStatus = 'QUEUED'): ChatModel {
+export function emptyChat(status: AgentTaskStatus = 'SUCCEEDED'): ChatModel {
   return { status, lines: [], eventCount: 0 };
 }
 

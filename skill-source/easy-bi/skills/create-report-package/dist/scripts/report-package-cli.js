@@ -1789,6 +1789,428 @@ async function applyEnrichments(plan, enrichmentsConfig) {
     plan.enrichments = enrichments;
 }
 /**
+ * Extract structured metric definitions from the declarative config's
+ * `query_groups[].metrics[]`. Returns a Map keyed by group query id.
+ */
+function collectGroupQueryMetrics(queryGroups) {
+    const result = new Map();
+    for (const g of queryGroups) {
+        const gid = String(g.id ?? "");
+        const defs = [];
+        for (const m of g.metrics ?? []) {
+            const mj = m;
+            defs.push({
+                id: String(mj.id ?? ""),
+                output_column: String(mj.output_column ?? mj.id ?? ""),
+                label: String(mj.label ?? mj.id ?? ""),
+                aggregation: String(mj.aggregation ?? "count_distinct"),
+                field: String(mj.field ?? ""),
+                condition: mj.condition ? String(mj.condition) : null,
+            });
+        }
+        if (defs.length)
+            result.set(gid, defs);
+    }
+    return result;
+}
+/** Collect all unique column references needed for raw-data queries. */
+function collectRequiredColumns(mergeKey, metricDefs) {
+    const seen = new Map();
+    // Merge key (only when non-empty)
+    if (mergeKey) {
+        const mkParts = mergeKey.includes(".") ? mergeKey.split(".") : ["t0", mergeKey];
+        const mkAlias = mkParts[0];
+        const mkName = mkParts[mkParts.length - 1];
+        if (mkName)
+            seen.set(`${mkAlias}.${mkName}`, { alias: mkAlias, name: mkName });
+    }
+    for (const m of metricDefs) {
+        // Dedup field
+        if (m.field) {
+            const parts = m.field.includes(".") ? m.field.split(".") : ["t0", m.field];
+            const alias = parts[0];
+            const name = parts[parts.length - 1];
+            const key = `${alias}.${name}`;
+            if (!seen.has(key))
+                seen.set(key, { alias, name });
+        }
+        // Condition columns: extract alias.field patterns
+        if (m.condition) {
+            const re = /\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/gi;
+            let match;
+            while ((match = re.exec(m.condition)) !== null) {
+                const alias = match[1];
+                const name = match[2];
+                const key = `${alias}.${name}`;
+                if (!seen.has(key))
+                    seen.set(key, { alias, name });
+            }
+        }
+    }
+    return [...seen.values()];
+}
+/**
+ * Generate a raw-data (non-aggregated) SQL query for a single group-query sibling.
+ * Returns just the columns needed for in-memory dedup + conditional counting —
+ * no GROUP BY, no aggregation functions.
+ */
+function buildGroupQueryRawSql(sibling, plan, metricDefs, mergeKeys) {
+    const dialect = dialectForPlan(plan);
+    const primary = sibling.source?.primary_table;
+    if (!primary)
+        throw new Error("group_queries sibling 缺少主表");
+    // Collect required columns: merge keys + metric dedup/condition fields
+    const allCols = [];
+    for (const mk of mergeKeys) {
+        allCols.push(...collectRequiredColumns(mk, []));
+    }
+    allCols.push(...collectRequiredColumns("", metricDefs));
+    // Deduplicate by alias.name
+    const uniqueCols = new Map();
+    for (const col of allCols) {
+        const key = `${col.alias}.${col.name}`;
+        if (!uniqueCols.has(key))
+            uniqueCols.set(key, col);
+    }
+    const selectParts = [];
+    for (const col of uniqueCols.values()) {
+        selectParts.push(`  ${columnExpression(col.alias, col.name, dialect)} AS ${quoteIdentifier(col.name, dialect)}`);
+    }
+    // FROM + JOINs — reuse from sibling.source
+    const sourceTables = new Map((sibling.source?.tables ?? [primary]).map((t) => [t.alias, t]));
+    // Build a column Map from sibling's source tables for reference resolution
+    const siblingColumns = new Map();
+    for (const t of sibling.source?.tables ?? [primary]) {
+        const fields = t.available_fields ?? t.fields ?? [];
+        siblingColumns.set(String(t.alias ?? ""), new Set(fields.map(String)));
+    }
+    const joinLines = (sibling.source?.joins ?? []).map((joinItem) => {
+        const alias = assertAlias(joinItem.alias);
+        const table = sourceTables.get(alias);
+        if (!table)
+            throw new Error(`JOIN 引用了未知表：${alias}`);
+        const predicates = (joinItem.on ?? []).map((condition) => {
+            const left = normalizeColumnReference(condition.left, siblingColumns);
+            const right = normalizeColumnReference(condition.right, siblingColumns);
+            return `${columnExpression(left.alias, left.field, dialect)} = ${columnExpression(right.alias, right.field, dialect)}`;
+        });
+        // Dedup by (alias, field) — knowledge may duplicate the same condition
+        const seenCondKeys = new Set();
+        for (const condition of joinItem.conditions ?? []) {
+            const condKey = `${condition.alias ?? alias}.${condition.field}`;
+            if (seenCondKeys.has(condKey))
+                continue;
+            seenCondKeys.add(condKey);
+            const op = condition.operator === "eq" ? "=" : condition.operator;
+            // Normalize value: prefer numeric form for numbers; avoids mixed 0 / '0' duplicates
+            const rawVal = condition.value;
+            const numVal = Number(rawVal);
+            const val = (typeof rawVal === "number" || (typeof rawVal === "string" && rawVal !== "" && !isNaN(numVal)))
+                ? String(numVal)
+                : typeof rawVal === "string"
+                    ? `'${String(rawVal).replace(/'/g, "''")}'`
+                    : String(rawVal ?? 0);
+            predicates.push(`${columnExpression(condition.alias ?? alias, condition.field, dialect)} ${op} ${val}`);
+        }
+        return `${String(joinItem.type).toUpperCase()} JOIN ${quoteIdentifier(table.database, dialect)}.${quoteIdentifier(table.table, dialect)} AS ${alias}\n  ON ${predicates.join("\n  AND ")}`;
+    });
+    // WHERE — embed system conditions as literals (script queries don't use separate bindings)
+    const system = (Array.isArray(sibling.system_conditions) ? sibling.system_conditions : []).map((c) => {
+        const op = c.operator === "eq" ? "=" : c.operator;
+        const val = typeof c.value === "string" ? `'${c.value.replace(/'/g, "''")}'` : String(c.value ?? 0);
+        return `  ${c.expression} ${op} ${val}`;
+    });
+    const whereLines = (system.length ? system : ["  1 = 1"]).join("\n  AND ");
+    // ORDER BY: merge key columns
+    const orderParts = mergeKeys.map((mk) => {
+        const parts = mk.includes(".") ? mk.split(".") : ["t0", mk];
+        const name = parts[parts.length - 1];
+        return `${quoteIdentifier(name, dialect)} ASC`;
+    });
+    return [
+        "SELECT",
+        selectParts.join(",\n"),
+        `FROM ${quoteIdentifier(primary.database, dialect)}.${quoteIdentifier(primary.table, dialect)} AS ${assertAlias(primary.alias)}`,
+        ...joinLines,
+        "WHERE",
+        whereLines,
+        ...(orderParts.length ? [`ORDER BY ${orderParts.join(", ")}`] : []),
+        "",
+    ].join("\n");
+}
+/**
+ * Generate TypeScript script source for group_queries: streams raw data from each
+ * sibling query, does in-memory COUNT DISTINCT with conditional dedup, then
+ * full-outer-merges results on the shared merge key(s).
+ */
+function buildGroupQueriesScriptSource(plan, metricDefsByGroup, mergeKeys) {
+    const groupIds = [...metricDefsByGroup.keys()];
+    // Extract the bare column name from a merge key ("t0.customer_name" → "customer_name")
+    const mergeKeyNames = mergeKeys.map((mk) => {
+        const parts = mk.includes(".") ? mk.split(".") : ["t0", mk];
+        return parts[parts.length - 1];
+    });
+    const primaryKey = mergeKeyNames[0];
+    const lines = [
+        "// === AUTO-GENERATED: group_queries script ===\n// In-memory COUNT DISTINCT + conditional dedup + full-outer-merge.",
+        "export async function run(ctx) {",
+    ];
+    // Emit metric definition tables as comments and as inline config
+    for (const gid of groupIds) {
+        const defs = metricDefsByGroup.get(gid) ?? [];
+        lines.push(`  // --- Group: ${gid} (${defs.length} metrics) ---`);
+        for (const d of defs) {
+            const condDesc = d.condition ? ` WHERE ${d.condition}` : "";
+            lines.push(`  //   ${d.id} (→${d.output_column}): ${d.aggregation}(${d.field})${condDesc}`);
+        }
+    }
+    lines.push("");
+    // Declare per-group storage: Map<mergeKey, { sets: Record<metricId, Set<dedupVal>> }>
+    for (const gid of groupIds) {
+        lines.push(`  // ${gid}: Map<mergeKey, { sets: Record<string, Set<string>> }>`);
+        lines.push(`  const ${gid}Map = new Map();`);
+    }
+    lines.push("");
+    // Stream each group's raw data query
+    for (const gid of groupIds) {
+        const defs = metricDefsByGroup.get(gid) ?? [];
+        lines.push(`  // === Stream ${gid} raw data ===`);
+        lines.push(`  for await (const row of ctx.queryStream("${gid}", ctx.filters)) {`);
+        // Build composite merge key expression
+        if (mergeKeyNames.length === 1) {
+            lines.push(`    const key = String(row[${JSON.stringify(primaryKey)}] ?? "");`);
+        }
+        else {
+            const keyExpr = mergeKeyNames.map((k) => `String(row[${JSON.stringify(k)}] ?? "")`).join(" + '|' + ");
+            lines.push(`    const key = ${keyExpr};`);
+        }
+        // Ensure group entry with per-metric dedup Sets
+        lines.push(`    if (!${gid}Map.has(key)) {`);
+        lines.push(`      ${gid}Map.set(key, { sets: {} });`);
+        lines.push(`    }`);
+        lines.push(`    const grp = ${gid}Map.get(key);`);
+        // Process each metric's dedup + condition
+        for (const d of defs) {
+            const fieldParts = d.field.includes(".") ? d.field.split(".") : ["t0", d.field];
+            const fieldName = fieldParts[fieldParts.length - 1];
+            const dedupCol = `row[${JSON.stringify(fieldName)}]`;
+            // Build condition check
+            let condCheck = "true";
+            if (d.condition) {
+                // Parse condition like "t0.status = 'BE_ALLOCATED'"
+                // Extract column name from condition for the script
+                const condMatch = d.condition.match(/^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\s*=\s*'([^']*)'$/i);
+                if (condMatch) {
+                    const condField = condMatch[2];
+                    const condValue = condMatch[3];
+                    condCheck = `String(row[${JSON.stringify(condField)}] ?? "") === ${JSON.stringify(condValue)}`;
+                }
+                else {
+                    // Fallback: use the raw condition as a comment, always count
+                    condCheck = "true /* condition: " + d.condition + " */";
+                }
+            }
+            const metricId = JSON.stringify(d.id);
+            const dedupVal = `String(${dedupCol} ?? "")`;
+            lines.push(`    // ${d.label}: ${d.aggregation}(${d.field})${d.condition ? " WHERE " + d.condition : ""}`);
+            lines.push(`    if (${condCheck}) {`);
+            lines.push(`      if (!grp.sets[${metricId}]) grp.sets[${metricId}] = new Set();`);
+            lines.push(`      const s_${d.id} = ${dedupVal};`);
+            lines.push(`      if (!grp.sets[${metricId}].has(s_${d.id})) {`);
+            lines.push(`        grp.sets[${metricId}].add(s_${d.id});`);
+            lines.push(`      }`);
+            lines.push(`    }`);
+        }
+        lines.push(`  }`);
+        lines.push("");
+    }
+    // Full-outer-merge
+    lines.push(`  // === Full-outer-merge on ${primaryKey} ===`);
+    if (groupIds.length === 1) {
+        lines.push(`  for (const [key, grp] of ${groupIds[0]}Map) {`);
+        if (mergeKeyNames.length === 1) {
+            lines.push(`    const row = { ${JSON.stringify(primaryKey)}: key };`);
+        }
+        else {
+            // Composite key: need to split the key back into components
+            lines.push(`    const keyParts = key.split("|");`);
+            const rowParts = mergeKeyNames.map((k, i) => `      ${JSON.stringify(k)}: keyParts[${i}] ?? ""`);
+            lines.push(`    const row = {`);
+            lines.push(rowParts.join(",\n"));
+            lines.push(`    };`);
+        }
+        for (const d of metricDefsByGroup.get(groupIds[0]) ?? []) {
+            lines.push(`    row[${JSON.stringify(d.id)}] = grp.sets[${JSON.stringify(d.id)}]?.size ?? 0;`);
+        }
+        lines.push(`    ctx.emit(row);`);
+        lines.push(`  }`);
+    }
+    else {
+        // Multiple groups: collect all keys, build merged rows
+        lines.push(`  const allKeys = new Set([`);
+        for (const gid of groupIds) {
+            lines.push(`    ...${gid}Map.keys(),`);
+        }
+        lines.push(`  ]);`);
+        lines.push("");
+        lines.push(`  for (const key of allKeys) {`);
+        if (mergeKeyNames.length === 1) {
+            lines.push(`    const row = { ${JSON.stringify(primaryKey)}: key };`);
+        }
+        else {
+            lines.push(`    const keyParts = key.split("|");`);
+            const rowParts = mergeKeyNames.map((k, i) => `      ${JSON.stringify(k)}: keyParts[${i}] ?? ""`);
+            lines.push(`    const row = {`);
+            lines.push(rowParts.join(",\n"));
+            lines.push(`    };`);
+        }
+        for (const gid of groupIds) {
+            lines.push(`    const ${gid}Grp = ${gid}Map.get(key);`);
+            for (const d of metricDefsByGroup.get(gid) ?? []) {
+                lines.push(`    row[${JSON.stringify(d.id)}] = ${gid}Grp?.sets[${JSON.stringify(d.id)}]?.size ?? 0;`);
+            }
+        }
+        lines.push(`    ctx.emit(row);`);
+        lines.push(`  }`);
+    }
+    lines.push("}");
+    lines.push("");
+    return lines.join("\n");
+}
+/**
+ * Build a complete script_report from a group_queries plan, switching the report
+ * from v2 SQL aggregation to v3 script-based in-memory computation.
+ */
+function buildScriptReportFromGroupQueriesPlan(plan, queryGroups) {
+    if (!plan.group_queries?.queries?.length)
+        return;
+    const metricDefsByGroup = collectGroupQueryMetrics(queryGroups);
+    if (!metricDefsByGroup.size)
+        return;
+    const mergeKeys = (plan.group_queries.merge_keys ?? []).map(String);
+    const dialect = dialectForPlan(plan);
+    // Build one query entry per sibling — raw-data SQL, no aggregation
+    const queries = [];
+    for (const sibling of plan.group_queries.queries) {
+        const gid = String(sibling.id ?? "");
+        const defs = metricDefsByGroup.get(gid);
+        if (!defs || !defs.length)
+            continue;
+        const sql = buildGroupQueryRawSql(sibling, plan, defs, mergeKeys);
+        const primary = sibling.source?.primary_table;
+        // Collect source table aliases and fields from this sibling
+        const siblingSources = [];
+        for (const table of sibling.source?.tables ?? [primary]) {
+            if (!table)
+                continue;
+            const alias = String(table.alias ?? "");
+            // Use all available fields from the sibling's source tables to cover:
+            // merge keys, JOIN ON columns, system conditions, and metric fields.
+            const tableFields = table.available_fields ?? [];
+            const fields = [...new Set(tableFields.map(String))];
+            // Dedup by alias
+            const existing = siblingSources.find((s) => String(s.alias ?? "") === alias);
+            if (existing) {
+                // Merge fields
+                const existingFields = new Set(existing.fields?.map(String) ?? []);
+                for (const f of fields)
+                    existingFields.add(f);
+                existing.fields = [...existingFields];
+                continue;
+            }
+            siblingSources.push({
+                profile_id: String(table.profile_id ?? ""),
+                database: String(table.database ?? ""),
+                table: String(table.table ?? ""),
+                alias,
+                fields: [...new Set(fields)],
+            });
+        }
+        queries.push({
+            id: gid,
+            mode: "stream",
+            profile_id: String(primary?.profile_id ?? ""),
+            database: String(primary?.database ?? ""),
+            sql_dialect: dialect.id,
+            sql,
+            sources: siblingSources,
+        });
+    }
+    if (!queries.length)
+        return;
+    // Generate script source
+    const scriptSource = buildGroupQueriesScriptSource(plan, metricDefsByGroup, mergeKeys);
+    // Build resource_budget
+    const resource_budget = {
+        max_queries: queries.length + 4,
+        max_query_rows: 1000000,
+        max_index_rows: 100000,
+        max_batch_keys: 2000,
+        max_output_rows: 500000,
+        max_memory_mb: 512,
+        timeout_seconds: 300,
+        stream_batch_rows: 128,
+    };
+    plan.script_report = {
+        queries,
+        source: scriptSource,
+        resource_budget,
+    };
+    // Inject all group-query fields into plan.fields so they appear in fields.json.
+    // Merge-key dimension fields + all metric fields from every sibling.
+    plan.fields = plan.fields ?? [];
+    const existingFieldIds = new Set(plan.fields.map((f) => String(f.id)));
+    let fieldOrder = plan.fields.reduce((max, f) => Math.max(max, Number(f.order ?? 0)), 0);
+    // 1. Merge-key dimension fields from the first sibling's merge key columns
+    for (const sibling of plan.group_queries.queries) {
+        for (const f of sibling.fields ?? []) {
+            const fid = String(f.id ?? "");
+            if (existingFieldIds.has(fid))
+                continue;
+            // Check if this is a merge key (column kind) or metric field
+            const kind = f.source?.kind;
+            if (kind === "column" && mergeKeys.includes(fid)) {
+                // Merge key dimension — needs to be in plan.fields
+                fieldOrder += 1;
+                plan.fields.push({
+                    id: fid,
+                    label: f.label ?? fid,
+                    order: fieldOrder,
+                    output_type: "string",
+                    source: { kind: "script", lineage: { ...f.source } },
+                    roles: ["group", "output"],
+                });
+                existingFieldIds.add(fid);
+            }
+        }
+    }
+    // 2. All metric fields from metric definitions
+    for (const gid of metricDefsByGroup.keys()) {
+        for (const d of metricDefsByGroup.get(gid) ?? []) {
+            if (existingFieldIds.has(d.id))
+                continue;
+            fieldOrder += 1;
+            plan.fields.push({
+                id: d.id,
+                label: d.label,
+                order: fieldOrder,
+                output_type: "number",
+                source: { kind: "script", lineage: { kind: "column", alias: d.field.includes(".") ? d.field.split(".")[0] : "t0", field: d.field.includes(".") ? d.field.split(".").pop() : d.field } },
+                roles: ["output", "metric"],
+            });
+            existingFieldIds.add(d.id);
+        }
+    }
+    // Rewrite all field sources to script lineage
+    for (const field of plan.fields ?? []) {
+        const kind = String(field.source?.kind ?? "");
+        if (kind === "time_shifted" || kind === "computed")
+            continue;
+        const originalSource = { ...field.source };
+        field.source = { kind: "script", lineage: originalSource };
+    }
+}
+/**
  * Resolve the sibling grouped queries of a multi-entity statistics report
  * (group_queries, §group-queries design) from knowledge into `plan.group_queries`.
  *
@@ -2392,7 +2814,8 @@ function groupTimeShiftedFields(decls) {
  * generate complete SQL.
  */
 function resolveTimeShiftedMetrics(plan, decls, configMetricIds, configMetricColumns) {
-    const existingIds = new Set((plan.fields ?? []).map((f) => String(f.id)));
+    plan.fields = plan.fields ?? [];
+    const existingIds = new Set(plan.fields.map((f) => String(f.id)));
     const errors = [];
     for (const d of decls) {
         if (!existingIds.has(d.base_metric) && !configMetricIds.has(d.base_metric)) {
@@ -2445,19 +2868,25 @@ function resolveTimeShiftedMetrics(plan, decls, configMetricIds, configMetricCol
  *     queryStreamWithFilters with shifted filters
  *  3. Streams the main query, looks up shifted indexes, computes deltas, emits
  */
-function buildTimeShiftedScriptSource(plan, shiftGroups, periodParam) {
-    // Resolve group key for time-shifted index lookup. Priority:
-    //  1. semantic_plan.dimensions[0].id (e.g. "shipper_name")
-    //  2. result_grain.keys[0] (model format)
-    //  3. First group_by column from query_groups/group_queries
+function buildTimeShiftedScriptSource(plan, shiftGroups, periodParam, groupByKeys) {
+    // Resolve group key columns for time-shifted index lookup. Priority:
+    //  1. groupByKeys parameter (from queryMeta or plan dims, already stripped of alias prefix)
+    //  2. semantic_plan.dimensions[0].id
+    //  3. result_grain.keys[0] (model format)
     //  4. Fallback "id"
-    const groupKeyRaw = plan.semantic_plan?.dimensions?.[0]?.id ??
-        plan.result_grain?.keys?.[0];
-    const groupKey = groupKeyRaw
-        ? typeof groupKeyRaw === "string"
-            ? groupKeyRaw.split(".").pop() ?? groupKeyRaw // "t0.shipper_name" → "shipper_name"
-            : groupKeyRaw?.field ?? groupKeyRaw?.name ?? String(groupKeyRaw)
-        : "id";
+    let groupKeys = groupByKeys.length
+        ? groupByKeys
+        : (plan.semantic_plan?.dimensions ?? [])
+            .map((d) => String(d.id ?? "").includes(".") ? String(d.id).split(".").pop() ?? String(d.id) : String(d.id));
+    if (!groupKeys.length) {
+        const grainKey = plan.result_grain?.keys?.[0];
+        if (grainKey) {
+            const gk = typeof grainKey === "string" ? grainKey : grainKey?.field ?? grainKey?.name ?? String(grainKey);
+            groupKeys = [gk.includes(".") ? gk.split(".").pop() ?? gk : gk];
+        }
+    }
+    if (!groupKeys.length)
+        groupKeys = ["id"];
     // Resolve each time_shifted field's base metric to its output column name.
     // base_column is resolved during collectTimeShiftedDecls from the declarative config.
     const fieldMap = new Map((plan.fields ?? []).map((f) => [String(f.id), f]));
@@ -2479,6 +2908,13 @@ function buildTimeShiftedScriptSource(plan, shiftGroups, periodParam) {
         const f = fieldMap.get(baseMetricId);
         return f ? String(f.label ?? baseMetricId) : baseMetricId;
     };
+    // Build key expression for Map lookups
+    const keyExpr = groupKeys.length === 1
+        ? `row[${JSON.stringify(groupKeys[0])}]`
+        : groupKeys.map((k) => `row[${JSON.stringify(k)}]`).join(" + '|' + ");
+    const keyExprQuoted = groupKeys.length === 1
+        ? `row[${JSON.stringify(groupKeys[0])}]`
+        : groupKeys.map((k) => `row[${JSON.stringify(k)}]`).join(" + \"|\" + ");
     const lines = [];
     lines.push("// === AUTO-GENERATED: time-shifted metrics script ===");
     lines.push("// shiftMonths: offset a period filter's {from,to} range by N months.");
@@ -2519,7 +2955,7 @@ function buildTimeShiftedScriptSource(plan, shiftGroups, periodParam) {
         lines.push(`    const ${g.shift}Filters = { ...ctx.filters, ${JSON.stringify(periodParam)}: shiftMonths(periodValue, ${-monthsBack}) };`);
         lines.push(`    const ${g.shift}Map = new Map();`);
         lines.push(`    for await (const row of ctx.queryStreamWithFilters('main', ${g.shift}Filters)) {`);
-        lines.push(`      ${g.shift}Map.set(row[${JSON.stringify(groupKey)}], row);`);
+        lines.push(`      ${g.shift}Map.set(${keyExpr}, row);`);
         lines.push("    }");
         lines.push(`    ${indexName} = ${g.shift}Map;`);
         lines.push("  }");
@@ -2528,7 +2964,7 @@ function buildTimeShiftedScriptSource(plan, shiftGroups, periodParam) {
     // Stream main + merge
     lines.push("  // Stream main query and merge time-shifted values");
     lines.push("  for await (const row of ctx.queryStream('main', ctx.filters)) {");
-    lines.push(`    const key = row[${JSON.stringify(groupKey)}];`);
+    lines.push(`    const key = ${keyExprQuoted};`);
     lines.push("");
     // Generate merge + compute logic
     const usedBaseMetrics = new Set();
@@ -2742,7 +3178,7 @@ function buildScriptReportFromTimeShiftedPlan(plan, shiftGroups, periodParam, qu
             fields: [...availableFields].sort(),
         }];
     // Generate the script source
-    const scriptSource = buildTimeShiftedScriptSource(plan, shiftGroups, periodParam);
+    const scriptSource = buildTimeShiftedScriptSource(plan, shiftGroups, periodParam, groupByCols);
     // Build script_report structure
     plan.script_report = {
         queries: [
@@ -4998,13 +5434,34 @@ export async function finalizeStagedPackage(options) {
         await configurePlan(planPath, paths.configuration);
         await approvePlan(planPath, options.reviewedBy);
         await generatePackage({ workspace, plan: planPath, out: candidateRoot, register: false });
-        // Clean up internal metadata that configurePlan stored on the plan.
+        // Clean up internal metadata that configurePlan stored on the plan, and sync the
+        // execution_plan strategy in case generatePackage switched us to script.
         try {
+            const candidateManifest = await readJson(join(candidateRoot, "report.manifest.json"));
             const updatedPlan = await readJson(planPath);
+            let changed = false;
             if (updatedPlan._time_shifted) {
                 delete updatedPlan._time_shifted;
-                await writeJson(planPath, updatedPlan);
+                changed = true;
             }
+            if (String(candidateManifest.execution_model ?? "").includes("script") && String(updatedPlan.execution_plan?.strategy) !== "script") {
+                updatedPlan.execution_plan = {
+                    ...(updatedPlan.execution_plan ?? {}),
+                    strategy: "script",
+                };
+                changed = true;
+            }
+            if (changed)
+                await writeJson(planPath, updatedPlan);
+            // Also sync the standalone execution-plan.json so re-runs of the pipeline
+            // see the updated strategy (validateStagedArtifacts reads this file).
+            try {
+                const standaloneEp = await readJson(paths.executionPlan);
+                if (String(standaloneEp.strategy ?? "") !== String(updatedPlan.execution_plan?.strategy ?? "")) {
+                    await writeJson(paths.executionPlan, { ...standaloneEp, ...updatedPlan.execution_plan });
+                }
+            }
+            catch { /* best-effort */ }
         }
         catch { /* best-effort cleanup */ }
         const packageValidation = await validatePackage(candidateRoot);
@@ -5013,10 +5470,12 @@ export async function finalizeStagedPackage(options) {
         await mkdir(dirname(finalRoot), { recursive: true });
         await rename(candidateRoot, finalRoot);
         published = true;
-        await updateReportIndex(workspace, await readJson(join(finalRoot, "report.manifest.json")), finalRoot);
+        const manifest = await readJson(join(finalRoot, "report.manifest.json"));
+        await updateReportIndex(workspace, manifest, finalRoot);
         if (movedPrevious)
             await rm(previousRoot, { recursive: true, force: true });
-        const result = { ok: true, phase: strategy === "script" ? "script" : "query", strategy, report_id: model.report?.id, package: finalRoot };
+        const actualStrategy = String(manifest?.execution_model ?? "").includes("script") ? "script" : strategy;
+        const result = { ok: true, phase: actualStrategy === "script" ? "script" : "query", strategy: actualStrategy, report_id: model.report?.id, package: finalRoot };
         await writeJson(paths.result, result);
         return result;
     }
@@ -5090,6 +5549,11 @@ export async function configurePlan(planPathValue, configurationPathValue) {
     // runtime. Resolved from knowledge here; stored in plan.group_queries.
     if (configuration.group_queries) {
         await applyGroupQueries(plan, configuration.group_queries);
+        // Auto-generate a v3 script report from group_queries: raw-data SQL per sibling
+        // + in-memory COUNT DISTINCT dedup + full-outer-merge on merge_keys.
+        if (Array.isArray(configuration.query_groups) && configuration.query_groups.length) {
+            buildScriptReportFromGroupQueriesPlan(plan, configuration.query_groups);
+        }
     }
     if (configuration.script_report) {
         await applyScriptReport(plan, configuration.script_report);
@@ -5187,6 +5651,7 @@ export async function configurePlan(planPathValue, configurationPathValue) {
     // Time-shifted fields are collected before this loop (via collectTimeShiftedDecls)
     // and injected into plan.fields by resolveTimeShiftedMetrics so blocker resolution
     // picks them up. They are skipped here.
+    plan.fields = plan.fields ?? [];
     const { groups: tsDecls, queryMeta: tsQueryMeta } = collectTimeShiftedDecls(configuration);
     if (tsDecls.length > 0) {
         // Build set of metric IDs and column info from declarative config for base_metric
@@ -5438,6 +5903,7 @@ export async function configurePlan(planPathValue, configurationPathValue) {
         delete plan._has_time_shifted;
     }
     finalizePlanningDocuments(plan, configuration);
+    plan.custom_logic = plan.custom_logic ?? { required: false, mode: "identity", group_keys: [], max_group_rows: 100000 };
     const fieldKinds = new Set((plan.fields ?? []).map((field) => field.source?.kind));
     const computedModes = new Set((plan.fields ?? [])
         .filter((field) => field.source?.kind === "computed")
@@ -5595,7 +6061,7 @@ function buildSql(plan) {
         }
         return `${String(joinItem.type).toUpperCase()} JOIN ${quoteIdentifier(table.database, dialect)}.${quoteIdentifier(table.table, dialect)} AS ${alias}\n  ON ${predicates.join("\n  AND ")}`;
     });
-    const system = (plan.system_conditions ?? []).map((condition) => `  ${condition.expression} ${condition.operator === "eq" ? "=" : condition.operator} :${condition.id}`);
+    const system = (Array.isArray(plan.system_conditions) ? plan.system_conditions : []).map((condition) => `  ${condition.expression} ${condition.operator === "eq" ? "=" : condition.operator} :${condition.id}`);
     const whereLines = (system.length ? system : ["  1 = 1"]).join("\n  AND ");
     const groupByExpressions = (plan.aggregation?.group_by ?? []).map((item) => {
         const reference = normalizeColumnReference(item, columns);
@@ -5776,8 +6242,48 @@ function buildBindings(plan) {
                 : {}),
         })),
         context: plan.context_bindings,
-        system: [...plan.system_conditions, ...joinSystem, ...havingSystem],
+        system: [...(Array.isArray(plan.system_conditions) ? plan.system_conditions : []), ...joinSystem, ...havingSystem],
         ...(plan.enrichments?.length ? { enrichments: buildEnrichmentBindings(plan) } : {}),
+    };
+}
+/**
+ * Build a per-query bindings object for a single script query, so the runtime can
+ * compile user filters (e.g. create_time range) into that query's SQL template.
+ * Filters only those plan.parameters whose expression refs are available in the
+ * query's source tables.
+ */
+function buildScriptQueryBindings(plan, query) {
+    const queryAliases = new Set((query.sources ?? []).map((s) => String(s.alias ?? "")).filter(Boolean));
+    const applicableParams = (plan.parameters ?? []).filter((p) => {
+        const expr = String(p.sql_binding?.expression ?? "");
+        // Extract alias from expression like "t0.`create_time`" or "t0.create_time"
+        const alias = expr.split(".")[0]?.replace(/`/g, "").trim();
+        return queryAliases.has(alias);
+    });
+    const dialect = dialectForPlan(plan);
+    return {
+        binding_format_version: "2",
+        filter_marker: "/* EASYBI_FILTERS */",
+        parameters: applicableParams.map((parameter) => ({
+            id: parameter.id,
+            expression: parameter.sql_binding.expression,
+            clause: parameter.sql_binding.clause,
+            operators: parameter.operators,
+            default_operator: parameter.default_operator,
+            value_adapter: parameter.sql_binding.value_adapter,
+            required: Boolean(parameter.required),
+            value_type: parameter.value_type,
+            ...(parameter.value_type === "boolean"
+                ? {
+                    flag_operator: parameter.sql_binding.flag_operator,
+                    flag_threshold: parameter.sql_binding.flag_threshold,
+                }
+                : {}),
+        })),
+        context: plan.context_bindings,
+        // Script queries embed system conditions as SQL literals (no named params),
+        // so system bindings aren't needed here.
+        system: [],
     };
 }
 /**
@@ -5990,7 +6496,7 @@ function lockedSources(plan) {
             add(condition.alias ?? joinItem.alias, condition.field);
         }
     }
-    for (const condition of plan.system_conditions ?? []) {
+    for (const condition of Array.isArray(plan.system_conditions) ? plan.system_conditions : []) {
         addExpression(condition.expression);
     }
     for (const parameter of plan.parameters ?? []) {
@@ -6102,6 +6608,7 @@ async function generateScriptPackage(workspace, plan, packageRoot, register) {
             database: query.database,
             sql_dialect: query.sql_dialect,
             sql: `queries/${query.id}.sql`,
+            bindings: `queries/${query.id}.bindings.json`,
         })),
         signature: { status: "unsigned-development" },
     };
@@ -6137,6 +6644,12 @@ async function generateScriptPackage(workspace, plan, packageRoot, register) {
     await writeFile(join(packageRoot, "scripts", "report.mjs"), stripTypeScriptTypes(plan.script_report.source, { mode: "strip" }), "utf8");
     for (const query of plan.script_report.queries ?? []) {
         await writeFile(join(packageRoot, "queries", `${query.id}.sql`), query.sql, "utf8");
+        // Per-query bindings: each script query needs its own bindings file so the
+        // runtime can compile user filters (e.g. create_time) into the SQL template.
+        // Build bindings from plan.parameters filtering to parameters whose expression
+        // references columns available in this query's source tables.
+        const queryBindings = buildScriptQueryBindings(plan, query);
+        await writeJson(join(packageRoot, "queries", `${query.id}.bindings.json`), queryBindings);
     }
     await writeJson(join(packageRoot, "tests", "cases.json"), {
         schema_version: "1",

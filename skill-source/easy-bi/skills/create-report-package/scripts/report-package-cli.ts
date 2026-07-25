@@ -6922,6 +6922,49 @@ function buildBindings(plan: JsonRecord): JsonRecord {
 }
 
 /**
+ * Build a per-query bindings object for a single script query, so the runtime can
+ * compile user filters (e.g. create_time range) into that query's SQL template.
+ * Filters only those plan.parameters whose expression refs are available in the
+ * query's source tables.
+ */
+function buildScriptQueryBindings(plan: JsonRecord, query: JsonRecord): JsonRecord {
+  const queryAliases = new Set(
+    (query.sources ?? []).map((s: JsonRecord) => String(s.alias ?? "")).filter(Boolean),
+  );
+  const applicableParams = (plan.parameters ?? []).filter((p: JsonRecord) => {
+    const expr = String(p.sql_binding?.expression ?? "");
+    // Extract alias from expression like "t0.`create_time`" or "t0.create_time"
+    const alias = expr.split(".")[0]?.replace(/`/g, "").trim();
+    return queryAliases.has(alias);
+  });
+  const dialect = dialectForPlan(plan);
+  return {
+    binding_format_version: "2",
+    filter_marker: "/* EASYBI_FILTERS */",
+    parameters: applicableParams.map((parameter: JsonRecord) => ({
+      id: parameter.id,
+      expression: parameter.sql_binding.expression,
+      clause: parameter.sql_binding.clause,
+      operators: parameter.operators,
+      default_operator: parameter.default_operator,
+      value_adapter: parameter.sql_binding.value_adapter,
+      required: Boolean(parameter.required),
+      value_type: parameter.value_type,
+      ...(parameter.value_type === "boolean"
+        ? {
+            flag_operator: parameter.sql_binding.flag_operator,
+            flag_threshold: parameter.sql_binding.flag_threshold,
+          }
+        : {}),
+    })),
+    context: plan.context_bindings,
+    // Script queries embed system conditions as SQL literals (no named params),
+    // so system bindings aren't needed here.
+    system: [],
+  };
+}
+
+/**
  * Turn a sibling group query into a standalone plan-shaped object so the SAME
  * `buildSql`/`buildBindings` produce its SQL + bindings. The shared time filter
  * (plan.group_queries.period_param) is re-bound to THIS sibling's own time column
@@ -7287,6 +7330,7 @@ async function generateScriptPackage(
       database: query.database,
       sql_dialect: query.sql_dialect,
       sql: `queries/${query.id}.sql`,
+      bindings: `queries/${query.id}.bindings.json`,
     })),
     signature: { status: "unsigned-development" },
   };
@@ -7329,6 +7373,15 @@ async function generateScriptPackage(
   );
   for (const query of plan.script_report.queries ?? []) {
     await writeFile(join(packageRoot, "queries", `${query.id}.sql`), query.sql, "utf8");
+    // Per-query bindings: each script query needs its own bindings file so the
+    // runtime can compile user filters (e.g. create_time) into the SQL template.
+    // Build bindings from plan.parameters filtering to parameters whose expression
+    // references columns available in this query's source tables.
+    const queryBindings = buildScriptQueryBindings(plan, query);
+    await writeJson(
+      join(packageRoot, "queries", `${query.id}.bindings.json`),
+      queryBindings,
+    );
   }
   await writeJson(join(packageRoot, "tests", "cases.json"), {
     schema_version: "1",

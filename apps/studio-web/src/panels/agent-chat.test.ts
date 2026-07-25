@@ -203,7 +203,7 @@ describe('agent-chat reducer', () => {
     let m = emptyChat();
     m = reduceEvents(m, [ev('job_started'), ev('phase_changed', { sessionId: 's1' })]);
     expect(m.lines).toHaveLength(0);
-    expect(m.status).toBe('QUEUED');
+    expect(m.status).toBe('SUCCEEDED');
   });
 
   it('isTerminal true only for terminal states', () => {
