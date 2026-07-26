@@ -1,201 +1,203 @@
-import { pathToFileURL } from "node:url";
-// ---------------------------------------------------------------------------
-// ScriptExecutionError
-// ---------------------------------------------------------------------------
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 export class ScriptExecutionError extends Error {
     code;
     constructor(code, message) {
         super(message);
         this.code = code;
-        this.name = "ScriptExecutionError";
     }
 }
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-class BudgetExceededError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = "BudgetExceededError";
+function positive(value, fallback, name) {
+    const number = Number(value ?? fallback);
+    if (!Number.isInteger(number) || number < 1) {
+        throw new ScriptExecutionError("INVALID_RESOURCE_BUDGET", `${name} 必须是正整数`);
     }
+    return number;
 }
-/**
- * Build a Map index from an array of rows.
- *
- * - Single key: raw value is used as the Map key (preserving type).
- * - Multiple keys: values are joined with \x00 as a composite string key.
- */
-function buildIndex(rows, keys) {
-    const index = new Map();
-    for (const row of rows) {
-        const key = keys.length === 1
-            ? row[keys[0]]
-            : keys.map((k) => String(row[k] ?? "")).join("\x00");
-        const bucket = index.get(key);
-        if (bucket) {
-            bucket.push(row);
-        }
-        else {
-            index.set(key, [row]);
-        }
-    }
-    return index;
-}
-/** Create a Promise that rejects when the signal fires. */
-function abortRace(signal) {
-    if (!signal)
-        return undefined;
-    return new Promise((_, reject) => {
-        if (signal.aborted) {
-            reject(new ScriptExecutionError("SCRIPT_CANCELED", "Script was canceled"));
-            return;
-        }
-        signal.addEventListener("abort", () => reject(new ScriptExecutionError("SCRIPT_CANCELED", "Script was canceled")), { once: true });
-    });
-}
-/** Create a Promise that rejects after timeoutSeconds. */
-function timeoutRace(seconds) {
-    if (seconds <= 0)
-        return undefined;
-    return new Promise((_, reject) => {
-        setTimeout(() => {
-            reject(new ScriptExecutionError("SCRIPT_TIMEOUT", `脚本执行超时（${seconds}s）`));
-        }, seconds * 1000);
-    });
-}
-// ---------------------------------------------------------------------------
-// runScriptIsolated
-// ---------------------------------------------------------------------------
-export async function runScriptIsolated(options) {
-    const { scriptPath, budget = {}, handlers, onEmit, signal } = options;
-    let queryCount = 0;
-    let outputRows = 0;
-    const maxQueries = Number(budget.max_queries ?? Infinity);
-    const maxOutputRows = Number(budget.max_output_rows ?? Infinity);
-    const timeoutSeconds = Number(budget.timeout_seconds ?? 0);
-    function checkBudget() {
-        if (queryCount >= maxQueries) {
-            throw new BudgetExceededError(`查询次数已达上限（${maxQueries}）`);
-        }
-        if (outputRows >= maxOutputRows) {
-            throw new BudgetExceededError(`输出行数已达上限（${maxOutputRows}）`);
-        }
-    }
-    const isPreview = Boolean(options.isPreview);
-    // --- ctx object exposed to user scripts ---
-    // NOTE: queryStream is NOT async so that "for await (const row of ctx.queryStream(...))"
-    // works directly. The handler call is deferred until the first iterator pull.
-    const ctx = {
-        /** True during preview; false during export. */
-        isPreview,
-        /** The request's filter values (read-only snapshot). */
-        filters: (options.filters ?? {}),
-        /** Switch to a named output sheet (export only; no-op in preview). */
-        beginSheet(_name) {
-            if (options.onBeginSheet)
-                options.onBeginSheet(_name);
-        },
-        /** Stream query with different filter overrides (for comparison queries). */
-        queryStreamWithFilters(queryId, filterOverrides) {
-            checkBudget();
-            queryCount++;
-            let iter;
-            return {
-                [Symbol.asyncIterator]() {
-                    return {
-                        async next() {
-                            if (!iter) {
-                                const iterable = await handlers.queryStreamWithFilters(queryId, filterOverrides);
-                                iter = iterable[Symbol.asyncIterator]();
-                            }
-                            return iter.next();
-                        },
-                        async return(value) {
-                            return iter?.return?.(value) ?? { done: true, value };
-                        },
-                        async throw(e) {
-                            if (iter?.throw)
-                                return iter.throw(e);
-                            throw e;
-                        },
-                    };
-                },
-            };
-        },
-        queryStream(queryId) {
-            checkBudget();
-            queryCount++;
-            return {
-                [Symbol.asyncIterator]() {
-                    let iter;
-                    return {
-                        async next() {
-                            if (!iter) {
-                                const iterable = await handlers.queryStream(queryId, []);
-                                iter = iterable[Symbol.asyncIterator]();
-                            }
-                            return iter.next();
-                        },
-                        async return(value) {
-                            return iter?.return?.(value) ?? { done: true, value };
-                        },
-                        async throw(e) {
-                            if (iter?.throw)
-                                return iter.throw(e);
-                            throw e;
-                        },
-                    };
-                },
-            };
-        },
-        async loadIndex(queryId, values = [], keys) {
-            checkBudget();
-            queryCount++;
-            const rows = await handlers.loadIndex(queryId, values);
-            if (keys && keys.length > 0) {
-                return buildIndex(rows, keys);
-            }
-            return rows;
-        },
-        async batchLookup(queryId, keys) {
-            checkBudget();
-            queryCount++;
-            return handlers.batchLookup(queryId, keys, []);
-        },
-        async emit(row) {
-            checkBudget();
-            outputRows++;
-            onEmit(row);
-        },
+export function normalizeScriptBudget(value = {}) {
+    return {
+        max_queries: positive(value.max_queries, 12, "max_queries"),
+        max_query_rows: positive(value.max_query_rows, 1_000_000, "max_query_rows"),
+        max_index_rows: positive(value.max_index_rows, 100_000, "max_index_rows"),
+        max_batch_keys: positive(value.max_batch_keys, 2_000, "max_batch_keys"),
+        max_output_rows: positive(value.max_output_rows, 500_000, "max_output_rows"),
+        max_memory_mb: positive(value.max_memory_mb, 512, "max_memory_mb"),
+        timeout_seconds: positive(value.timeout_seconds, 300, "timeout_seconds"),
+        stream_batch_rows: positive(value.stream_batch_rows, 128, "stream_batch_rows"),
     };
-    // --- load and execute user script ---
-    try {
-        // Cache-bust to allow repeated loads of the same path (needed in tests).
-        const url = `${pathToFileURL(scriptPath).href}?t=${Date.now()}`;
-        const mod = await import(url);
-        if (typeof mod.run !== "function") {
-            throw new ScriptExecutionError("INVALID_SCRIPT", "脚本必须导出 async function run(ctx)");
-        }
-        const runPromise = mod.run(ctx);
-        // Race: user script vs abort vs timeout
-        const racers = [runPromise];
-        const abortP = abortRace(signal);
-        const timeoutP = timeoutRace(timeoutSeconds);
-        if (abortP)
-            racers.push(abortP);
-        if (timeoutP)
-            racers.push(timeoutP);
-        await Promise.race(racers);
-        return { queryCount, outputRows };
+}
+export async function runScriptIsolated(options) {
+    const budget = normalizeScriptBudget(options.budget);
+    if (options.signal?.aborted) {
+        throw new ScriptExecutionError("SCRIPT_CANCELED", "脚本报表执行已取消");
     }
-    catch (error) {
-        if (error instanceof ScriptExecutionError)
-            throw error;
-        if (error instanceof BudgetExceededError ||
-            (error instanceof Error && error.name === "BudgetExceededError")) {
-            throw new ScriptExecutionError("QUERY_BUDGET_EXCEEDED", error.message);
+    const runnerPath = fileURLToPath(new URL("./script-runner.js", import.meta.url));
+    const streams = new Map();
+    let streamSequence = 0;
+    let queryCount = 0;
+    let queryRows = 0;
+    let outputRows = 0;
+    let child;
+    const assertRunning = () => {
+        if (options.signal?.aborted) {
+            throw new ScriptExecutionError("SCRIPT_CANCELED", "脚本报表执行已取消");
         }
-        throw new ScriptExecutionError("SCRIPT_RUNTIME_ERROR", error instanceof Error ? error.message : String(error));
-    }
+    };
+    const countQuery = () => {
+        queryCount += 1;
+        if (queryCount > budget.max_queries) {
+            throw new ScriptExecutionError("QUERY_BUDGET_EXCEEDED", `脚本查询次数超过上限 ${budget.max_queries}`);
+        }
+    };
+    const countRows = (count) => {
+        queryRows += count;
+        if (queryRows > budget.max_query_rows) {
+            throw new ScriptExecutionError("QUERY_ROW_BUDGET_EXCEEDED", `脚本累计查询行数超过上限 ${budget.max_query_rows}`);
+        }
+    };
+    const terminate = () => {
+        if (!child || child.killed)
+            return;
+        child.kill("SIGTERM");
+        const timer = setTimeout(() => child?.kill("SIGKILL"), 1_000);
+        timer.unref();
+    };
+    return new Promise((resolvePromise, rejectPromise) => {
+        let settled = false;
+        const finish = (error, result) => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timeout);
+            options.signal?.removeEventListener("abort", onAbort);
+            terminate();
+            if (error)
+                rejectPromise(error);
+            else
+                resolvePromise(result);
+        };
+        const onAbort = () => finish(new ScriptExecutionError("SCRIPT_CANCELED", "脚本报表执行已取消"));
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        const timeout = setTimeout(() => finish(new ScriptExecutionError("SCRIPT_TIMEOUT", `脚本执行超过上限 ${budget.timeout_seconds} 秒`)), budget.timeout_seconds * 1_000);
+        child = fork(runnerPath, [], {
+            execArgv: [
+                "--permission",
+                `--allow-fs-read=${runnerPath}`,
+                `--allow-fs-read=${options.scriptPath}`,
+                `--max-old-space-size=${Math.max(16, budget.max_memory_mb)}`,
+            ],
+            stdio: ["ignore", "ignore", "ignore", "ipc"],
+        });
+        const sendResult = (requestId, ok, value, error) => {
+            child?.send({
+                type: "result",
+                requestId,
+                ok,
+                ...(ok ? { value } : {
+                    error: {
+                        code: String(error?.code ?? "SCRIPT_RUNTIME_FAILED"),
+                        message: error instanceof Error ? error.message : String(error),
+                    },
+                }),
+            });
+        };
+        child.on("message", async (message) => {
+            if (settled)
+                return;
+            if (message?.type === "ready") {
+                child?.send({
+                    type: "start",
+                    scriptPath: options.scriptPath,
+                    input: { filters: options.filters ?? {}, context: options.context ?? {} },
+                });
+                return;
+            }
+            if (message?.type === "completed") {
+                finish(undefined, { outputRows, queryRows, queryCount });
+                return;
+            }
+            if (message?.type === "failed") {
+                finish(new ScriptExecutionError(String(message.error?.code ?? "SCRIPT_FAILED"), String(message.error?.message ?? "脚本执行失败")));
+                return;
+            }
+            if (message?.type !== "call")
+                return;
+            const requestId = String(message.requestId);
+            const payload = message.payload ?? {};
+            try {
+                assertRunning();
+                if (message.method === "openQueryStream") {
+                    countQuery();
+                    const iterable = await options.handlers.queryStream(String(payload.queryId), payload.values ?? []);
+                    const streamId = `stream-${++streamSequence}`;
+                    streams.set(streamId, iterable[Symbol.asyncIterator]());
+                    sendResult(requestId, true, { streamId });
+                }
+                else if (message.method === "nextQueryStream") {
+                    const iterator = streams.get(String(payload.streamId));
+                    if (!iterator)
+                        throw new ScriptExecutionError("STREAM_NOT_FOUND", "查询流不存在");
+                    const rows = [];
+                    let done = false;
+                    while (rows.length < budget.stream_batch_rows) {
+                        const next = await iterator.next();
+                        if (next.done) {
+                            done = true;
+                            streams.delete(String(payload.streamId));
+                            break;
+                        }
+                        rows.push(next.value);
+                    }
+                    countRows(rows.length);
+                    sendResult(requestId, true, { rows, done });
+                }
+                else if (message.method === "closeQueryStream") {
+                    const iterator = streams.get(String(payload.streamId));
+                    streams.delete(String(payload.streamId));
+                    await iterator?.return?.();
+                    sendResult(requestId, true, null);
+                }
+                else if (message.method === "loadIndex") {
+                    countQuery();
+                    const rows = await options.handlers.loadIndex(String(payload.queryId), payload.values ?? []);
+                    if (rows.length > budget.max_index_rows) {
+                        throw new ScriptExecutionError("INDEX_LIMIT_EXCEEDED", `索引查询结果超过上限 ${budget.max_index_rows}`);
+                    }
+                    countRows(rows.length);
+                    sendResult(requestId, true, rows);
+                }
+                else if (message.method === "batchLookup") {
+                    const keys = payload.keys ?? [];
+                    if (!Array.isArray(keys) || keys.length > budget.max_batch_keys) {
+                        throw new ScriptExecutionError("BATCH_KEY_LIMIT_EXCEEDED", `批量查询键数量超过上限 ${budget.max_batch_keys}`);
+                    }
+                    countQuery();
+                    const rows = await options.handlers.batchLookup(String(payload.queryId), keys, payload.values ?? []);
+                    countRows(rows.length);
+                    sendResult(requestId, true, rows);
+                }
+                else if (message.method === "emit") {
+                    outputRows += 1;
+                    if (outputRows > budget.max_output_rows) {
+                        throw new ScriptExecutionError("OUTPUT_ROW_LIMIT_EXCEEDED", `脚本输出行数超过上限 ${budget.max_output_rows}`);
+                    }
+                    await options.onEmit(payload.row);
+                    sendResult(requestId, true, null);
+                }
+                else {
+                    throw new ScriptExecutionError("UNKNOWN_SCRIPT_CALL", `未知脚本调用：${message.method}`);
+                }
+            }
+            catch (error) {
+                sendResult(requestId, false, undefined, error);
+            }
+        });
+        child.on("error", (error) => finish(error));
+        child.on("exit", (code, signal) => {
+            if (!settled) {
+                finish(new ScriptExecutionError("SCRIPT_PROCESS_EXITED", `脚本隔离进程异常退出（code=${code ?? "null"}, signal=${signal ?? "null"}）`));
+            }
+        });
+    });
 }
 //# sourceMappingURL=script-runtime.js.map
