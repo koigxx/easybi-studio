@@ -29,7 +29,7 @@
 
 ### 当前版本
 
-- Bundle `1.35.1`、知识库 Skill `0.16.0`、报表 Skill `2.32.0`（开发版）。
+- Bundle `1.35.4`、知识库 Skill `0.16.0`、报表 Skill `2.34.1`（开发版）。
 - 数据库支持：MySQL（默认）与 PostgreSQL，经方言层分派；连接类型在配置页可选。
 - 每个 Skill 含面向开发者/管理员的 `使用说明.md`；报表计划为 v2，报表包支持 v2 声明式和 v3 隔离脚本（v1 不读取、不迁移、不执行）；Runtime HTTP API 仍为 v1。
 - 每次同步生成新的不可变版本缓存与 `vendor/easybi-bundle` 快照，不覆盖旧缓存。
@@ -45,6 +45,32 @@
 ---
 
 ## ② 变更历史（倒序）
+
+### 模型字段来源兼容与字段目录完整性（2026-07-27）
+
+- **根因修复**：Workspace SDK 同时识别新版 `metrics[].source.table_alias/field` 与旧版扁平 `source_alias/source_field`，不再因模型格式演进而把已映射指标显示成“未映射”。
+- **直接字段可追溯**：查询输出未显式写 `source` 时，仅在已选源字段中存在唯一同名列时回推 `alias.field`；同名列跨表时保持空值，避免猜错来源。`output_fields` 同步返回查询列、类型和已解析来源。
+- **字段目录完整性**：读取查询契约时合并 `output` 与新版 `aggregations`，并按输出字段/结果粒度标识直接字段，使客户名称、客户简称和基础汇总指标都出现在同一字段目录及其来源列中。
+- **验证**：Workspace SDK 63/63、Studio Web 103/103、两个包 typecheck 通过；以 `transport-test/report-1` 实际模型验证 `shipper_name → t0.shipper_name`、`customer_abbreviation → t0.customer_abbreviation`，以及订单数、件数、重量、体积四个基础指标来源均正确。
+
+### 指标语义保真与自动建模候选（bundle 1.35.4）（2026-07-27）
+
+- **报表输入到建模的语义链路**：`inspect` 保留业务指标的聚合、来源、去重键、条件与对比意图；件数/重量/体积/金额类总和默认推断为 `sum`，订单/运单/派车单数量保持 `count_distinct`。
+- **自动比较建模**：环比/同比变化字段被识别为 comparison 派生指标，不再误报成缺失物理字段；高置信基础总量会绑定到主事实表的规范总量列，比较指标绑定到相应基础指标。
+- **减少无效确认**：高置信候选会预填入 Discovery 模型、来源字段白名单与 Context Pack；只有真正无法判断的口径才进入统一确认。
+- **验证**：报表 Skill 90/90 通过；客户货量分析表的重新 inspect/init-model 已确认 10 个高置信指标假设、0 个业务确认问题。
+
+### 复杂对比脚本分流与受控时间分组（bundle 1.35.3）（2026-07-27）
+
+- **计算图驱动执行阶段**：只要计算图的输出节点要求脚本执行，模型会确定性提升为 `script` 策略并同步执行计划，Studio 因而完成查询编译后进入脚本编译，避免 SQL 基础指标与环比/同比脚本输出被错误地按纯 SQL 包封存。
+- **安全时间分组**：`GROUP BY` 新增受控 `DATE_FORMAT(alias.field, '%Y-%m'|'%Y%m'|'%Y-%m-%d')` 支持；列引用和格式字面量均白名单校验，未开放任意 SQL 表达式。
+- **验证**：报表 Skill回归通过，覆盖脚本策略提升和月份分组 SQL；全仓质量门禁执行通过。
+
+### 默认创建时间筛选与脚本输出契约（bundle 1.35.2）（2026-07-27）
+
+- **默认时间筛选可追溯**：知识库识别或报表维护页指定的创建时间会写入 `default_time_filter` 和 `semantic_plan.time_semantics`，对应参数标记 `system_role=default_time_filter`、`required=true`、`output=false`。创建时间继续是默认筛选和排序依据，但不再被误解为必然输出列。
+- **v3 字段一致性门禁**：脚本包测试期望列改由最终 `fields.json` 派生；校验会拒绝 `tests/cases.json.expected_columns` 与字段清单不一致的制品，避免筛选列误入导出结果契约。
+- **验证**：报表 Skill 90/90、TypeScript 编译及 `git diff --check` 通过。
 
 ### 计算图确定性编译契约（bundle 1.35.1）（2026-07-27）
 

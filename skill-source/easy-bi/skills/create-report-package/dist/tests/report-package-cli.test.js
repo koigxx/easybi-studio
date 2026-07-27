@@ -301,6 +301,19 @@ test("create-time is a required datetime range filter", async () => {
     assert.deepEqual(ct.operators, ["between", "gte", "lte"]);
     // Forced required even though the knowledge fixture marks it required:false.
     assert.equal(ct.required, true);
+    assert.equal(ct.system_role, "default_time_filter");
+    assert.equal(ct.output, false);
+    assert.deepEqual(plan.semantic_plan.time_semantics, [{
+            role: "default_filter",
+            field: "t0.create_time",
+            parameter_id: "create_time",
+            value_type: "datetime_range",
+            required: true,
+            output: false,
+            source: "knowledge_auto",
+        }]);
+    assert.equal(plan.default_time_filter.field, "create_time");
+    assert.equal(plan.default_time_filter.output, false);
     // Non-date filters stay single-value and optional.
     const code = plan.parameters.find((p) => p.id === "code");
     assert.equal(code.value_type, "string");
@@ -590,7 +603,7 @@ test("v2 SQL aggregate fields generate GROUP BY and parameterized HAVING", async
                 "t0.id",
                 "t0.code",
                 "t0.name",
-                "t0.create_time",
+                "DATE_FORMAT(t0.create_time, '%Y-%m')",
                 "t1.product_name",
             ],
             having: [],
@@ -604,6 +617,7 @@ test("v2 SQL aggregate fields generate GROUP BY and parameterized HAVING", async
     const sql = await readFile(join(packageRoot, "queries", "main.sql"), "utf8");
     assert.match(sql, /SUM\(t1\.`qty`\) AS `qty`/);
     assert.match(sql, /GROUP BY t0\.`id`, t0\.`code`/);
+    assert.match(sql, /DATE_FORMAT\(t0\.`create_time`, '%Y-%m'\)/);
     assert.match(sql, /HAVING\n  1 = 1\n\/\* EASYBI_HAVING_FILTERS \*\//);
     const bindings = JSON.parse(await readFile(join(packageRoot, "queries", "bindings.json"), "utf8"));
     assert.equal(bindings.parameters.find((item) => item.id === "qty").clause, "having");
@@ -1802,8 +1816,19 @@ test("v3 script package requires a readable semantic/execution plan and locks ea
     assert.doesNotMatch(compiledScript, /ctx:\s*any/);
     const lock = JSON.parse(await readFile(join(packageRoot, "knowledge.lock.json"), "utf8"));
     assert.equal(lock.script_query_sources.length, 3);
+    const outputFields = JSON.parse(await readFile(join(packageRoot, "fields.json"), "utf8"));
+    const testCasesPath = join(packageRoot, "tests", "cases.json");
+    const testCases = JSON.parse(await readFile(testCasesPath, "utf8"));
+    assert.deepEqual(testCases.cases[0].expected_columns, outputFields.fields.map((field) => field.id));
     const validation = await validatePackage(packageRoot);
     assert.equal(validation.valid, true, validation.errors.join("\n"));
+    // A filter-only field must not leak into the report-output expectation.
+    testCases.cases[0].expected_columns = [...testCases.cases[0].expected_columns, "create_time"];
+    await writeFile(testCasesPath, JSON.stringify(testCases, null, 2));
+    await resealPackage(packageRoot);
+    const mismatched = await validatePackage(packageRoot);
+    assert.equal(mismatched.valid, false);
+    assert.match(mismatched.errors.join("\n"), /expected_columns 必须与 fields.json 输出字段完全一致/);
     const contextPath = join(fixture.workspace, "work", "report-context.json");
     const context = await buildKnowledgeContext({ plan: fixture.plan, out: contextPath });
     assert.equal(context.selected_table_count, 2);
@@ -1823,7 +1848,9 @@ test("staged report model builds query/script context packs without leaking phys
     assert.ok(Array.isArray(model.output_fields));
     model.result_grain.keys = ["code"];
     model.open_questions = [];
-    model.recommended_strategy = "script";
+    // The model author may select SQL for base aggregates, but comparison nodes
+    // are compiled as script outputs and must promote the whole package route.
+    model.recommended_strategy = "sql";
     model.query_contracts[0].sources[0].fields.push("not-approved-field");
     assert.match(validateReportModelValue(model).join("\n"), /模型外字段/);
     model.query_contracts[0].sources[0].fields.pop();
@@ -1847,7 +1874,7 @@ test("staged report model builds query/script context packs without leaking phys
                 output_type: "number",
                 depends_on: ["driver_count"],
                 expression: "{driver_count} * 2",
-                execution_hint: "auto",
+                execution_hint: "script",
                 output: true,
             },
         ],
@@ -1866,6 +1893,7 @@ test("staged report model builds query/script context packs without leaking phys
     await writeFile(modelPath, JSON.stringify(model, null, 2));
     const approved = await approveReportModel(modelPath, "model-reviewer", fixture.plan);
     assert.equal(validateReportModelValue(approved, true).length, 0);
+    assert.equal(approved.recommended_strategy, "script");
     const compiled = compileCalculationPlan(approved);
     assert.equal(compiled.version, "2");
     assert.deepEqual(compiled.steps.map((step) => step.id), ["driver_count", "driver_count_double"]);

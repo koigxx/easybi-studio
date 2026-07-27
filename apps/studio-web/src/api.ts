@@ -599,6 +599,9 @@ export interface ReportModelOutputField {
   kind: 'data' | 'metric' | 'calculation';
   route: 'query' | 'metric' | 'calculation_graph';
   queryId: string;
+  queryColumn: string;
+  source: string;
+  type: string;
   metricId: string;
   calculationNode: string;
 }

@@ -143,6 +143,51 @@ describe('current report model', () => {
     }
   });
 
+  it('normalizes structured metric lineage and exposes direct query-field lineage', async () => {
+    const modelPath = join(ws, 'reports', 'models', 'r1', 'report-model.json');
+    const model = JSON.parse(await readFile(modelPath, 'utf8')) as TestModel & {
+      metrics: unknown[];
+      query_contracts: Array<Record<string, unknown>>;
+      output_fields?: unknown[];
+    };
+    model.metrics = [
+      {
+        id: 'amount_total',
+        label: '金额合计',
+        source: { table_alias: 't0', field: 'customer_id' },
+        aggregation: 'sum',
+        distinct_key: null,
+      },
+    ];
+    model.query_contracts[0]!.output = [
+      { name: 'customer_id', label: '客户 ID', type: 'string' },
+    ];
+    model.query_contracts[0]!.aggregations = [
+      { name: 'amount_total', label: '金额合计', type: 'decimal' },
+    ];
+    model.output_fields = [
+      { id: 'customer_id', label: '客户 ID', kind: 'data', route: 'query', query_id: 'main', query_column: 'customer_id', type: 'string' },
+      { id: 'amount_total', label: '金额合计', kind: 'metric', route: 'query', query_id: 'main', query_column: 'amount_total', type: 'decimal' },
+    ];
+    model.approval = { status: 'approved', model_hash: hashModel(model) };
+    await json(modelPath, model);
+
+    const detail = await readReportModel(ws, 'r1');
+    expect(detail.metrics[0]).toMatchObject({
+      sourceAlias: 't0',
+      sourceField: 'customer_id',
+      dedupKey: '',
+    });
+    expect(detail.queryContracts[0]?.outputColumns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'customer_id', role: 'group_key', source: 't0.customer_id' }),
+      expect.objectContaining({ name: 'amount_total', role: 'metric', source: 't0.customer_id' }),
+    ]));
+    expect(detail.outputFields).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'customer_id', queryColumn: 'customer_id', source: 't0.customer_id' }),
+      expect.objectContaining({ id: 'amount_total', queryColumn: 'amount_total', source: 't0.customer_id' }),
+    ]));
+  });
+
   it('edits fields and relationships, approves the model, and updates its minimal source lock', async () => {
     const detail = await readReportModel(ws, 'r1');
     const saved = await writeReportModel(ws, 'r1', {

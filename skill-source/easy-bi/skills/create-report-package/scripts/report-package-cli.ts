@@ -514,6 +514,34 @@ function normalizeColumnReference(
   return { alias: match[1]!, field: match[2]! };
 }
 
+/**
+ * Grouping accepts a bare locked column or a deliberately tiny, dialect-owned
+ * date bucket expression. Do not pass arbitrary SQL through this path: format
+ * literals and referenced columns are both whitelisted here.
+ */
+function normalizeGroupByExpression(
+  value: unknown,
+  availableColumns: Map<string, Set<string>>,
+  dialect: SqlDialect,
+): string {
+  const raw = String(value ?? "").trim();
+  if (COLUMN_REF_RE.test(raw)) {
+    const ref = normalizeColumnReference(raw, availableColumns);
+    return columnExpression(ref.alias, ref.field, dialect);
+  }
+  const match = raw.match(
+    /^DATE_FORMAT\(\s*([A-Za-z][A-Za-z0-9_]*)\.(?:`)?([A-Za-z0-9_$]+)(?:`)?\s*,\s*'(%Y-%m|%Y%m|%Y-%m-%d)'\s*\)$/i,
+  );
+  if (!match) {
+    throw new Error(`分组表达式不支持：${raw}；仅支持 alias.field 或 DATE_FORMAT(alias.field, '%Y-%m'|'%Y%m'|'%Y-%m-%d')`);
+  }
+  const [, alias, field, format] = match;
+  if (!availableColumns.get(alias!)?.has(field!)) {
+    throw new Error(`分组表达式引用了未知列：${alias}.${field}`);
+  }
+  return `DATE_FORMAT(${columnExpression(alias!, field!, dialect)}, '${format}')`;
+}
+
 function parseFieldReference(value: string): {
   database?: string;
   table?: string;
@@ -918,6 +946,23 @@ export async function inspectReport(options: {
   const blockers: JsonRecord[] = [];
   const warnings: JsonRecord[] = [];
   const resolvedFields: JsonRecord[] = [];
+  const metricAggregation = (label: string, configured: unknown): string => {
+    if (/订单(数|数量)|运单(数|数量)|派车单(数|数量)/u.test(label)) return "count_distinct";
+    if (/件数|数量|重量|体积|金额|费用|运费/u.test(label)) return "sum";
+    if (typeof configured === "string" && configured.trim()) return configured;
+    if (/比例|比率|率$/u.test(label)) return "ratio";
+    if (/均值|平均/u.test(label)) return "avg";
+    return "count_distinct";
+  };
+  const comparisonIntent = (label: string): JsonRecord | null => {
+    const mode = label.includes("环比") ? "chain" : label.includes("同比") ? "yoy" : "";
+    if (!mode) return null;
+    return {
+      mode,
+      operation: /率$/u.test(label) ? "percent_change" : "subtract",
+      base_label: label.replace(/(环比|同比)/gu, "").replace(/(变化量|变化率|增减额|增减率|差额|比率)$/u, "").trim(),
+    };
+  };
 
   for (const [index, requestedField] of (
     requirement.required_fields ?? []
@@ -964,24 +1009,14 @@ export async function inspectReport(options: {
       });
       continue;
     }
+    const comparison = comparisonIntent(String(label ?? raw));
     const inferredMetric =
-      roles.includes("metric") ||
+      comparison !== null || roles.includes("metric") ||
       (!explicitBinding &&
         /数量|总数|合计|金额|总额|比例|比率|率$|均值|平均/u.test(String(label ?? raw)));
     if (inferredMetric) {
       const fieldId = stableId(String(label ?? raw)).replaceAll("-", "_");
-      const aggregation =
-        typeof requestedObject?.aggregation === "string"
-          ? requestedObject.aggregation
-          : /比例|比率|率$/u.test(String(label ?? raw))
-            ? "ratio"
-            : /数量|总数|数$/u.test(String(label ?? raw))
-              ? "count_distinct"
-              : /金额|总额|合计/u.test(String(label ?? raw))
-                ? "sum"
-                : /均值|平均/u.test(String(label ?? raw))
-                  ? "avg"
-                  : "count_distinct";
+      const aggregation = metricAggregation(String(label ?? raw), requestedObject?.aggregation);
       blockers.push({
         code: "METRIC_REQUIRES_MODELING",
         field: raw,
@@ -991,7 +1026,7 @@ export async function inspectReport(options: {
         roles: roles.length ? roles : ["metric", "output"],
         metric_intent: {
           aggregation,
-          source_field: String(requestedObject?.metric?.source_field ?? requestedObject?.source_field ?? requestedObject?.field ?? "").trim() || null,
+          source_field: comparison ? null : (String(requestedObject?.metric?.source_field ?? requestedObject?.source_field ?? requestedObject?.field ?? "").trim() || null),
           distinct_field: String(requestedObject?.metric?.distinct_field ?? requestedObject?.distinct_field ?? "").trim() || null,
           conditions: requestedObject?.metric?.conditions ?? [],
           entity: String(label ?? raw).includes("派车单")
@@ -999,8 +1034,9 @@ export async function inspectReport(options: {
             : String(label ?? raw).includes("运单")
               ? "运单"
               : String(label ?? raw).includes("订单")
-                ? "订单"
-                : null,
+              ? "订单"
+              : null,
+          ...(comparison ? { comparison } : {}),
         },
         message: `指标「${String(label ?? raw)}」需要在建模阶段确认来源字段、聚合方式、去重键和条件口径`,
       });
@@ -1132,6 +1168,41 @@ export async function inspectReport(options: {
     field.source.kind = "column";
     field.source.alias = aliasesByTable.get(tableKey(field.source));
   }
+  // Preserve high-confidence, conventional totals on the selected fact table.
+  // This is intentionally narrow: an ambiguous metric remains a blocker rather
+  // than guessing across tables, while the common order total fields can proceed
+  // to modeling without a needless question.
+  const primaryAlias = sourceTables[0]?.alias ?? "t0";
+  const primaryFieldNames = new Set((primaryTable?.physical_fields ?? []).map((field: JsonRecord) => String(field.physical?.name ?? "")));
+  const primaryMetricKey = (primaryTable?.physical_fields ?? []).find((field: JsonRecord) => field.physical?.primary_key)?.physical?.name;
+  const boundMetrics = new Map<string, JsonRecord>();
+  for (const blocker of blockers) {
+    if (blocker.code !== "METRIC_REQUIRES_MODELING") continue;
+    const intent = blocker.metric_intent as JsonRecord;
+    if (intent.comparison) continue;
+    const label = String(blocker.label ?? "");
+    const candidates = String(intent.aggregation) === "count_distinct"
+      ? [primaryMetricKey]
+      : /件数|数量/u.test(label) ? ["total_quantity", "quantity"]
+      : /重量/u.test(label) ? ["total_weight", "weight"]
+      : /体积/u.test(label) ? ["total_volume", "volume"]
+      : /金额|费用|运费/u.test(label) ? ["total_amount", "amount", "transport_price"] : [];
+    const match = candidates.find((name): name is string => Boolean(name && primaryFieldNames.has(name)));
+    if (!match) continue;
+    intent.source_field = `${primaryAlias}.${match}`;
+    intent.confidence = "high";
+    boundMetrics.set(label.replace(/总和$/u, ""), blocker);
+  }
+  for (const blocker of blockers) {
+    const intent = blocker.metric_intent as JsonRecord | undefined;
+    const comparison = intent?.comparison as JsonRecord | undefined;
+    if (!comparison) continue;
+    const base = boundMetrics.get(String(comparison.base_label ?? ""));
+    if (base) {
+      comparison.base_metric_id = base.field_id;
+      comparison.confidence = "high";
+    }
+  }
   if (tableKeys.size > 1) {
     blockers.push({
       code: "JOIN_REQUIRED",
@@ -1152,6 +1223,18 @@ export async function inspectReport(options: {
   const engine = resolveEngine(config, sourceTables[0]?.profile_id);
   const dialect = getSqlDialect(engine);
   const alias = sourceTables[0]?.alias ?? "t0";
+  // The report requirement may name a preferred business time field. Resolve it
+  // against the real primary-table candidates, then persist one canonical
+  // default-filter record. This is filter metadata, never an output-column rule.
+  const timeCandidates = findCreateTimeCandidates(primaryTable);
+  const requestedTimeField = String(requirement.time_semantics?.field ?? "")
+    .trim()
+    .split(".")
+    .filter(Boolean)
+    .pop();
+  const selectedTimeCandidate =
+    timeCandidates.find((candidate) => candidate.field === requestedTimeField) ??
+    timeCandidates[0];
   const parameters = resolvedFields
     .filter(
       (field) =>
@@ -1178,6 +1261,11 @@ export async function inspectReport(options: {
             ? effectiveFilter.default_operator
             : operators[0],
         required: Boolean(effectiveFilter.required),
+        ...(selectedTimeCandidate &&
+        field.source.alias === alias &&
+        field.source.field === selectedTimeCandidate.field
+          ? { system_role: "default_time_filter", output: false }
+          : {}),
         sql_binding: {
           expression: columnExpression(field.source.alias, field.source.field, dialect),
           clause: "where",
@@ -1225,7 +1313,7 @@ export async function inspectReport(options: {
   // column even when create-time is NOT one of the report's output fields — the
   // column just has to exist on the table. Broad name/label matching keeps this
   // working across create_time / created_at / gmt_create / 创建时间 conventions.
-  const createTimeField = findCreateTimeColumn(primaryTable);
+  const createTimeField = selectedTimeCandidate?.field ?? findCreateTimeColumn(primaryTable);
   const idField = primaryTable?.physical_fields?.some(
     (field: JsonRecord) => field.physical?.name === "id",
   )
@@ -1314,10 +1402,22 @@ export async function inspectReport(options: {
             id: blocker.field_id,
             label: blocker.label ?? blocker.field,
             definition: blocker.description ?? "",
+            kind: blocker.code === "METRIC_REQUIRES_MODELING" ? "metric" : "value",
+            metric_intent: blocker.metric_intent ?? null,
           })),
       ],
       distinct_keys: {},
-      time_semantics: [],
+      time_semantics: selectedTimeCandidate
+        ? [{
+            role: "default_filter",
+            field: `${alias}.${selectedTimeCandidate.field}`,
+            parameter_id: selectedTimeCandidate.field,
+            value_type: selectedTimeCandidate.value_type,
+            required: true,
+            output: false,
+            source: requestedTimeField ? "requirement" : "knowledge_auto",
+          }]
+        : [],
       exclusions: [],
       open_questions: blockers.map((blocker: JsonRecord) => ({
         id: String(blocker.field_id ?? `q_unknown`),
@@ -1370,9 +1470,24 @@ export async function inspectReport(options: {
     // period_param defaulting in configure-plan). Each carries the alias/field
     // and the range value_type needed to synthesize a required filter. Empty
     // when the primary table has no date/datetime create-time column.
-    default_period_candidates: findCreateTimeCandidates(primaryTable).map(
+    default_period_candidates: timeCandidates.map(
       (candidate) => ({ alias, ...candidate }),
     ),
+    ...(selectedTimeCandidate
+      ? {
+          default_time_filter: {
+            role: "default_filter",
+            alias,
+            field: selectedTimeCandidate.field,
+            label: selectedTimeCandidate.label,
+            value_type: selectedTimeCandidate.value_type,
+            parameter_id: selectedTimeCandidate.field,
+            required: true,
+            output: false,
+            source: requestedTimeField ? "requirement" : "knowledge_auto",
+          },
+        }
+      : {}),
     warnings,
     blockers,
     approval: {
@@ -1531,7 +1646,7 @@ function validatePlanV2(plan: JsonRecord): string[] {
       }
     }
     for (const item of plan.aggregation?.group_by ?? []) {
-      normalizeColumnReference(item, columns);
+      normalizeGroupByExpression(item, columns, dialectForPlan(plan));
     }
     // A computed field is transform-produced and cannot be a SQL (WHERE/HAVING)
     // filter. It CAN be a `post_transform` filter (evaluated in memory against the
@@ -3797,10 +3912,11 @@ export async function buildKnowledgeContext(options: {
     (metric: JsonRecord, index: number) => {
       const label = String(metric.label ?? metric.id ?? `metric-${index + 1}`);
       const description = String(metric.definition ?? "");
+      const intent = metric.metric_intent as JsonRecord | undefined;
       const isMetric =
         /数量|总数|合计|金额|总额|比例|比率|率$|均值|平均/.test(label) ||
         String(metric.kind ?? "") === "metric";
-      const aggregation = /比例|比率|率$/.test(label)
+      const aggregation = String(intent?.aggregation ?? "") || (/比例|比率|率$/.test(label)
         ? "ratio"
         : /数量|总数|数$/.test(label)
           ? "count_distinct"
@@ -3808,9 +3924,9 @@ export async function buildKnowledgeContext(options: {
             ? "sum"
             : /平均|均值/.test(label)
               ? "avg"
-              : isMetric
+                : isMetric
                 ? "count_distinct"
-                : "value";
+                : "value");
       const rawStatusSemantic = label
         .replace(/的?(订单|运单|派车单)?(数量|总数|数|合计)$/u, "")
         .trim();
@@ -3829,10 +3945,15 @@ export async function buildKnowledgeContext(options: {
         id: String(metric.id ?? `metric-${index + 1}`),
         label,
         description,
-        kind: isMetric ? "metric" : "value",
+        kind: String(metric.kind ?? "") === "metric" || isMetric ? "metric" : "value",
         aggregation,
-        entity,
+        entity: String(intent?.entity ?? entity),
         status_semantic: statusSemantic && statusSemantic !== label ? statusSemantic : null,
+        source_field: intent?.source_field ?? null,
+        distinct_field: intent?.distinct_field ?? null,
+        conditions: intent?.conditions ?? [],
+        comparison: intent?.comparison ?? null,
+        confidence: intent?.confidence ?? null,
       };
     },
   );
@@ -4297,6 +4418,11 @@ function modelSourceFields(plan: JsonRecord, table: JsonRecord): string[] {
       }
     }
   }
+  for (const metric of plan.semantic_plan?.metrics ?? []) {
+    const source = String(metric.metric_intent?.source_field ?? "");
+    const [alias, field] = source.split(".");
+    if (alias === table.alias && field) names.add(field);
+  }
   for (const condition of table.system_conditions ?? []) {
     if (condition.field) names.add(String(condition.field));
   }
@@ -4515,6 +4641,22 @@ export async function initializeReportModel(options: { plan: string; out: string
       ...metric,
       distinct_key: plan.semantic_plan?.distinct_keys?.[metric.id] ?? null,
     })),
+    ...(() => {
+      const hypotheses = (plan.semantic_plan?.metrics ?? [])
+        .filter((metric: JsonRecord) => Boolean(metric.metric_intent?.source_field) || Boolean(metric.metric_intent?.comparison?.base_metric_id))
+        .map((metric: JsonRecord) => ({
+          id: metric.id,
+          label: metric.label,
+          aggregation: metric.metric_intent?.aggregation,
+          source_field: metric.metric_intent?.source_field ?? null,
+          distinct_field: metric.metric_intent?.distinct_field ?? null,
+          conditions: metric.metric_intent?.conditions ?? [],
+          comparison: metric.metric_intent?.comparison ?? null,
+          confidence: metric.metric_intent?.confidence ?? "high",
+          evidence: "inspect 高置信候选",
+        }));
+      return hypotheses.length ? { metric_hypotheses: hypotheses } : {};
+    })(),
     filters: plan.parameters ?? [],
     time_semantics: plan.semantic_plan?.time_semantics ?? [],
     exclusions: plan.semantic_plan?.exclusions ?? [],
@@ -4526,8 +4668,23 @@ export async function initializeReportModel(options: { plan: string; out: string
     open_questions: (() => {
       const seen = new Map<string, JsonRecord>();
       const add = (item: JsonRecord) => { seen.set(String(item.id ?? ''), item); };
-      for (const item of (plan.semantic_plan?.open_questions ?? [])) add(item);
+      const resolvedMetricIds = new Set(
+        (plan.blockers ?? [])
+          .filter((blocker: JsonRecord) => {
+            const intent = blocker.metric_intent as JsonRecord | undefined;
+            return blocker.code === "METRIC_REQUIRES_MODELING" &&
+              (Boolean(intent?.source_field) || Boolean(intent?.comparison?.base_metric_id));
+          })
+          .map((blocker: JsonRecord) => String(blocker.field_id ?? "")),
+      );
+      for (const item of (plan.semantic_plan?.open_questions ?? [])) {
+        if (!resolvedMetricIds.has(String(item.id ?? ""))) add(item);
+      }
       for (const blocker of (plan.blockers ?? [])) {
+        const intent = blocker.metric_intent as JsonRecord | undefined;
+        const isResolvedMetric = blocker.code === "METRIC_REQUIRES_MODELING" &&
+          (Boolean(intent?.source_field) || Boolean(intent?.comparison?.base_metric_id));
+        if (isResolvedMetric) continue;
         add({
           id: String(blocker.field_id ?? `q_${String(blocker.code ?? 'unknown')}`),
           question: String(blocker.message ?? ''),
@@ -4712,7 +4869,7 @@ function normalizeFinalReportModelValue(model: JsonRecord): JsonRecord {
     };
   });
   const queryIds = new Set(queryContracts.map((query: JsonRecord) => String(query.id ?? "")));
-  const normalized = {
+  const normalized: JsonRecord = {
     ...model,
     sources,
     relationships,
@@ -4721,7 +4878,21 @@ function normalizeFinalReportModelValue(model: JsonRecord): JsonRecord {
       ? model.output_fields.filter((field: JsonRecord) => !field.query_id || queryIds.has(String(field.query_id)))
       : model.output_fields,
   };
-  return { ...normalized, output_fields: deriveOutputFields(normalized), calculation_plan: deriveCalculationPlan(normalized) };
+  const preliminaryPlan = compileCalculationPlan(normalized);
+  // A model may describe SQL base metrics plus script-only comparison/merge
+  // nodes. That is a v3 script report as a whole: keeping recommended_strategy
+  // as sql would make Studio skip SCRIPT_COMPILATION and strand those outputs.
+  const requiresScript = (preliminaryPlan.steps ?? []).some(
+    (step: JsonRecord) => step.execution === "script" && step.output === true,
+  );
+  const executionNormalized = requiresScript && normalized.recommended_strategy !== "script"
+    ? { ...normalized, recommended_strategy: "script", execution_strategy_reason: "calculation_graph_script_output" }
+    : normalized;
+  return {
+    ...executionNormalized,
+    output_fields: deriveOutputFields(executionNormalized),
+    calculation_plan: deriveCalculationPlan(executionNormalized),
+  };
 }
 
 export function validateDiscoveryReportModelValue(model: JsonRecord): string[] {
@@ -5051,7 +5222,7 @@ export async function approveReportModel(
   planPathValue?: string,
 ): Promise<JsonRecord> {
   const path = resolve(modelPath);
-  const model = await readJson(path);
+  const model = normalizeFinalReportModelValue(await readJson(path));
   const preErrors = validateReportModelValue(model, false);
   if (preErrors.length) throw new Error(preErrors.join("；"));
   if ((model.open_questions ?? []).length) throw new Error("仍有待确认问题，不能批准模型");
@@ -5716,7 +5887,14 @@ export async function validateStagedArtifacts(options: {
     errors.push(...validateReportModelValue(model, options.requireApprovedModel ?? ["query", "script"].includes(options.phase)));
     errors.push(...calculationPlanErrors(model));
     const semanticPlan = await readRequiredJson(paths.semanticPlan, "语义计划");
-    const executionPlan = await readRequiredJson(paths.executionPlan, "执行计划");
+    let executionPlan = await readRequiredJson(paths.executionPlan, "执行计划");
+    // Strategy is derived from the approved calculation graph. Keep the
+    // standalone execution-plan artifact aligned so the Job manager schedules
+    // QUERY → SCRIPT rather than finalising an incomplete SQL package.
+    if (String(executionPlan.strategy ?? "") !== String(model.recommended_strategy ?? "")) {
+      executionPlan = { ...executionPlan, strategy: model.recommended_strategy };
+      await writeJson(paths.executionPlan, executionPlan);
+    }
     if (!String(semanticPlan.result_grain ?? "").trim()) errors.push("语义计划缺少 result_grain");
     if (!(executionPlan.steps ?? []).length) errors.push("执行计划缺少 steps");
     if (String(executionPlan.strategy ?? "") !== String(model.recommended_strategy ?? "")) {
@@ -6365,13 +6543,14 @@ export async function finalizeStagedPackage(options: {
   // ensures every report has at least a basic time filter.
   if (!(plan.parameters ?? []).some((p: JsonRecord) => p.value_type === "datetime_range")) {
     const candidate =
+      (plan.default_time_filter as JsonRecord | undefined) ??
       (plan.default_period_candidates ?? [])[0] ??
       (plan.source?.tables ?? []).find((t: JsonRecord) =>
         (t.available_fields ?? []).some((f: string) => f === "create_time"),
       );
     if (candidate) {
       const alias = candidate.alias ?? "t0";
-      const fieldId = "create_time";
+      const fieldId = String(candidate.field ?? "create_time");
       // Also register create_time as a filter-only field so the package validator
       // doesn't reject it ("参数没有对应报表字段").
       const existingFieldIds = new Set((plan.fields ?? []).map((f: JsonRecord) => String(f.id)));
@@ -6392,6 +6571,8 @@ export async function finalizeStagedPackage(options: {
               table: candidate.table ?? "unknown",
             },
             filter: { enabled: false },
+            system_role: "default_time_filter",
+            output: false,
             enum_ref: null,
             roles: [],
             description: "自动注入的时间筛选列",
@@ -6408,6 +6589,8 @@ export async function finalizeStagedPackage(options: {
           operators: ["between", "gte", "lte"],
           default_operator: "between",
           required: true,
+          system_role: "default_time_filter",
+          output: false,
           sql_binding: {
             expression: `${alias}.\`${fieldId}\``,
             clause: "where",
@@ -7187,10 +7370,7 @@ function buildSql(plan: JsonRecord): string {
     "\n  AND ",
   );
   const groupByExpressions = (plan.aggregation?.group_by ?? []).map(
-    (item: string) => {
-      const reference = normalizeColumnReference(item, columns);
-      return columnExpression(reference.alias, reference.field, dialect);
-    },
+    (item: string) => normalizeGroupByExpression(item, columns, dialect),
   );
   const groupBy = groupByExpressions.join(", ");
   const transformOrdering =
@@ -7879,7 +8059,10 @@ async function generateScriptPackage(
       id: "empty-filters",
       filters: {},
       context: {},
-      expected_columns: (plan.fields ?? []).map((field: JsonRecord) => field.id),
+      // Filter-only fields such as create_time may be present in plan.fields so
+      // their bindings can be compiled, but they are not necessarily report
+      // outputs. Test expectations must always follow the actual fields.json.
+      expected_columns: fields.fields.map((field: JsonRecord) => field.id),
     }],
   });
   if (hasEnums) {
@@ -8214,6 +8397,33 @@ async function validateScriptPackage(packageRoot: string): Promise<{
   }
   if (manifest.execution_model !== "isolated_script") errors.push("v3 execution_model 必须是 isolated_script");
   if (String(fields.schema_version) !== "2") errors.push("fields.json 必须使用 schema_version=2");
+  const outputFieldIds = (fields.fields ?? []).map((field: JsonRecord) => String(field.id ?? ""));
+  if (!outputFieldIds.length || outputFieldIds.some((id: string) => !id)) {
+    errors.push("fields.json 必须声明至少一个有效输出字段");
+  }
+  if (new Set(outputFieldIds).size !== outputFieldIds.length) {
+    errors.push("fields.json 输出字段 id 不能重复");
+  }
+  try {
+    const cases = await readJson(join(packageRoot, "tests", "cases.json"));
+    if (!Array.isArray(cases.cases) || !cases.cases.length) {
+      errors.push("v3 测试用例不能为空");
+    } else {
+      for (const testCase of cases.cases) {
+        const actual = Array.isArray(testCase.expected_columns)
+          ? testCase.expected_columns.map(String)
+          : [];
+        if (
+          actual.length !== outputFieldIds.length ||
+          actual.some((id: string, index: number) => id !== outputFieldIds[index])
+        ) {
+          errors.push(`v3 测试用例 ${String(testCase.id ?? "?")} 的 expected_columns 必须与 fields.json 输出字段完全一致`);
+        }
+      }
+    }
+  } catch (error) {
+    errors.push(`v3 测试用例无效：${error instanceof Error ? error.message : String(error)}`);
+  }
   if (!semantic.result_grain || semantic.status !== "approved") errors.push("v3 语义计划必须已批准并明确结果粒度");
   if (execution.strategy !== "script" || execution.status !== "approved" || !(execution.steps ?? []).length) {
     errors.push("v3 执行计划必须已批准且包含脚本步骤");

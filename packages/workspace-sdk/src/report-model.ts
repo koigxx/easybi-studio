@@ -555,6 +555,11 @@ export interface ReportModelOutputField {
   kind: 'data' | 'metric' | 'calculation';
   route: 'query' | 'metric' | 'calculation_graph';
   queryId: string;
+  /** The column name emitted by the query contract. */
+  queryColumn: string;
+  /** Resolved lineage for direct query outputs when it is determinable. */
+  source: string;
+  type: string;
   metricId: string;
   calculationNode: string;
 }
@@ -667,6 +672,53 @@ export async function readReportModel(
     description: metric.evidence ?? '',
   }));
 
+  // Model format v1.35+ keeps source lineage in the structured `source` object.
+  // Older models used the flat source_alias/source_field pair.  Normalize both
+  // forms here so Studio has one stable display/editing contract.
+  const metrics: ReportModelMetric[] = (model.metrics ?? []).map((m: JsonRecord): ReportModelMetric => {
+    const nestedSource = m.source && typeof m.source === 'object' ? m.source as JsonRecord : {};
+    return {
+      id: String(m.id ?? ''),
+      label: String(m.label ?? m.id ?? ''),
+      entity: String(m.entity ?? ''),
+      aggregation: String(m.aggregation ?? ''),
+      sourceTable: String(m.source_table ?? nestedSource.table ?? ''),
+      sourceAlias: String(m.source_alias ?? nestedSource.table_alias ?? nestedSource.alias ?? ''),
+      sourceField: String(m.source_field ?? nestedSource.field ?? ''),
+      dedupKey: String(m.dedup_key ?? m.distinct_key ?? ''),
+      condition: m.condition ? String(m.condition) : null,
+      evidence: String(m.evidence ?? ''),
+      confidence: String(m.confidence ?? 'hypothesis'),
+    };
+  });
+  const configuredOutputFields = Array.isArray(model.output_fields)
+    ? model.output_fields as JsonRecord[]
+    : [];
+  const selectedFieldSources = new Map<string, string[]>();
+  for (const source of sources) {
+    for (const field of source.fields) {
+      const candidates = selectedFieldSources.get(field.name) ?? [];
+      candidates.push(`${source.alias}.${field.name}`);
+      selectedFieldSources.set(field.name, candidates);
+    }
+  }
+  const metricForColumn = (column: JsonRecord): ReportModelMetric | undefined => {
+    const name = String(column.name ?? column.id ?? '');
+    const label = String(column.label ?? name);
+    return metrics.find((metric) => metric.id === name || metric.label === label);
+  };
+  const resolveColumnSource = (column: JsonRecord): string => {
+    const explicit = String(column.source ?? '').trim();
+    if (explicit) return explicit;
+    const metric = metricForColumn(column);
+    if (metric?.sourceAlias && metric.sourceField) return `${metric.sourceAlias}.${metric.sourceField}`;
+    const name = String(column.name ?? column.id ?? '');
+    const candidates = selectedFieldSources.get(name) ?? [];
+    // Only infer an exact physical-name match when there is one unambiguous
+    // selected source.  Joined tables can share column names such as `id`.
+    return candidates.length === 1 ? candidates[0]! : '';
+  };
+
   return {
     reportId: String(model.report?.id ?? reportId),
     reportName: String(model.report?.name ?? reportId),
@@ -711,19 +763,7 @@ export async function readReportModel(
       },
       component: String(f.component ?? ''),
     })),
-    metrics: (model.metrics ?? []).map((m: JsonRecord): ReportModelMetric => ({
-      id: String(m.id ?? ''),
-      label: String(m.label ?? m.id ?? ''),
-      entity: String(m.entity ?? ''),
-      aggregation: String(m.aggregation ?? ''),
-      sourceTable: String(m.source_table ?? ''),
-      sourceAlias: String(m.source_alias ?? ''),
-      sourceField: String(m.source_field ?? ''),
-      dedupKey: String(m.dedup_key ?? ''),
-      condition: m.condition ? String(m.condition) : null,
-      evidence: String(m.evidence ?? ''),
-      confidence: String(m.confidence ?? 'hypothesis'),
-    })),
+    metrics,
     calculationGraph: {
       version: '1',
       persisted: persistedCalculationNodes !== null,
@@ -753,13 +793,28 @@ export async function readReportModel(
       })),
     },
     outputFields: (() => {
-      const configured = Array.isArray(model.output_fields) ? model.output_fields as JsonRecord[] : [];
-      if (configured.length) return configured.map((field) => ({
-        id: String(field.id ?? ''), label: String(field.label ?? field.id ?? ''),
-        kind: String(field.kind ?? 'data') as ReportModelOutputField['kind'],
-        route: String(field.route ?? 'query') as ReportModelOutputField['route'],
-        queryId: String(field.query_id ?? ''), metricId: String(field.metric_id ?? ''), calculationNode: String(field.calculation_node ?? ''),
-      }));
+      if (configuredOutputFields.length) return configuredOutputFields.map((field) => {
+        const queryId = String(field.query_id ?? '');
+        const queryColumn = String(field.query_column ?? field.id ?? '');
+        const contract = (model.query_contracts ?? []).find((item: JsonRecord) => String(item.id ?? '') === queryId);
+        const columns = contract
+          ? [
+              ...((contract.output_contract ?? contract.output ?? []) as JsonRecord[]),
+              ...(Array.isArray(contract.aggregations) ? contract.aggregations as JsonRecord[] : []),
+            ]
+          : [];
+        const column = columns.find((item) => String(item.name ?? item.id ?? '') === queryColumn);
+        return {
+          id: String(field.id ?? ''), label: String(field.label ?? field.id ?? ''),
+          kind: String(field.kind ?? 'data') as ReportModelOutputField['kind'],
+          route: String(field.route ?? 'query') as ReportModelOutputField['route'],
+          queryId,
+          queryColumn,
+          source: column ? resolveColumnSource(column) : '',
+          type: String(field.type ?? column?.type ?? ''),
+          metricId: String(field.metric_id ?? ''), calculationNode: String(field.calculation_node ?? ''),
+        };
+      });
       const seen = new Set<string>();
       return (model.query_contracts ?? []).flatMap((contract: JsonRecord) =>
         (contract.output_contract ?? contract.output ?? []).flatMap((column: JsonRecord | string) => {
@@ -767,7 +822,7 @@ export async function readReportModel(
           const id = String(item.name ?? item.id ?? '');
           if (!id || seen.has(id)) return [];
           seen.add(id);
-          return [{ id, label: String(item.label ?? id), kind: 'data' as const, route: 'query' as const, queryId: String(contract.id ?? ''), metricId: '', calculationNode: '' }];
+          return [{ id, label: String(item.label ?? id), kind: 'data' as const, route: 'query' as const, queryId: String(contract.id ?? ''), queryColumn: id, source: resolveColumnSource(item), type: String(item.type ?? ''), metricId: '', calculationNode: '' }];
         }),
       );
     })(),
@@ -783,21 +838,38 @@ export async function readReportModel(
           parameterName: String(model.time_semantics.parameter_name ?? ''),
         }
       : null,
-    queryContracts: (model.query_contracts ?? []).map((qc: JsonRecord): ReportModelQueryContract => ({
-      id: String(qc.id ?? ''),
-      purpose: String(qc.purpose ?? ''),
-      entity: String(qc.entity ?? ''),
-      outputColumns: ((qc.output_contract ?? qc.output ?? []) as JsonRecord[]).map((col: JsonRecord) => ({
-        name: String(col.name ?? ''),
-        label: String(col.label ?? col.name ?? ''),
-        type: String(col.type ?? ''),
-        role: String(col.role ?? ''),
-        source: String(col.source ?? ''),
-        ...(col.aggregation ? { aggregation: String(col.aggregation) } : {}),
-        ...(col.condition !== undefined ? { condition: col.condition ? String(col.condition) : null } : {}),
-        ...(col.nullable !== undefined ? { nullable: Boolean(col.nullable) } : {}),
-      })),
-    })),
+    queryContracts: (model.query_contracts ?? []).map((qc: JsonRecord): ReportModelQueryContract => {
+      const queryId = String(qc.id ?? '');
+      const columns = [
+        ...((qc.output_contract ?? qc.output ?? []) as JsonRecord[]),
+        ...(Array.isArray(qc.aggregations) ? qc.aggregations as JsonRecord[] : []),
+      ];
+      const seen = new Set<string>();
+      return {
+        id: queryId,
+        purpose: String(qc.purpose ?? ''),
+        entity: String(qc.entity ?? ''),
+        outputColumns: columns.flatMap((col: JsonRecord) => {
+          const name = String(col.name ?? col.id ?? '');
+          if (!name || seen.has(name)) return [];
+          seen.add(name);
+          const outputField = configuredOutputFields.find(
+            (field) => String(field.query_id ?? '') === queryId && String(field.query_column ?? field.id ?? '') === name,
+          );
+          const isDirectData = String(outputField?.kind ?? '') === 'data' || (model.result_grain?.keys ?? []).map(String).includes(name);
+          return [{
+            name,
+            label: String(col.label ?? name),
+            type: String(col.type ?? outputField?.type ?? ''),
+            role: String(col.role ?? (isDirectData ? 'group_key' : 'metric')),
+            source: resolveColumnSource(col),
+            ...(col.aggregation ? { aggregation: String(col.aggregation) } : {}),
+            ...(col.condition !== undefined ? { condition: col.condition ? String(col.condition) : null } : {}),
+            ...(col.nullable !== undefined ? { nullable: Boolean(col.nullable) } : {}),
+          }];
+        }),
+      };
+    }),
     comparison: model.comparison && typeof model.comparison === 'object'
       ? {
           enabled: Boolean(model.comparison.enabled),
