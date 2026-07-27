@@ -397,6 +397,7 @@ export const workspaceApi = {
     sources: ReportModelEditSource[],
     relationships: ReportModelRelationship[],
     comparison?: ReportModelComparison | null,
+    calculationGraph?: Omit<ReportModelCalculationGraph, 'persisted'>,
     metricEdits?: Array<{ id: string; sourceField?: string; sourceAlias?: string; dedupKey?: string }>,
     filterEdits?: Array<{
       id: string;
@@ -418,6 +419,7 @@ export const workspaceApi = {
       sources,
       relationships,
       comparison,
+      calculationGraph,
       metricEdits,
       filterEdits,
     }),
@@ -515,6 +517,40 @@ export interface ReportModelMetric {
   confidence: string;
 }
 
+export type ReportModelCalculationKind =
+  | 'aggregate'
+  | 'formula'
+  | 'comparison'
+  | 'window'
+  | 'merge';
+export interface ReportModelCalculationNode {
+  id: string;
+  label: string;
+  kind: ReportModelCalculationKind;
+  outputType: string;
+  dependencies: string[];
+  expression: string;
+  sourceField: string;
+  aggregation: string;
+  condition: string;
+  comparisonMode: string;
+  comparisonOffset: number;
+  windowFunction: string;
+  partitionBy: string[];
+  orderBy: string[];
+  frame: string;
+  mergeOperation: string;
+  joinKeys: string[];
+  executionHint: 'auto' | 'sql' | 'script';
+  output: boolean;
+  description: string;
+}
+export interface ReportModelCalculationGraph {
+  version: '1';
+  nodes: ReportModelCalculationNode[];
+  persisted: boolean;
+}
+
 export interface ReportModelFilter {
   id: string;
   label: string;
@@ -569,6 +605,7 @@ export interface ReportModelDetail {
   relationships: ReportModelRelationship[];
   filters: ReportModelFilter[];
   metrics: ReportModelMetric[];
+  calculationGraph: ReportModelCalculationGraph;
   timeSemantics?: ReportModelTimeSemantics | null;
   queryContracts?: ReportModelQueryContract[];
   comparison: ReportModelComparison | null;

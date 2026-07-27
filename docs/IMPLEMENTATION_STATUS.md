@@ -1,6 +1,6 @@
 # Easy BI Studio 实施状态
 
-最后更新时间：2026-07-23
+最后更新时间：2026-07-27
 
 > 本文档分三区：**① 当前状态快照**（现在是什么样）→ **② 变更历史**（倒序增量）→ **③ 历史阶段记录**（各阶段任务/测试归档）。
 > 架构见 [ARCHITECTURE.md](./ARCHITECTURE.md)；开发规范见 [AI_CONTRIBUTING.md](./AI_CONTRIBUTING.md)。
@@ -29,7 +29,7 @@
 
 ### 当前版本
 
-- Bundle `1.31.8`、知识库 Skill `0.16.0`、报表 Skill `2.28.8`（开发版）。
+- Bundle `1.33.1`、知识库 Skill `0.16.0`、报表 Skill `2.30.1`（开发版）。
 - 数据库支持：MySQL（默认）与 PostgreSQL，经方言层分派；连接类型在配置页可选。
 - 每个 Skill 含面向开发者/管理员的 `使用说明.md`；报表计划为 v2，报表包支持 v2 声明式和 v3 隔离脚本（v1 不读取、不迁移、不执行）；Runtime HTTP API 仍为 v1。
 - 每次同步生成新的不可变版本缓存与 `vendor/easybi-bundle` 快照，不覆盖旧缓存。
@@ -45,6 +45,37 @@
 ---
 
 ## ② 变更历史（倒序）
+
+### 计算模型页面业务化与渐进式编辑（2026-07-27）
+
+- **默认简洁列表**：计算模型从“所有节点、所有技术字段同时展开”改成紧凑指标清单；每行只显示中文指标名、业务类型、是否进入报表、字段/计算摘要和自动/SQL/脚本提示，一次只展开一个指标。
+- **面向业务的入口与术语**：新增明确的“基础指标”和“公式指标”入口；原 `aggregate/formula/window/merge` 改为“基础指标、公式指标、排名/累计、跨数据计算”等中文表述，并解释基础指标负责字段汇总、公式指标负责占比/差额等二次计算。
+- **渐进式修改**：普通编辑只展示“指标名称、怎么计算”和对应业务配置；稳定 ID、结果格式、执行方式、是否输出和口径说明收进“高级设置”。基础指标按“统计字段、统计方式、可选筛选条件”编辑；公式指标通过中文指标按钮选择参与项，并自动同步公式依赖。
+- **字段防挤压修正**：解除指标行复用通用按钮造成的固定高度，让名称、类型标签和计算摘要按内容撑开并自然换行；标题区和操作区允许换行，展开编辑改为单列纵向分区，统计字段、统计方式、筛选条件及高级选项均获得完整可用宽度。
+- **视觉与交互验证**：在本地 `transport-test/report-1` 已确认模型上实测默认清单、单指标展开和新增公式指标；测试过程只修改前端临时状态，未保存客户模型。Studio Web 101/101、typecheck、生产 build、定向 ESLint 与 `git diff --check` 通过。
+- **已知问题与下一步**：公式正文仍使用 `{指标ID}` 作为稳定引用，但默认隐藏 ID，并提示普通用户只需调整运算符和数字。后续可增加纯中文可视公式生成器，彻底避免直接编辑表达式。
+
+### 复杂报表计算 DAG 与可视化模型编辑（bundle 1.33.1）（2026-07-27）
+
+- **结构化复杂指标**：`report-model.json` 新增可选且向后兼容的 `calculation_graph` v1，把原子聚合、多级派生公式、同比环比、窗口排名/累计和跨查询运算统一为有稳定 ID 的 DAG 节点；每个节点显式记录输出类型、依赖、执行偏好、是否输出和业务说明，不再只能把复杂口径散落在 comparison、computed、查询或脚本描述中。
+- **确定性模型门禁**：Workspace SDK 与报表 Skill 同步校验节点类型、聚合/窗口/对比/合并操作、字段白名单、未知/重复依赖、公式引用与声明依赖一致性、对比偏移，以及计算图循环。批准 hash 包含计算图，修改后必须重新批准和封存。
+- **页面清晰可改**：报表模型弹窗新增“计算模型”页签；可查看旧基础指标转换出的节点，增删节点，修改中文名称/ID、节点类型、依赖链、公式、聚合来源和条件、窗口分区/排序/frame、跨查询合并键、输出类型、SQL/脚本偏好与业务说明。依赖候选同时包含基础指标、查询输出和其他计算节点，节点重命名会同步依赖与公式引用。
+- **Agent 与后续生成衔接**：建模 Context Pack 要求占比、多级派生、时间对比、窗口和跨事实运算必须进入计算图；QUERY/SCRIPT Context Pack 携带批准后的同一计算图，脚本 API 白名单同步补齐 `queryStreamWithFilters/beginSheet`，为下一阶段的确定性 SQL/脚本编译预留唯一输入。
+- **常规场景矩阵**：按明细、单表汇总、状态分布、多表维度、去重指标、占比/多级派生、同比环比、排行累计、跨事实、enrichment、动态透视/漏斗/留存/递归和多 Sheet 逐类检查。前九类已有结构化节点或既有模型表达；动态透视、漏斗、留存与递归暂由 script 策略在执行计划中显式拆解，尚未提升为专属一等节点。
+- **改动文件**：Workspace SDK 模型类型、校验、持久化与测试；Studio Service 模型 API；Studio Web API 与模型编辑器；报表 Skill CLI、SKILL、提示词、技术规范、测试和编译产物；Bundle/version 断言与本状态文档。
+- **测试与分发**：报表 Skill 90/90；Workspace SDK 62/62；Studio Web 101/101；Studio Service 56 通过、2 个可选 Runtime 测试跳过；全仓 `test`（含 integration）、`typecheck`、`build` 通过，变更产品文件定向 ESLint 与 `git diff --check` 通过。Bundle 1.33.1 已同步到不可变缓存与 vendor（SHA-256 `7d27c77a…`）。
+- **已知问题与下一步**：本阶段完成“能建模、能看见、能修改、能校验”，尚未让声明式生成器确定性编译每一种 DAG 节点；当前生成 Context 已携带计算图，下一步应实现 DAG 拓扑规划与 SQL/脚本分流，并优先把动态透视、漏斗和留存评估为专属节点。真实业务数据结果仍需数据库 fixture/preview 验收。
+
+### 分阶段建模链路恢复与模型契约收敛（bundle 1.32.0）（2026-07-27）
+
+- **恢复唯一建模路径**：Studio 的报表编排重新使用 Manifest 路径和 `work/report-model/<report-id>/<revision>`，依次执行 knowledge 选择、inspect、`init-model`、结构化确认、`finalize-staged-model`；生成阶段只消费已批准的当前模型，并将最小副本放入独立的 `work/report-build` revision。DISCOVERY/MODELING 与 QUERY/SCRIPT 的上下文目录重新隔离。
+- **`create_time` 默认策略**：真实来源中存在可识别的 `create_time`、`created_at`、`gmt_create` 或等价时间语义时，继续自动生成默认时间筛选与排序；来源不具备该字段时不再向模型伪造 `create_time`，改用既有主键降序兜底，避免生成不可执行 SQL。
+- **统一模型约束**：Studio 编辑器、Workspace SDK 和报表 Skill 统一只接受 `left/inner` 关系及正式基数集合，允许合法的无键单行汇总；关系、查询输出、指标来源/去重键与筛选表达式都必须落在已选择字段白名单内。编辑器保存时会把筛选结构规范化，并显式提交删除项，不再出现 UI 删除后模型仍保留的漂移。
+- **脚本 Runtime 闭环**：隔离脚本补齐 `queryStreamWithFilters`、`beginSheet` 和 `isPreview` 协议，父子进程权限路径使用真实路径规范化，修复 macOS `/var` 链接下 Node 权限误拒绝；预览对分 Sheet 请求安全忽略，导出仍执行受控回调。
+- **冗余/错误逻辑清理**：移除 staged finalize 中无条件注入 `create_time` 的旧逻辑，修复 `configure-plan` 误跳过全部新增 column 字段的问题；未命中的指标编辑不再静默忽略。
+- **改动文件**：Studio Service 的 staged workflow、阶段提示词与测试；Studio Web 模型编辑器；Workspace SDK 模型读写/校验与测试；报表 Skill CLI、隔离 Runtime/runner、编译产物、版本清单；Bundle 与版本断言。
+- **测试与分发**：报表 Skill 90/90；Workspace SDK 60/60；Studio Web 101/101；Studio Service 56 通过、2 个可选 Runtime 测试跳过；全仓 `test`（含 integration）、`typecheck`、`build` 通过。Bundle 1.32.0 已同步到不可变缓存与 vendor（SHA-256 `f6a1dd59…`）。
+- **已知问题与下一步**：当前模型能覆盖单表/多表 SQL、聚合、enrichment、分组多查询与隔离 TypeScript 脚本，但复杂派生指标仍分别散落在 comparison、computed、group query 和脚本契约中。下一步建立向后兼容的结构化指标/计算 DAG，并让声明式 SQL 与脚本编译共同消费；真实数据库 preview/Excel 仍需业务数据验收。登记工作区不会被静默升级。
 
 ### 清晰需求直达模型、技术错误自动修复（bundle 1.31.8）（2026-07-23）
 

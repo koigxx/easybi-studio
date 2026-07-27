@@ -2195,6 +2195,34 @@ test("staged report model builds query/script context packs without leaking phys
   model.query_contracts[0].sources[0].fields.push("not-approved-field");
   assert.match(validateReportModelValue(model).join("\n"), /模型外字段/);
   model.query_contracts[0].sources[0].fields.pop();
+  model.calculation_graph = {
+    version: "1",
+    nodes: [
+      {
+        id: "driver_count",
+        label: "司机数",
+        kind: "aggregate",
+        output_type: "integer",
+        depends_on: [],
+        source: { field: "t0.code", aggregation: "count_distinct" },
+        execution_hint: "sql",
+        output: true,
+      },
+      {
+        id: "driver_count_double",
+        label: "司机数两倍",
+        kind: "formula",
+        output_type: "number",
+        depends_on: ["driver_count"],
+        expression: "{driver_count} * 2",
+        execution_hint: "auto",
+        output: true,
+      },
+    ],
+  };
+  const cyclic = structuredClone(model);
+  cyclic.calculation_graph.nodes[0].depends_on = ["driver_count_double"];
+  assert.match(validateReportModelValue(cyclic).join("\n"), /循环依赖/);
   await writeFile(modelPath, JSON.stringify(model, null, 2));
   const approved = await approveReportModel(modelPath, "model-reviewer", fixture.plan);
   assert.equal(validateReportModelValue(approved, true).length, 0);
@@ -2211,6 +2239,7 @@ test("staged report model builds query/script context packs without leaking phys
   assert.equal(queryContext.context_manifest.fresh_session, true);
   assert.equal(queryContext.payload.knowledge.tables.length, 1);
   assert.equal(queryContext.payload.query_contract.id, "main");
+  assert.equal(queryContext.payload.calculation_graph.nodes.length, 2);
 
   const outputDir = join(fixture.workspace, "work", "query-outputs");
   await mkdir(outputDir, { recursive: true });
@@ -2229,7 +2258,15 @@ test("staged report model builds query/script context packs without leaking phys
   const serialized = JSON.stringify(scriptContext);
   assert.equal(serialized.includes("physical_fields"), false);
   assert.equal(serialized.includes("schema_fingerprint"), false);
-  assert.deepEqual(scriptContext.payload.allowed_api, ["queryStream", "loadIndex", "batchLookup", "emit"]);
+  assert.equal(scriptContext.payload.calculation_graph.nodes.length, 2);
+  assert.deepEqual(scriptContext.payload.allowed_api, [
+    "queryStream",
+    "queryStreamWithFilters",
+    "loadIndex",
+    "batchLookup",
+    "beginSheet",
+    "emit",
+  ]);
   await assert.rejects(
     buildPhaseContext({
       phase: "unknown" as "query",

@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
+  Calculator,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Database,
   Edit3,
   FileText,
@@ -16,6 +19,9 @@ import {
 import {
   workspaceApi,
   type AvailableField,
+  type ReportModelCalculationGraph,
+  type ReportModelCalculationKind,
+  type ReportModelCalculationNode,
   type ReportModelComparison,
   type ReportModelDetail,
   type ReportModelFilter,
@@ -23,10 +29,11 @@ import {
   type ReportModelRelationship,
 } from '../api.js';
 
-type EditorTab = 'fields' | 'sources' | 'comparison';
+type EditorTab = 'fields' | 'calculations' | 'sources' | 'comparison';
 
 const TAB_DEFS: { id: EditorTab; label: string; icon: typeof Table2 }[] = [
   { id: 'fields', label: '字段目录', icon: FileText },
+  { id: 'calculations', label: '计算模型', icon: Calculator },
   { id: 'sources', label: '数据源', icon: Database },
   { id: 'comparison', label: '环比/同比', icon: Edit3 },
 ];
@@ -54,8 +61,6 @@ const ROLE_TAG_STYLE: Record<string, string> = {
 const RELATION_TYPES = [
   ['left', '左连接'],
   ['inner', '内连接'],
-  ['right', '右连接'],
-  ['full', '全连接'],
 ] as const;
 const CARDINALITIES = ['1:1', '1:n', 'n:1', 'n:n', 'unknown'] as const;
 
@@ -84,13 +89,15 @@ export function ReportModelEditor({
     Array<{ id: string; sourceField?: string; sourceAlias?: string; dedupKey?: string }>
   >([]);
   const [filterEditsDirty, setFilterEditsDirty] = useState(false);
+  const [calculationDirty, setCalculationDirty] = useState(false);
   // Working copy of filters for the FiltersTab (mutated in place, saved on submit)
   const [filterEdits, setFilterEdits] = useState<ReportModelFilter[]>([]);
   useEffect(() => {
     if (model && !filterEditsDirty) setFilterEdits(structuredClone(model.filters));
   }, [model, filterEditsDirty]);
   // Track merged state (metricEdits + filterEditsDirty count as changes)
-  const hasMetricOrFilterEdits = metricEdits.length > 0 || filterEditsDirty;
+  const hasMetricOrFilterEdits =
+    metricEdits.length > 0 || filterEditsDirty || calculationDirty;
   const effectiveChanged = changed || hasMetricOrFilterEdits;
   const [pickers, setPickers] = useState<
     Record<string, { loading: boolean; fields: AvailableField[]; open: boolean; search: string }>
@@ -101,6 +108,7 @@ export function ReportModelEditor({
     try {
       setModel(await workspaceApi.getReportModel(projectId, reportId));
       setChanged(false);
+      setCalculationDirty(false);
     } catch (e) {
       setError(String((e as Error).message ?? e));
     }
@@ -225,14 +233,39 @@ export function ReportModelEditor({
         })),
         model.relationships,
         model.comparison,
+        calculationDirty
+          ? { version: '1', nodes: model.calculationGraph.nodes }
+          : undefined,
         metricEdits.length ? metricEdits : undefined,
-        filterEditsDirty ? filterEdits : undefined,
+        filterEditsDirty
+          ? [
+              ...filterEdits.map((filter) => ({
+                id: filter.id,
+                label: filter.label,
+                valueType: filter.valueType,
+                operators: filter.operators,
+                defaultOperator: filter.defaultOperator,
+                required: filter.required,
+                expression: filter.sqlBinding.expression,
+                clause: filter.sqlBinding.clause,
+                valueAdapter: filter.sqlBinding.valueAdapter,
+                component: filter.component,
+              })),
+              ...model.filters
+                .filter(
+                  (original) =>
+                    !filterEdits.some((current) => current.id === original.id),
+                )
+                .map((original) => ({ id: original.id, delete: true })),
+            ]
+          : undefined,
       );
       setModel(saved);
       setChanged(false);
       setSavedAny(true);
       setMetricEdits([]);
       setFilterEditsDirty(false);
+      setCalculationDirty(false);
       setStatus('模型已校验并重新确认；后续生成报表将使用此模型');
     } catch (e) {
       setError(String((e as Error).message ?? e));
@@ -368,7 +401,20 @@ export function ReportModelEditor({
                 />
               )}
 
-              {/* Tab 2: 数据源 — 表字段管理 + 关联关系 */}
+              {/* Tab 2: 结构化复杂计算 DAG */}
+              {activeTab === 'calculations' && (
+                <CalculationGraphTab
+                  model={model}
+                  onChange={(graph) => {
+                    mutate((draft) => {
+                      draft.calculationGraph = graph;
+                    });
+                    setCalculationDirty(true);
+                  }}
+                />
+              )}
+
+              {/* Tab 3: 数据源 — 表字段管理 + 关联关系 */}
               {activeTab === 'sources' && (
                 <>
                   <section>
@@ -641,7 +687,7 @@ export function ReportModelEditor({
                 </>
               )}
 
-              {/* Tab 3: 环比/同比 */}
+              {/* Tab 4: 环比/同比 */}
               {activeTab === 'comparison' && (
                 <ComparisonSection
                   model={model}
@@ -665,6 +711,766 @@ function formatSqlFormula(m: ReportModelMetric): string {
   let formula = `${agg} ${dedup}${end}`;
   if (m.condition) formula += ` WHERE ${m.condition}`;
   return formula;
+}
+
+const CALCULATION_KIND_OPTIONS: Array<[ReportModelCalculationKind, string]> = [
+  ['aggregate', '基础指标'],
+  ['formula', '公式指标'],
+  ['comparison', '同比 / 环比'],
+  ['window', '排名 / 累计'],
+  ['merge', '跨数据计算'],
+];
+
+function calculationKindLabel(kind: ReportModelCalculationKind): string {
+  return CALCULATION_KIND_OPTIONS.find(([value]) => value === kind)?.[1] ?? kind;
+}
+
+function CalculationGraphTab({
+  model,
+  onChange,
+}: {
+  model: ReportModelDetail;
+  onChange: (graph: ReportModelCalculationGraph) => void;
+}): JSX.Element {
+  const graph = model.calculationGraph;
+  const [expandedNodeId, setExpandedNodeId] = useState<string | null>(null);
+  const [advancedNodeId, setAdvancedNodeId] = useState<string | null>(null);
+  const fieldOptions = model.sources.flatMap((source) =>
+    source.fields.map((field) => ({
+      value: `${source.alias}.${field.name}`,
+      label: `${source.alias}.${field.name}（${field.label || field.name}）`,
+    })),
+  );
+  const fieldLabelByValue = new Map(fieldOptions.map((field) => [field.value, field.label]));
+  const nodeLabelById = new Map([
+    ...model.metrics.map((metric) => [metric.id, metric.label] as const),
+    ...(model.queryContracts ?? []).flatMap((contract) =>
+      contract.outputColumns.map((column) => [column.name, column.label] as const),
+    ),
+    ...graph.nodes.map((node) => [node.id, node.label] as const),
+  ]);
+
+  function nodeSummary(node: ReportModelCalculationNode): string {
+    const dependencyLabels = node.dependencies.map(
+      (dependency) => nodeLabelById.get(dependency) ?? dependency,
+    );
+    if (node.kind === 'aggregate') {
+      const aggregation = {
+        sum: '求和',
+        count: '计数',
+        count_distinct: '去重计数',
+        avg: '计算平均值',
+        min: '取最小值',
+        max: '取最大值',
+        first: '取首值',
+        last: '取末值',
+      }[node.aggregation] ?? '汇总';
+      const field = fieldLabelByValue.get(node.sourceField) ?? node.sourceField ?? '未选择字段';
+      return `${field} · ${aggregation}${node.condition ? ' · 有筛选条件' : ''}`;
+    }
+    if (node.kind === 'formula') return node.expression || '尚未填写计算公式';
+    if (node.kind === 'comparison') {
+      const mode = { difference: '差额', rate: '变化率', chain: '环比', yoy: '同比' }[
+        node.comparisonMode
+      ] ?? '时间对比';
+      return `${dependencyLabels[0] ?? '未选择基础指标'} · ${mode}`;
+    }
+    if (node.kind === 'window') {
+      const operation = {
+        running_sum: '累计求和',
+        moving_avg: '移动平均',
+        row_number: '行号',
+        rank: '排名',
+        dense_rank: '密集排名',
+        lag: '前一期值',
+        lead: '后一期值',
+      }[node.windowFunction] ?? '窗口计算';
+      return `${dependencyLabels[0] ?? '未选择基础指标'} · ${operation}`;
+    }
+    const operation = {
+      add: '相加',
+      subtract: '相减',
+      multiply: '相乘',
+      divide: '相除',
+      coalesce: '取首个非空值',
+    }[node.mergeOperation] ?? '跨数据计算';
+    return `${dependencyLabels.join('、') || '未选择指标'} · ${operation}`;
+  }
+
+  function replaceNodes(nodes: ReportModelCalculationNode[]): void {
+    onChange({ version: '1', nodes, persisted: true });
+  }
+
+  function patchNode(index: number, patch: Partial<ReportModelCalculationNode>): void {
+    const previous = graph.nodes[index];
+    if (!previous) return;
+    const next = graph.nodes.map((node, nodeIndex) =>
+      nodeIndex === index ? { ...node, ...patch } : { ...node },
+    );
+    if (patch.id && patch.id !== previous.id) {
+      for (const node of next) {
+        node.dependencies = node.dependencies.map((dependency) =>
+          dependency === previous.id ? patch.id! : dependency,
+        );
+        node.expression = node.expression.replaceAll(`{${previous.id}}`, `{${patch.id}}`);
+      }
+    }
+    replaceNodes(next);
+  }
+
+  function toggleDependency(index: number, dependency: string): void {
+    const node = graph.nodes[index];
+    if (!node || dependency === node.id) return;
+    const dependencies = node.dependencies.includes(dependency)
+      ? node.dependencies.filter((item) => item !== dependency)
+      : [...node.dependencies, dependency];
+    if (node.kind === 'formula') {
+      const selected = node.dependencies.includes(dependency);
+      const expression = selected
+        ? node.expression
+            .replaceAll(`{${dependency}}`, '')
+            .replace(/\s{2,}/g, ' ')
+            .trim()
+        : `${node.expression}${node.expression.trim() ? ' ' : ''}{${dependency}}`;
+      patchNode(index, { dependencies, expression });
+      return;
+    }
+    patchNode(index, { dependencies });
+  }
+
+  function addNode(kind: ReportModelCalculationKind): void {
+    let sequence = graph.nodes.length + 1;
+    while (graph.nodes.some((node) => node.id === `calc_${sequence}`)) sequence += 1;
+    const dependency = graph.nodes.at(-1)?.id ?? model.metrics[0]?.id;
+    replaceNodes([
+      ...graph.nodes,
+      {
+        id: `calc_${sequence}`,
+        label: kind === 'aggregate' ? `基础指标 ${sequence}` : `计算指标 ${sequence}`,
+        kind,
+        outputType: 'number',
+        dependencies: kind === 'aggregate' || !dependency ? [] : [dependency],
+        expression: kind === 'formula' && dependency ? `{${dependency}}` : '',
+        sourceField: '',
+        aggregation: 'sum',
+        condition: '',
+        comparisonMode: 'difference',
+        comparisonOffset: 1,
+        windowFunction: 'running_sum',
+        partitionBy: [],
+        orderBy: [],
+        frame: '',
+        mergeOperation: 'add',
+        joinKeys: [],
+        executionHint: 'auto',
+        output: true,
+        description: '',
+      },
+    ]);
+    setExpandedNodeId(`calc_${sequence}`);
+  }
+
+  function removeNode(index: number): void {
+    const removed = graph.nodes[index];
+    if (!removed) return;
+    replaceNodes(
+      graph.nodes
+        .filter((_, nodeIndex) => nodeIndex !== index)
+        .map((node) => ({
+          ...node,
+          dependencies: node.dependencies.filter((dependency) => dependency !== removed.id),
+        })),
+    );
+  }
+
+  const graphLabels = new Set(graph.nodes.map((node) => node.label));
+  const metricLabels = new Set(model.metrics.map((metric) => metric.label));
+  const dependencyOptions = [
+    ...graph.nodes.map((node) => ({ id: node.id, label: node.label, legacy: false })),
+    ...model.metrics
+      .filter((metric) => !graphLabels.has(metric.label))
+      .map((metric) => ({ id: metric.id, label: metric.label, legacy: true })),
+    ...(model.queryContracts ?? []).flatMap((contract) =>
+      contract.outputColumns
+        .filter(
+          (column) =>
+            column.role !== 'group_key' &&
+            ['number', 'integer', 'bigint', 'decimal', 'float', 'double', 'percentage'].includes(
+              column.type.toLowerCase(),
+            ) &&
+            !graphLabels.has(column.label) &&
+            !metricLabels.has(column.label),
+        )
+        .map((column) => ({
+          id: column.name,
+          label: `${column.label} · ${contract.id}`,
+          legacy: true,
+        })),
+    ),
+  ].filter((item, index, all) =>
+    all.findIndex((candidate) => candidate.id === item.id) === index,
+  );
+
+  return (
+    <section
+      data-testid="calculation-model"
+      style={{ display: 'flex', flexDirection: 'column', gap: 'var(--ide-sp-3)' }}
+    >
+      <div
+        className="ide-card"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          flexWrap: 'wrap',
+          gap: 'var(--ide-sp-3)',
+        }}
+      >
+        <div style={{ minWidth: 0, flex: '1 1 420px' }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              flexWrap: 'wrap',
+              gap: 'var(--ide-sp-2)',
+            }}
+          >
+            <strong style={{ fontSize: 'var(--ide-fz-sm)' }}>指标计算</strong>
+            <span className="ide-badge ide-badge-neutral">{graph.nodes.length} 个指标</span>
+            {!graph.persisted && graph.nodes.length > 0 && (
+              <span className="ide-badge ide-badge-neutral">已整理原有指标</span>
+            )}
+          </div>
+          <div
+            style={{
+              marginTop: 'var(--ide-sp-1)',
+              color: 'var(--ide-text-tertiary)',
+              fontSize: 'var(--ide-fz-xs)',
+            }}
+          >
+            基础指标负责汇总数据库字段；公式指标基于已有指标继续计算。点击一行即可修改。
+          </div>
+        </div>
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: 'var(--ide-sp-2)',
+            flexShrink: 0,
+          }}
+        >
+          <button
+            className="ide-btn ide-btn-sm"
+            onClick={() => addNode('aggregate')}
+            title="直接对数据库字段求和、计数或取平均值"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            基础指标
+          </button>
+          <button
+            className="ide-btn ide-btn-sm ide-btn-primary"
+            onClick={() => addNode('formula')}
+            title="用已有指标计算占比、差额或其他公式"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            公式指标
+          </button>
+        </div>
+      </div>
+
+      {graph.nodes.length === 0 ? (
+        <div
+          className="ide-card"
+          style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-sm)' }}
+        >
+          当前报表只有直接展示的字段。需要求和、计数、占比或排名时，再添加指标。
+        </div>
+      ) : (
+        graph.nodes.map((node, index) => {
+          const availableDependencies = dependencyOptions.filter((item) => item.id !== node.id);
+          return (
+            <div
+              key={`${node.id}-${index}`}
+              className="ide-card"
+              data-testid={`calculation-node-${node.id}`}
+              style={{ padding: 0, overflow: 'hidden' }}
+            >
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 'var(--ide-sp-3)',
+                  padding: 'var(--ide-sp-3) var(--ide-sp-4)',
+                  borderBottom:
+                    expandedNodeId === node.id
+                      ? '1px solid var(--ide-border-subtle)'
+                      : '1px solid transparent',
+                }}
+              >
+                <span
+                  className="ide-badge ide-badge-neutral"
+                  style={{ flexShrink: 0 }}
+                >
+                  {index + 1}
+                </span>
+                <button
+                  className="ide-btn ide-btn-ghost"
+                  style={{
+                    flex: 1,
+                    minWidth: 0,
+                    justifyContent: 'flex-start',
+                    padding: 0,
+                    textAlign: 'left',
+                    alignItems: 'flex-start',
+                    height: 'auto',
+                    minHeight: 0,
+                  }}
+                  onClick={() =>
+                    setExpandedNodeId((current) => current === node.id ? null : node.id)
+                  }
+                  aria-expanded={expandedNodeId === node.id}
+                >
+                  {expandedNodeId === node.id ? (
+                    <ChevronDown className="w-3.5 h-3.5" style={{ flexShrink: 0 }} />
+                  ) : (
+                    <ChevronRight className="w-3.5 h-3.5" style={{ flexShrink: 0 }} />
+                  )}
+                  <span style={{ minWidth: 0, flex: 1 }}>
+                    <span
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        flexWrap: 'wrap',
+                        gap: 'var(--ide-sp-2)',
+                        lineHeight: 1.4,
+                      }}
+                    >
+                      <strong
+                        style={{
+                          minWidth: 0,
+                          overflowWrap: 'anywhere',
+                          fontSize: 'var(--ide-fz-sm)',
+                        }}
+                      >
+                        {node.label}
+                      </strong>
+                      <span className="ide-badge ide-badge-neutral">
+                        {calculationKindLabel(node.kind)}
+                      </span>
+                      {node.output && <span className="ide-badge ide-badge-success">报表输出</span>}
+                    </span>
+                    <span
+                      style={{
+                        display: 'block',
+                        marginTop: 'var(--ide-sp-1)',
+                        color: 'var(--ide-text-tertiary)',
+                        fontSize: 'var(--ide-fz-xs)',
+                        lineHeight: 1.5,
+                        overflowWrap: 'anywhere',
+                      }}
+                    >
+                      {nodeSummary(node)}
+                    </span>
+                  </span>
+                </button>
+                <span
+                  className="ide-badge ide-badge-neutral"
+                  title="系统会根据模型自动选择 SQL 或脚本"
+                  style={{ flexShrink: 0 }}
+                >
+                  {node.executionHint === 'sql'
+                    ? 'SQL'
+                    : node.executionHint === 'script'
+                      ? '脚本'
+                      : '自动'}
+                </span>
+                <button
+                  className="ide-btn ide-btn-sm ide-btn-ghost"
+                  title="删除指标"
+                  onClick={() => removeNode(index)}
+                  style={{ flexShrink: 0 }}
+                >
+                  <Trash2 className="w-3.5 h-3.5" style={{ color: 'var(--state-error)' }} />
+                </button>
+              </div>
+
+              {expandedNodeId === node.id && (
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(0, 1fr)',
+                  gap: 'var(--ide-sp-4)',
+                  padding: 'var(--ide-sp-4)',
+                  background: 'var(--ide-bg-chrome)',
+                }}
+              >
+                <div>
+                  <label style={{ display: 'block' }}>
+                    <span style={{ color: 'var(--ide-text-secondary)', fontSize: 'var(--ide-fz-xs)', fontWeight: 600 }}>
+                      指标名称
+                    </span>
+                    <input
+                      className="ide-input"
+                      style={{ width: '100%', marginTop: 'var(--ide-sp-1)' }}
+                      value={node.label}
+                      onChange={(event) => patchNode(index, { label: event.target.value })}
+                      aria-label={`指标 ${index + 1} 名称`}
+                    />
+                  </label>
+                  <label style={{ display: 'block', marginTop: 'var(--ide-sp-3)' }}>
+                    <span style={{ color: 'var(--ide-text-secondary)', fontSize: 'var(--ide-fz-xs)', fontWeight: 600 }}>
+                      怎么计算
+                    </span>
+                    <select
+                      className="ide-select"
+                      style={{ width: '100%', marginTop: 'var(--ide-sp-1)' }}
+                      value={node.kind}
+                      onChange={(event) =>
+                        patchNode(index, {
+                          kind: event.target.value as ReportModelCalculationKind,
+                        })
+                      }
+                    >
+                      {CALCULATION_KIND_OPTIONS.map(([value, label]) => (
+                        <option key={value} value={value}>{label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    className="ide-btn ide-btn-sm ide-btn-ghost"
+                    style={{ marginTop: 'var(--ide-sp-3)' }}
+                    onClick={() =>
+                      setAdvancedNodeId((current) => current === node.id ? null : node.id)
+                    }
+                  >
+                    {advancedNodeId === node.id ? (
+                      <ChevronDown className="w-3.5 h-3.5" />
+                    ) : (
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    )}
+                    高级设置
+                  </button>
+                  {advancedNodeId === node.id && (
+                    <div style={{ marginTop: 'var(--ide-sp-2)', display: 'flex', flexDirection: 'column', gap: 'var(--ide-sp-2)' }}>
+                      <label>
+                        <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-xs)' }}>指标 ID（通常无需修改）</span>
+                        <input
+                          className="ide-input ide-text-mono"
+                          style={{ width: '100%', marginTop: 'var(--ide-sp-1)' }}
+                          value={node.id}
+                          onChange={(event) => patchNode(index, { id: event.target.value })}
+                        />
+                      </label>
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'minmax(0, 1fr)',
+                          gap: 'var(--ide-sp-2)',
+                        }}
+                      >
+                        <select
+                          className="ide-select"
+                          value={node.outputType}
+                          onChange={(event) => patchNode(index, { outputType: event.target.value })}
+                          aria-label="结果格式"
+                        >
+                          <option value="number">数值</option>
+                          <option value="integer">整数</option>
+                          <option value="percentage">百分比</option>
+                          <option value="string">文本</option>
+                          <option value="datetime">时间</option>
+                        </select>
+                        <select
+                          className="ide-select"
+                          value={node.executionHint}
+                          onChange={(event) =>
+                            patchNode(index, {
+                              executionHint: event.target.value as 'auto' | 'sql' | 'script',
+                            })
+                          }
+                          aria-label="执行方式"
+                        >
+                          <option value="auto">系统自动选择</option>
+                          <option value="sql">优先使用 SQL</option>
+                          <option value="script">使用复杂脚本</option>
+                        </select>
+                      </div>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 'var(--ide-sp-2)', fontSize: 'var(--ide-fz-xs)' }}>
+                        <input
+                          type="checkbox"
+                          checked={node.output}
+                          onChange={(event) => patchNode(index, { output: event.target.checked })}
+                        />
+                        在最终报表中显示这个指标
+                      </label>
+                      <textarea
+                        className="ide-input"
+                        style={{ width: '100%', minHeight: 52 }}
+                        value={node.description}
+                        onChange={(event) => patchNode(index, { description: event.target.value })}
+                        placeholder="可选：补充统计口径或用途"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div
+                  style={{
+                    minWidth: 0,
+                    paddingTop: 'var(--ide-sp-4)',
+                    borderTop: '1px solid var(--ide-border-subtle)',
+                  }}
+                >
+                  <div
+                    style={{
+                      marginBottom: 'var(--ide-sp-2)',
+                      fontSize: 'var(--ide-fz-xs)',
+                      fontWeight: 600,
+                      color: 'var(--ide-text-secondary)',
+                    }}
+                  >
+                    {node.kind === 'aggregate' ? '选择统计字段和方式' : '设置计算规则'}
+                  </div>
+                  {(node.kind === 'comparison' || node.kind === 'window') && (
+                    <label style={{ display: 'block', marginBottom: 'var(--ide-sp-3)' }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-xs)' }}>
+                        基于哪个指标
+                      </span>
+                      <select
+                        className="ide-select"
+                        style={{ width: '100%', marginTop: 'var(--ide-sp-1)' }}
+                        value={node.dependencies[0] ?? ''}
+                        onChange={(event) =>
+                          patchNode(index, {
+                            dependencies: event.target.value ? [event.target.value] : [],
+                          })
+                        }
+                      >
+                        <option value="">请选择已有指标…</option>
+                        {availableDependencies.map((dependency) => (
+                          <option key={dependency.id} value={dependency.id}>
+                            {dependency.label || dependency.id}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  {(node.kind === 'formula' || node.kind === 'merge') && (
+                    <div style={{ marginBottom: 'var(--ide-sp-3)' }}>
+                      <div style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-xs)', marginBottom: 'var(--ide-sp-1)' }}>
+                        {node.kind === 'formula'
+                          ? '点击参与计算的指标，再在公式中使用它'
+                          : '选择两个或更多需要合并计算的指标'}
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--ide-sp-1)' }}>
+                        {availableDependencies.map((dependency) => {
+                          const selected = node.dependencies.includes(dependency.id);
+                          return (
+                            <button
+                              key={dependency.id}
+                              className={`ide-btn ide-btn-sm ${selected ? 'ide-btn-primary' : 'ide-btn-ghost'}`}
+                              onClick={() => toggleDependency(index, dependency.id)}
+                            >
+                              {dependency.label || dependency.id}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                  {node.kind === 'aggregate' && (
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'minmax(0, 1fr)',
+                        gap: 'var(--ide-sp-3)',
+                      }}
+                    >
+                      <label>
+                        <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-xs)' }}>统计字段</span>
+                      <select
+                        className="ide-select"
+                        style={{ width: '100%', marginTop: 'var(--ide-sp-1)' }}
+                        value={node.sourceField}
+                        onChange={(event) => patchNode(index, { sourceField: event.target.value })}
+                      >
+                        <option value="">选择来源字段…</option>
+                        {fieldOptions.map((field) => (
+                          <option key={field.value} value={field.value}>{field.label}</option>
+                        ))}
+                      </select>
+                      </label>
+                      <label>
+                        <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-xs)' }}>统计方式</span>
+                      <select
+                        className="ide-select"
+                        style={{ width: '100%', marginTop: 'var(--ide-sp-1)' }}
+                        value={node.aggregation}
+                        onChange={(event) => patchNode(index, { aggregation: event.target.value })}
+                      >
+                        <option value="sum">求和</option>
+                        <option value="count">计数</option>
+                        <option value="count_distinct">去重计数</option>
+                        <option value="avg">平均</option>
+                        <option value="min">最小值</option>
+                        <option value="max">最大值</option>
+                        <option value="first">首值</option>
+                        <option value="last">末值</option>
+                      </select>
+                      </label>
+                      <label>
+                        <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-xs)' }}>
+                          筛选条件（可选，不熟悉可留空）
+                        </span>
+                      <input
+                        className="ide-input ide-text-mono"
+                        style={{ width: '100%', marginTop: 'var(--ide-sp-1)' }}
+                        value={node.condition}
+                        onChange={(event) => patchNode(index, { condition: event.target.value })}
+                        placeholder="可选条件，如 t0.status = 'DONE'"
+                      />
+                      </label>
+                    </div>
+                  )}
+                  {node.kind === 'formula' && (
+                    <label style={{ display: 'block' }}>
+                      <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-xs)' }}>
+                        计算公式
+                      </span>
+                      <textarea
+                        className="ide-input ide-text-mono"
+                        style={{ width: '100%', minHeight: 76, marginTop: 'var(--ide-sp-1)' }}
+                        value={node.expression}
+                        onChange={(event) => {
+                          const expression = event.target.value;
+                          const known = new Set(availableDependencies.map((dependency) => dependency.id));
+                          const dependencies = [
+                            ...new Set(
+                              [...expression.matchAll(/\{([A-Za-z][A-Za-z0-9_]*)\}/g)]
+                                .map((match) => match[1]!)
+                                .filter((dependency) => known.has(dependency)),
+                            ),
+                          ];
+                          patchNode(index, { expression, dependencies });
+                        }}
+                        placeholder="例如：{收入} - {成本}，或 {完成量} / {目标量}"
+                      />
+                      <span style={{ display: 'block', marginTop: 'var(--ide-sp-1)', color: 'var(--ide-text-tertiary)', fontSize: 'var(--ide-fz-2xs)' }}>
+                        公式中的大括号内容是指标 ID。一般由 AI 生成；人工修改运算符和数字即可。
+                      </span>
+                    </label>
+                  )}
+                  {node.kind === 'comparison' && (
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'minmax(0, 1fr)',
+                        gap: 'var(--ide-sp-2)',
+                      }}
+                    >
+                      <select
+                        className="ide-select"
+                        value={node.comparisonMode}
+                        onChange={(event) => patchNode(index, { comparisonMode: event.target.value })}
+                      >
+                        <option value="difference">差额</option>
+                        <option value="rate">变化率</option>
+                        <option value="chain">环比</option>
+                        <option value="yoy">同比</option>
+                      </select>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 'var(--ide-sp-2)' }}>
+                        <span style={{ fontSize: 'var(--ide-fz-xs)', color: 'var(--ide-text-tertiary)' }}>
+                          偏移期数
+                        </span>
+                        <input
+                          className="ide-input"
+                          type="number"
+                          min={1}
+                          value={node.comparisonOffset}
+                          onChange={(event) =>
+                            patchNode(index, { comparisonOffset: Number(event.target.value || 1) })
+                          }
+                        />
+                      </label>
+                    </div>
+                  )}
+                  {node.kind === 'window' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--ide-sp-2)' }}>
+                      <select
+                        className="ide-select"
+                        value={node.windowFunction}
+                        onChange={(event) => patchNode(index, { windowFunction: event.target.value })}
+                      >
+                        <option value="running_sum">累计求和</option>
+                        <option value="moving_avg">移动平均</option>
+                        <option value="row_number">行号</option>
+                        <option value="rank">排名</option>
+                        <option value="dense_rank">密集排名</option>
+                        <option value="lag">前值</option>
+                        <option value="lead">后值</option>
+                      </select>
+                      <input
+                        className="ide-input ide-text-mono"
+                        value={node.partitionBy.join(', ')}
+                        onChange={(event) =>
+                          patchNode(index, {
+                            partitionBy: event.target.value.split(',').map((item) => item.trim()).filter(Boolean),
+                          })
+                        }
+                        placeholder="分区字段：t0.customer_id, t0.region"
+                      />
+                      <input
+                        className="ide-input ide-text-mono"
+                        value={node.orderBy.join(', ')}
+                        onChange={(event) =>
+                          patchNode(index, {
+                            orderBy: event.target.value.split(',').map((item) => item.trim()).filter(Boolean),
+                          })
+                        }
+                        placeholder="排序字段：t0.create_time desc"
+                      />
+                      <input
+                        className="ide-input ide-text-mono"
+                        value={node.frame}
+                        onChange={(event) => patchNode(index, { frame: event.target.value })}
+                        placeholder="可选窗口：rows between 6 preceding and current row"
+                      />
+                    </div>
+                  )}
+                  {node.kind === 'merge' && (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--ide-sp-2)' }}>
+                      <select
+                        className="ide-select"
+                        value={node.mergeOperation}
+                        onChange={(event) => patchNode(index, { mergeOperation: event.target.value })}
+                      >
+                        <option value="add">相加</option>
+                        <option value="subtract">相减</option>
+                        <option value="multiply">相乘</option>
+                        <option value="divide">相除</option>
+                        <option value="coalesce">取首个非空值</option>
+                      </select>
+                      <input
+                        className="ide-input ide-text-mono"
+                        value={node.joinKeys.join(', ')}
+                        onChange={(event) =>
+                          patchNode(index, {
+                            joinKeys: event.target.value.split(',').map((item) => item.trim()).filter(Boolean),
+                          })
+                        }
+                        placeholder="跨查询合并键：customer_id, month"
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+              )}
+            </div>
+          );
+        })
+      )}
+    </section>
+  );
 }
 
 /** Unified field directory — the primary view showing all output fields, their DB mappings, and filters. */

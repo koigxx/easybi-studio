@@ -11,6 +11,7 @@ export type ScriptResourceBudget = {
 };
 export type ScriptQueryHandlers = {
     queryStream(queryId: string, values: unknown[]): Promise<AsyncIterable<JsonRecord>>;
+    queryStreamWithFilters(queryId: string, filtersOverride: unknown): Promise<AsyncIterable<JsonRecord>>;
     loadIndex(queryId: string, values: unknown[]): Promise<JsonRecord[]>;
     batchLookup(queryId: string, keys: unknown[], values: unknown[]): Promise<JsonRecord[]>;
 };
@@ -26,6 +27,8 @@ export declare function runScriptIsolated(options: {
     budget?: JsonRecord;
     handlers: ScriptQueryHandlers;
     onEmit(row: JsonRecord): Promise<void> | void;
+    onBeginSheet?(name: string): Promise<void> | void;
+    isPreview?: boolean;
     signal?: AbortSignal;
 }): Promise<{
     outputRows: number;

@@ -242,6 +242,14 @@ const RELATION_ALIASES: Record<string, string> = {
   full_join: 'full',
   cross_join: 'cross',
 };
+const MODEL_RELATION_TYPES = new Set(["left", "inner"]);
+const MODEL_CARDINALITIES = new Set(["1:1", "1:n", "n:1", "n:n", "unknown"]);
+const MODEL_CALCULATION_KINDS = new Set(["aggregate", "formula", "comparison", "window", "merge"]);
+const MODEL_CALCULATION_EXECUTION_HINTS = new Set(["auto", "sql", "script"]);
+const MODEL_CALCULATION_AGGREGATIONS = new Set(["sum", "count", "count_distinct", "avg", "min", "max", "first", "last"]);
+const MODEL_CALCULATION_WINDOWS = new Set(["row_number", "rank", "dense_rank", "running_sum", "moving_avg", "lag", "lead"]);
+const MODEL_CALCULATION_COMPARISONS = new Set(["difference", "rate", "chain", "yoy"]);
+const MODEL_CALCULATION_MERGES = new Set(["add", "subtract", "multiply", "divide", "coalesce"]);
 function normalizeRelationType(value: string): string {
   const key = value.trim().toLowerCase();
   return RELATION_ALIASES[key] ?? key;
@@ -4601,6 +4609,126 @@ export function validateDiscoveryReportModelValue(model: JsonRecord): string[] {
   return errors;
 }
 
+function validateCalculationGraphValue(
+  model: JsonRecord,
+  sourceFields: Map<string, Set<string>>,
+): string[] {
+  const graph = model.calculation_graph;
+  if (graph == null) return [];
+  const errors: string[] = [];
+  if (typeof graph !== "object" || Array.isArray(graph)) return ["calculation_graph 必须是对象"];
+  if (String(graph.version ?? "") !== "1") errors.push("calculation_graph.version 必须为 1");
+  if (!Array.isArray(graph.nodes)) return [...errors, "calculation_graph.nodes 必须是数组"];
+  const nodes = graph.nodes as JsonRecord[];
+  const nodeIds = new Set<string>();
+  const metricIds = new Set<string>((model.metrics ?? []).map((metric: JsonRecord) => String(metric.id ?? "")));
+  const queryOutputs = new Set<string>(
+    (model.query_contracts ?? []).flatMap((query: JsonRecord) =>
+      (query.output ?? query.output_contract ?? []).map((column: JsonRecord | string) =>
+        String(typeof column === "string" ? column : column.name ?? ""),
+      ),
+    ),
+  );
+  for (const node of nodes) {
+    const id = String(node.id ?? "");
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(id) || nodeIds.has(id)) {
+      errors.push(`计算节点 id 缺失、非法或重复：${id || "?"}`);
+    }
+    nodeIds.add(id);
+  }
+  const knownDependencies = new Set([...nodeIds, ...metricIds, ...queryOutputs]);
+  const edges = new Map<string, string[]>();
+  const parseField = (value: unknown): { alias: string; field: string } => {
+    const text = String(value ?? "");
+    const dot = text.indexOf(".");
+    return dot > 0
+      ? { alias: text.slice(0, dot), field: text.slice(dot + 1).replace(/\s+(asc|desc)$/i, "") }
+      : { alias: "", field: "" };
+  };
+  for (const node of nodes) {
+    const id = String(node.id ?? "");
+    const kind = String(node.kind ?? "");
+    const dependencies = Array.isArray(node.depends_on) ? node.depends_on.map(String) : [];
+    edges.set(id, dependencies.filter((dependency) => nodeIds.has(dependency)));
+    if (!String(node.label ?? "").trim()) errors.push(`计算节点 ${id || "?"} 缺少名称`);
+    if (!MODEL_CALCULATION_KINDS.has(kind)) errors.push(`计算节点 ${id || "?"} 类型不支持：${kind}`);
+    if (!String(node.output_type ?? "").trim()) errors.push(`计算节点 ${id || "?"} 缺少输出类型`);
+    const executionHint = String(node.execution_hint ?? "auto");
+    if (!MODEL_CALCULATION_EXECUTION_HINTS.has(executionHint)) {
+      errors.push(`计算节点 ${id || "?"} 的执行偏好不支持：${executionHint}`);
+    }
+    if (new Set(dependencies).size !== dependencies.length) errors.push(`计算节点 ${id || "?"} 存在重复依赖`);
+    for (const dependency of dependencies) {
+      if (!knownDependencies.has(dependency)) errors.push(`计算节点 ${id || "?"} 引用了未知依赖：${dependency}`);
+    }
+    if (kind === "aggregate") {
+      const source = String(node.source?.field ?? "");
+      const endpoint = parseField(source);
+      if (!endpoint.alias || !endpoint.field || !sourceFields.get(endpoint.alias)?.has(endpoint.field)) {
+        errors.push(`聚合节点 ${id || "?"} 的来源字段不在模型白名单中：${source || "?"}`);
+      }
+      if (!MODEL_CALCULATION_AGGREGATIONS.has(String(node.source?.aggregation ?? ""))) {
+        errors.push(`聚合节点 ${id || "?"} 的聚合方式不支持：${node.source?.aggregation ?? ""}`);
+      }
+    } else if (kind === "formula") {
+      if (!dependencies.length) errors.push(`公式节点 ${id || "?"} 至少需要一个依赖`);
+      const expression = String(node.expression ?? "").trim();
+      if (!expression) {
+        errors.push(`公式节点 ${id || "?"} 缺少表达式`);
+      } else {
+        const references = new Set(
+          [...expression.matchAll(/\{([A-Za-z][A-Za-z0-9_]*)\}/g)].map((match) => match[1]!),
+        );
+        for (const reference of references) {
+          if (!dependencies.includes(reference)) errors.push(`公式节点 ${id || "?"} 的表达式引用未声明依赖：${reference}`);
+        }
+        for (const dependency of dependencies) {
+          if (!references.has(dependency)) errors.push(`公式节点 ${id || "?"} 声明了未使用依赖：${dependency}`);
+        }
+      }
+    } else if (kind === "comparison") {
+      if (dependencies.length !== 1) errors.push(`对比节点 ${id || "?"} 必须且只能依赖一个指标`);
+      if (!MODEL_CALCULATION_COMPARISONS.has(String(node.comparison?.mode ?? ""))) {
+        errors.push(`对比节点 ${id || "?"} 的对比方式不支持：${node.comparison?.mode ?? ""}`);
+      }
+      if (!Number.isInteger(Number(node.comparison?.offset)) || Number(node.comparison?.offset) < 1) {
+        errors.push(`对比节点 ${id || "?"} 的偏移期数必须是正整数`);
+      }
+    } else if (kind === "window") {
+      if (dependencies.length !== 1) errors.push(`窗口节点 ${id || "?"} 必须且只能依赖一个指标`);
+      if (!MODEL_CALCULATION_WINDOWS.has(String(node.window?.function ?? ""))) {
+        errors.push(`窗口节点 ${id || "?"} 的窗口函数不支持：${node.window?.function ?? ""}`);
+      }
+      for (const field of [...(node.window?.partition_by ?? []), ...(node.window?.order_by ?? [])].map(String)) {
+        const endpoint = parseField(field);
+        if (!endpoint.alias || !endpoint.field || !sourceFields.get(endpoint.alias)?.has(endpoint.field)) {
+          errors.push(`窗口节点 ${id || "?"} 使用了模型外字段：${field}`);
+        }
+      }
+    } else if (kind === "merge") {
+      if (dependencies.length < 2) errors.push(`合并节点 ${id || "?"} 至少需要两个依赖`);
+      if (!MODEL_CALCULATION_MERGES.has(String(node.merge?.operation ?? ""))) {
+        errors.push(`合并节点 ${id || "?"} 的运算方式不支持：${node.merge?.operation ?? ""}`);
+      }
+    }
+  }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string, path: string[]): void => {
+    if (visiting.has(id)) {
+      errors.push(`计算节点存在循环依赖：${[...path, id].join(" -> ")}`);
+      return;
+    }
+    if (visited.has(id)) return;
+    visiting.add(id);
+    for (const dependency of edges.get(id) ?? []) visit(dependency, [...path, id]);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const id of nodeIds) visit(id, []);
+  return errors;
+}
+
 export function validateReportModelValue(model: JsonRecord, requireApproved = false): string[] {
   const errors: string[] = [];
   const strategy = String(model.recommended_strategy ?? "");
@@ -4632,8 +4760,26 @@ export function validateReportModelValue(model: JsonRecord, requireApproved = fa
       new Set((source.fields ?? []).map((field: JsonRecord | string) => String(typeof field === "string" ? field : field.name))),
     ]),
   );
+  for (const source of model.sources ?? []) {
+    if (source.alias) {
+      sourceFields.set(
+        String(source.alias),
+        new Set((source.fields ?? []).map((field: JsonRecord | string) =>
+          String(typeof field === "string" ? field : field.name),
+        )),
+      );
+    }
+  }
   const relationKeys = new Set<string>();
   for (const relationship of model.relationships ?? []) {
+    const relationshipType = normalizeRelationType(String(relationship.type ?? ""));
+    if (!MODEL_RELATION_TYPES.has(relationshipType)) {
+      errors.push(`不支持的关联类型：${relationship.type ?? ""}（仅支持 left/inner）`);
+    }
+    const cardinality = String(relationship.cardinality ?? "").trim().toLowerCase();
+    if (!MODEL_CARDINALITIES.has(cardinality)) {
+      errors.push(`不支持的关系基数：${relationship.cardinality ?? ""}`);
+    }
     const resolveEp = (raw: unknown): { id: string; field: string; display: string } => {
       if (typeof raw === "string" && raw.trim()) {
         const dot = raw.indexOf(".");
@@ -4708,6 +4854,7 @@ export function validateReportModelValue(model: JsonRecord, requireApproved = fa
     }
   }
   if (!(model.query_contracts ?? []).length) errors.push("模型至少需要一个查询契约");
+  errors.push(...validateCalculationGraphValue(model, sourceFields));
   if (requireApproved) {
     if ((model.open_questions ?? []).length) errors.push("仍有待确认问题，不能批准模型");
     if (model.approval?.status !== "approved") errors.push("模型尚未批准");
@@ -5100,6 +5247,22 @@ export async function buildPhaseContext(options: {
         model_format_version: REPORT_MODEL_FORMAT_VERSION,
         required_root_fields: ["report", "result_grain", "sources", "relationships", "metrics", "filters", "recommended_strategy", "query_contracts", "confirmation", "open_questions"],
         recommended_strategy: ["sql", "enrichment", "group_queries", "script"],
+        calculation_graph: {
+          required_for: ["多级派生指标", "占比/差额", "同比环比", "窗口累计/排名", "跨查询运算"],
+          version: "1",
+          node_kinds: ["aggregate", "formula", "comparison", "window", "merge"],
+          execution_hints: ["auto", "sql", "script"],
+          rules: ["depends_on 只引用基础指标、查询输出或其他节点", "禁止循环依赖", "来源字段必须在模型白名单"],
+          scenario_mapping: {
+            detail: "直接输出字段，不强制创建节点",
+            grouped_summary: "aggregate",
+            ratio_or_multi_level_derived: "aggregate + formula",
+            period_comparison: "comparison",
+            rank_or_running_total: "window",
+            cross_fact: "独立 query_contracts + merge",
+            pivot_funnel_retention_recursive: "script 策略并在执行计划中显式拆步骤和中间粒度",
+          },
+        },
         confirmation: ["discovery_revision", "confirmation_hash"],
         open_questions: "必须为空；业务口径已完成唯一一次确认",
       },
@@ -5126,7 +5289,12 @@ export async function buildPhaseContext(options: {
       return compactModelTable(table, new Set((source.fields ?? []).map(String)));
     });
     if (tables.length > 3) throw new Error(`查询 ${options.queryId} 涉及 ${tables.length} 张表；请拆分查询契约或明确例外`);
-    payload = { query_contract: contract, knowledge: { tables }, sql_dialect: contract.sql_dialect ?? plan.sql_dialect };
+    payload = {
+      query_contract: contract,
+      calculation_graph: model.calculation_graph ?? null,
+      knowledge: { tables },
+      sql_dialect: contract.sql_dialect ?? plan.sql_dialect,
+    };
     manifest.expected_outputs = [`queries/${options.queryId}.sql`, `query-outputs/${options.queryId}.json`];
   } else if (options.phase === "script") {
     if (!model) throw new Error("script 阶段需要 --model");
@@ -5160,8 +5328,9 @@ export async function buildPhaseContext(options: {
       result_grain: model.result_grain,
       semantic_plan: plan.semantic_plan,
       execution_plan: plan.execution_plan,
+      calculation_graph: model.calculation_graph ?? null,
       query_outputs: queryOutputs,
-      allowed_api: ["queryStream", "loadIndex", "batchLookup", "emit"],
+      allowed_api: ["queryStream", "queryStreamWithFilters", "loadIndex", "batchLookup", "beginSheet", "emit"],
     };
     manifest.forbidden_inputs.push("物理知识库", "表字段详情", "查询探索过程");
     manifest.expected_outputs = ["scripts/report.ts"];
@@ -5857,30 +6026,21 @@ export async function finalizeStagedPackage(options: {
   // report model so configurePlan can resolve column references. Preserve any
   // extra metadata (table_id, schema_fingerprint, system_conditions) already set
   // by inspect by merging available_fields into existing entries.
-  // Always inject create_time so reports never ship without a time filter.
+  // Rehydrate the model-selected fields into the plan. Time defaults are taken
+  // only from real knowledge fields discovered by inspect (create_time,
+  // created_at, gmt_create, semantic 创建时间, etc.); never fabricate a column.
   if (model.sources && Array.isArray(model.sources)) {
     plan.source = plan.source ?? {};
     const existingByAlias = new Map(
       (plan.source.tables ?? []).map((t: JsonRecord) => [t.alias, t]),
     );
-    // Always inject create_time into the primary table's available_fields so
-    // reports never ship without a time-range parameter. Merge with existing
-    // fields from inspect/model to avoid losing anything already resolved.
-    const injectTime = (alias: string, fields: string[]): string[] => {
-      const set = new Set(fields);
-      set.add("create_time");
-      return [...set];
-    };
-    const modelTables = model.sources.map((s: JsonRecord, index: number) => {
+    const modelTables = model.sources.map((s: JsonRecord) => {
       const existing: JsonRecord = existingByAlias.get(s.alias) ?? {};
       const modelFields = (s.fields ?? []).map((f: JsonRecord | string) =>
         typeof f === "string" ? f : String(f.name ?? ""),
       );
       const existingFields = (existing.available_fields ?? []).map(String);
-      // Merge: existing fields + model fields + create_time (for primary table)
-      const merged = index === 0
-        ? injectTime(s.alias, [...new Set([...existingFields, ...modelFields])])
-        : [...new Set([...existingFields, ...modelFields])];
+      const merged = [...new Set([...existingFields, ...modelFields])];
       return {
         ...existing,
         alias: s.alias ?? existing.alias,
@@ -6323,6 +6483,11 @@ export async function configurePlan(
   }
 
   const existingFieldIds = new Set((plan.fields ?? []).map((f: JsonRecord) => f.id));
+  const queryGroupMetricIds = new Set<string>(
+    (configuration.query_groups ?? []).flatMap((group: JsonRecord) =>
+      (group.metrics ?? []).map((metric: JsonRecord) => String(metric.id ?? "")),
+    ),
+  );
   const maxOrder = (plan.fields ?? []).reduce(
     (max: number, f: JsonRecord) => Math.max(max, Number(f.order ?? 0)),
     0,
@@ -6332,10 +6497,11 @@ export async function configurePlan(
     if (existingFieldIds.has(candidate.id)) continue;
     const kind = candidate.source?.kind;
     // time_shifted fields are resolved above; skip them here.
-    // Metric stubs from query_groups (kind=column) are also skipped — their full
-    // sql_expression resolution happens via applyGroupQueries for group_queries
-    // strategy, or via the declarative config for sql strategy.
-    if (kind === "time_shifted" || kind === "column") continue;
+    // Metric stubs from query_groups may temporarily use kind=column; their full
+    // sql_expression resolution happens via applyGroupQueries. Any other new
+    // physical column must still be rejected so knowledge lineage cannot be bypassed.
+    if (kind === "time_shifted") continue;
+    if (kind === "column" && queryGroupMetricIds.has(String(candidate.id))) continue;
     if (
       kind !== "computed" &&
       kind !== "sql_expression" &&

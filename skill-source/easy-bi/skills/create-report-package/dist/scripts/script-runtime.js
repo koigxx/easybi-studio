@@ -1,4 +1,6 @@
 import { fork } from "node:child_process";
+import { realpath } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 export class ScriptExecutionError extends Error {
     code;
@@ -31,7 +33,9 @@ export async function runScriptIsolated(options) {
     if (options.signal?.aborted) {
         throw new ScriptExecutionError("SCRIPT_CANCELED", "脚本报表执行已取消");
     }
-    const runnerPath = fileURLToPath(new URL("./script-runner.js", import.meta.url));
+    const runnerPath = await realpath(fileURLToPath(new URL("./script-runner.js", import.meta.url)));
+    const scriptPath = await realpath(options.scriptPath);
+    const runnerPackageRoot = resolve(dirname(runnerPath), "../..");
     const streams = new Map();
     let streamSequence = 0;
     let queryCount = 0;
@@ -82,8 +86,8 @@ export async function runScriptIsolated(options) {
         child = fork(runnerPath, [], {
             execArgv: [
                 "--permission",
-                `--allow-fs-read=${runnerPath}`,
-                `--allow-fs-read=${options.scriptPath}`,
+                `--allow-fs-read=${runnerPackageRoot}`,
+                `--allow-fs-read=${dirname(scriptPath)}`,
                 `--max-old-space-size=${Math.max(16, budget.max_memory_mb)}`,
             ],
             stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -107,8 +111,12 @@ export async function runScriptIsolated(options) {
             if (message?.type === "ready") {
                 child?.send({
                     type: "start",
-                    scriptPath: options.scriptPath,
-                    input: { filters: options.filters ?? {}, context: options.context ?? {} },
+                    scriptPath,
+                    input: {
+                        filters: options.filters ?? {},
+                        context: options.context ?? {},
+                        isPreview: Boolean(options.isPreview),
+                    },
                 });
                 return;
             }
@@ -129,6 +137,13 @@ export async function runScriptIsolated(options) {
                 if (message.method === "openQueryStream") {
                     countQuery();
                     const iterable = await options.handlers.queryStream(String(payload.queryId), payload.values ?? []);
+                    const streamId = `stream-${++streamSequence}`;
+                    streams.set(streamId, iterable[Symbol.asyncIterator]());
+                    sendResult(requestId, true, { streamId });
+                }
+                else if (message.method === "openQueryStreamWithFilters") {
+                    countQuery();
+                    const iterable = await options.handlers.queryStreamWithFilters(String(payload.queryId), payload.filtersOverride);
                     const streamId = `stream-${++streamSequence}`;
                     streams.set(streamId, iterable[Symbol.asyncIterator]());
                     sendResult(requestId, true, { streamId });
@@ -182,6 +197,15 @@ export async function runScriptIsolated(options) {
                         throw new ScriptExecutionError("OUTPUT_ROW_LIMIT_EXCEEDED", `脚本输出行数超过上限 ${budget.max_output_rows}`);
                     }
                     await options.onEmit(payload.row);
+                    sendResult(requestId, true, null);
+                }
+                else if (message.method === "beginSheet") {
+                    const name = String(payload.name ?? "").trim();
+                    if (!name) {
+                        throw new ScriptExecutionError("INVALID_SHEET_NAME", "Sheet 名称不能为空");
+                    }
+                    if (!options.isPreview)
+                        await options.onBeginSheet?.(name);
                     sendResult(requestId, true, null);
                 }
                 else {

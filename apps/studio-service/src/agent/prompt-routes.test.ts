@@ -37,7 +37,7 @@ beforeAll(async () => {
         },
         {
           id: 'create-report-package',
-          version: '2.28.8',
+          version: '2.30.1',
           path: 'create-report-package',
           agent_entry: 'create-report-package/SKILL.md',
           agent_prompts: 'create-report-package/prompts.json',

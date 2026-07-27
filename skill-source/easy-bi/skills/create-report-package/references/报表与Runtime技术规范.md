@@ -512,6 +512,59 @@ Studio 对用户保持一个逻辑对话，但复杂报表在 Provider 层拆成
 
 `report-model.json` 的 hash 排除审批时间等元数据，批准后任何业务内容变化都会使校验失败。查询契约与最终脚本配置必须同时满足表白名单和字段白名单；缺表/缺字段必须显式回到建模阶段扩展。每个 Context Pack 包含 `fresh_session`、允许/禁止输入、表/字段/字节预算和预期产物，超过预算直接失败，不静默扩大上下文。
 
-建模阶段产物固定放在 `work/report-model/<report-id>/<revision>/`，生成阶段产物固定放在 `work/report-build/<report-id>/<revision>/`，二者不得混用。`validate-stage` 是阶段完成门禁；Provider 的 `completed` 事件本身不代表阶段成功。`finalize-staged-model` 使用唯一一次用户确认结果批准模型，生成最小 `source.lock.json`、manifest 和 checksums 后原子替换当前模型。Studio 的模型编辑器只允许修改字段白名单与关联关系，保存时重新校验字段、同步查询契约/最小 source lock、更新 plan 引用并重新封存。v3 每个查询契约由独立 fresh Agent 编译，外层 SELECT 别名必须按顺序匹配输出契约；声明式策略只复核 `declarative-configuration.json`。`finalize-staged` 先在 revision 内生成并校验候选包，再原子替换唯一当前开发包和索引；已发布包不可覆盖。只有 script 策略构造 `configuration.script_report`。Agent 不得直接编辑 `plan.script_report`。
+建模阶段产物固定放在 `work/report-model/<report-id>/<revision>/`，生成阶段产物固定放在 `work/report-build/<report-id>/<revision>/`，二者不得混用。`validate-stage` 是阶段完成门禁；Provider 的 `completed` 事件本身不代表阶段成功。`finalize-staged-model` 使用唯一一次用户确认结果批准模型，生成最小 `source.lock.json`、manifest 和 checksums 后原子替换当前模型。Studio 的模型编辑器允许修改字段白名单、关联关系、筛选、基础指标以及结构化复杂计算图，保存时重新校验字段、计算依赖/循环、同步查询契约/最小 source lock、更新 plan 引用并重新封存。v3 每个查询契约由独立 fresh Agent 编译，外层 SELECT 别名必须按顺序匹配输出契约；声明式策略只复核 `declarative-configuration.json`。`finalize-staged` 先在 revision 内生成并校验候选包，再原子替换唯一当前开发包和索引；已发布包不可覆盖。只有 script 策略构造 `configuration.script_report`。Agent 不得直接编辑 `plan.script_report`。
+
+### 19.1 复杂计算图
+
+`report-model.json.calculation_graph` 是可选、向后兼容的复杂指标 DAG，格式固定为：
+
+```json
+{
+  "version": "1",
+  "nodes": [
+    {
+      "id": "profit_rate",
+      "label": "利润率",
+      "kind": "formula",
+      "output_type": "percentage",
+      "depends_on": ["profit", "income"],
+      "expression": "{profit} / nullif({income}, 0)",
+      "execution_hint": "auto",
+      "output": true,
+      "description": "利润占收入比例"
+    }
+  ]
+}
+```
+
+节点类型及专属配置：
+
+- `aggregate`：`source.field/aggregation/condition`，用于 `sum/count/count_distinct/avg/min/max/first/last`。
+- `formula`：`expression`，使用 `{node_id}` 引用依赖，用于加减乘除、占比及多级派生。
+- `comparison`：`comparison.mode/offset`，用于差额、变化率、环比与同比。
+- `window`：`window.function/partition_by/order_by/frame`，用于排名、累计、移动平均、lag/lead。
+- `merge`：`merge.operation/join_keys`，用于不同查询结果之间的算术或空值合并。
+
+`depends_on` 只能引用基础指标、查询输出或其他计算节点，禁止重复依赖、未知依赖和循环依赖。聚合来源及窗口分区/排序字段必须属于模型字段白名单。`execution_hint=auto` 由生成阶段在 SQL 与隔离脚本之间确定性选择；`sql/script` 是显式偏好，但不能绕过安全、粒度和资源门禁。
+
+### 19.2 常规报表场景映射
+
+建模时至少按下表判断一次，不能只根据“几张表”决定策略：
+
+| 场景 | 模型表达 | 默认策略 |
+|---|---|---|
+| 明细清单、台账 | 结果粒度键 + 直接输出字段 + 筛选/排序 | `sql` |
+| 单表分组汇总、状态分布 | `aggregate` 节点，条件指标写入 `source.condition` | `sql` |
+| 多表维度汇总 | `n:1` 关系 + `aggregate`，先检查扇出 | `sql` |
+| 订单数、客户数等去重指标 | `count_distinct` + 明确业务去重键 | `sql` |
+| 毛利、完成率、客单价、占比 | 基础聚合节点 + `formula` 多级派生 | `auto` |
+| 同比、环比、变化率 | `comparison`，明确基础指标、时间参数和偏移期数 | `auto` |
+| 排名、累计、移动平均、前后值 | `window`，明确分区、排序和 frame | `auto` |
+| 目标与实际、订单与退款等跨事实指标 | 每个事实独立查询 + `merge` + 稳定合并键 | `group_queries` 或 `script` |
+| 一对多附加标签/列表 | 主粒度保持不变，使用有界 enrichment | `enrichment` |
+| 多阶段查找、动态透视、漏斗、留存、树形递归 | 在语义/执行计划中显式拆步骤和中间粒度；现有节点不足时必须选择脚本并保留完整查询契约 | `script` |
+| 多 Sheet 输出 | 计算图负责字段和依赖，执行计划负责 Sheet 名称、列集合与输出顺序 | `script` |
+
+每个指标必须回答：统计实体是什么、结果粒度是什么、来源字段是什么、是否需要去重、时间归属是什么、排除条件是什么、是否跨事实、依赖哪些指标。任何一个答案缺失且会改变结果时，必须在唯一一次统一确认中提出；不能留给 SQL/脚本生成阶段自行猜测。
 
 查询输出契约必须与模型逐列匹配名称、顺序及双方都声明的类型；缺文件、额外/遗漏列、模型 hash 漂移、SQL/脚本安全失败、表字段白名单越界或最终包静态校验失败都会阻止阶段前进。Studio 的 SSE 游标计入 `run_started/run_completed/user_message` 等所有持久化事件，跨阶段重新订阅不得跳过或重放旧的 `job_completed`。

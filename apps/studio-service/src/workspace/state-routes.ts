@@ -125,6 +125,31 @@ export function registerWorkspaceStateRoutes(
         period_param: string;
         lookback_months: number;
       } | null;
+      calculationGraph?: {
+        version: '1';
+        nodes: Array<{
+          id: string;
+          label: string;
+          kind: 'aggregate' | 'formula' | 'comparison' | 'window' | 'merge';
+          outputType: string;
+          dependencies: string[];
+          expression: string;
+          sourceField: string;
+          aggregation: string;
+          condition: string;
+          comparisonMode: string;
+          comparisonOffset: number;
+          windowFunction: string;
+          partitionBy: string[];
+          orderBy: string[];
+          frame: string;
+          mergeOperation: string;
+          joinKeys: string[];
+          executionHint: 'auto' | 'sql' | 'script';
+          output: boolean;
+          description: string;
+        }>;
+      };
       metricEdits?: Array<{
         id: string;
         sourceField?: string;
@@ -179,6 +204,7 @@ export function registerWorkspaceStateRoutes(
           sources: body.sources,
           relationships: body.relationships,
           comparison: body.comparison,
+          calculationGraph: body.calculationGraph,
           metricEdits: body.metricEdits,
           filterEdits: body.filterEdits,
         }),

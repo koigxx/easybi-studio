@@ -9,14 +9,11 @@ import { normalizeAbsolute, resolveWithinWorkspace } from './paths.js';
 type JsonRecord = Record<string, any>;
 
 const REPORT_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
-const KNOWN_RELATION_TYPES = ['inner', 'left', 'right', 'full', 'cross'] as const;
+const KNOWN_RELATION_TYPES = ['inner', 'left'] as const;
 const RELATION_TYPES = new Set<string>(KNOWN_RELATION_TYPES);
 const RELATION_ALIASES: Record<string, string> = {
   inner_join: 'inner',
   left_join: 'left',
-  right_join: 'right',
-  full_join: 'full',
-  cross_join: 'cross',
 };
 
 function normalizeRelationType(value: string): string {
@@ -25,6 +22,29 @@ function normalizeRelationType(value: string): string {
 }
 const KNOWN_CARDINALITIES = ['1:1', '1:n', 'n:1', 'n:n', 'unknown'] as const;
 const CARDINALITIES = new Set<string>(KNOWN_CARDINALITIES);
+const CALCULATION_KINDS = new Set(['aggregate', 'formula', 'comparison', 'window', 'merge']);
+const CALCULATION_EXECUTION_HINTS = new Set(['auto', 'sql', 'script']);
+const CALCULATION_AGGREGATIONS = new Set([
+  'sum',
+  'count',
+  'count_distinct',
+  'avg',
+  'min',
+  'max',
+  'first',
+  'last',
+]);
+const CALCULATION_WINDOWS = new Set([
+  'row_number',
+  'rank',
+  'dense_rank',
+  'running_sum',
+  'moving_avg',
+  'lag',
+  'lead',
+]);
+const CALCULATION_COMPARISONS = new Set(['difference', 'rate', 'chain', 'yoy']);
+const CALCULATION_MERGES = new Set(['add', 'subtract', 'multiply', 'divide', 'coalesce']);
 
 function normalizeCardinality(value: string): string {
   return value.trim().toLowerCase();
@@ -135,20 +155,174 @@ function parseEndpoint(raw: unknown): { sourceId: string; field: string; normali
   return { sourceId: '', field: '', normalized: String(raw ?? ''), display: JSON.stringify(raw ?? '(空)') };
 }
 
+function validateCalculationGraph(model: JsonRecord, sourceFields: Map<string, Set<string>>): string[] {
+  const graph = model.calculation_graph;
+  if (graph == null) return [];
+  const errors: string[] = [];
+  if (typeof graph !== 'object' || Array.isArray(graph)) return ['calculation_graph 必须是对象'];
+  if (String(graph.version ?? '') !== '1') errors.push('calculation_graph.version 必须为 1');
+  if (!Array.isArray(graph.nodes)) return [...errors, 'calculation_graph.nodes 必须是数组'];
+
+  const nodes = graph.nodes as JsonRecord[];
+  const nodeIds = new Set<string>();
+  const metricIds = new Set<string>((model.metrics ?? []).map((metric: JsonRecord) => String(metric.id ?? '')));
+  const queryOutputs = new Set<string>(
+    (model.query_contracts ?? []).flatMap((query: JsonRecord) =>
+      (query.output ?? query.output_contract ?? []).map((column: JsonRecord | string) =>
+        String(typeof column === 'string' ? column : column.name ?? ''),
+      ),
+    ),
+  );
+  for (const node of nodes) {
+    const id = String(node.id ?? '');
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(id) || nodeIds.has(id)) {
+      errors.push(`计算节点 id 缺失、非法或重复：${id || '?'}`);
+    }
+    nodeIds.add(id);
+  }
+
+  const knownDependencies = new Set([...nodeIds, ...metricIds, ...queryOutputs]);
+  const edges = new Map<string, string[]>();
+  for (const node of nodes) {
+    const id = String(node.id ?? '');
+    const kind = String(node.kind ?? '');
+    const dependencies = Array.isArray(node.depends_on) ? node.depends_on.map(String) : [];
+    edges.set(id, dependencies.filter((dependency) => nodeIds.has(dependency)));
+    if (!String(node.label ?? '').trim()) errors.push(`计算节点 ${id || '?'} 缺少名称`);
+    if (!CALCULATION_KINDS.has(kind)) errors.push(`计算节点 ${id || '?'} 类型不支持：${kind}`);
+    if (!String(node.output_type ?? '').trim()) errors.push(`计算节点 ${id || '?'} 缺少输出类型`);
+    const executionHint = String(node.execution_hint ?? 'auto');
+    if (!CALCULATION_EXECUTION_HINTS.has(executionHint)) {
+      errors.push(`计算节点 ${id || '?'} 的执行偏好不支持：${executionHint}`);
+    }
+    if (new Set(dependencies).size !== dependencies.length) {
+      errors.push(`计算节点 ${id || '?'} 存在重复依赖`);
+    }
+    for (const dependency of dependencies) {
+      if (!knownDependencies.has(dependency)) {
+        errors.push(`计算节点 ${id || '?'} 引用了未知依赖：${dependency}`);
+      }
+    }
+    if (kind === 'aggregate') {
+      const source = String(node.source?.field ?? '');
+      const endpoint = parseEndpoint(source);
+      if (
+        !endpoint.sourceId ||
+        !endpoint.field ||
+        !sourceFields.get(endpoint.sourceId)?.has(endpoint.field)
+      ) {
+        errors.push(`聚合节点 ${id || '?'} 的来源字段不在模型白名单中：${source || '?'}`);
+      }
+      if (!CALCULATION_AGGREGATIONS.has(String(node.source?.aggregation ?? ''))) {
+        errors.push(`聚合节点 ${id || '?'} 的聚合方式不支持：${node.source?.aggregation ?? ''}`);
+      }
+    } else if (kind === 'formula') {
+      if (!dependencies.length) errors.push(`公式节点 ${id || '?'} 至少需要一个依赖`);
+      const expression = String(node.expression ?? '').trim();
+      if (!expression) {
+        errors.push(`公式节点 ${id || '?'} 缺少表达式`);
+      } else {
+        const references = new Set(
+          [...expression.matchAll(/\{([A-Za-z][A-Za-z0-9_]*)\}/g)].map((match) => match[1]!),
+        );
+        for (const reference of references) {
+          if (!dependencies.includes(reference)) {
+            errors.push(`公式节点 ${id || '?'} 的表达式引用未声明依赖：${reference}`);
+          }
+        }
+        for (const dependency of dependencies) {
+          if (!references.has(dependency)) {
+            errors.push(`公式节点 ${id || '?'} 声明了未使用依赖：${dependency}`);
+          }
+        }
+      }
+    } else if (kind === 'comparison') {
+      if (dependencies.length !== 1) errors.push(`对比节点 ${id || '?'} 必须且只能依赖一个指标`);
+      if (!CALCULATION_COMPARISONS.has(String(node.comparison?.mode ?? ''))) {
+        errors.push(`对比节点 ${id || '?'} 的对比方式不支持：${node.comparison?.mode ?? ''}`);
+      }
+      if (!Number.isInteger(Number(node.comparison?.offset)) || Number(node.comparison?.offset) < 1) {
+        errors.push(`对比节点 ${id || '?'} 的偏移期数必须是正整数`);
+      }
+    } else if (kind === 'window') {
+      if (dependencies.length !== 1) errors.push(`窗口节点 ${id || '?'} 必须且只能依赖一个指标`);
+      if (!CALCULATION_WINDOWS.has(String(node.window?.function ?? ''))) {
+        errors.push(`窗口节点 ${id || '?'} 的窗口函数不支持：${node.window?.function ?? ''}`);
+      }
+      for (const field of [
+        ...(node.window?.partition_by ?? []),
+        ...(node.window?.order_by ?? []),
+      ].map(String)) {
+        const endpoint = parseEndpoint(field.replace(/\s+(asc|desc)$/i, ''));
+        if (
+          !endpoint.sourceId ||
+          !endpoint.field ||
+          !sourceFields.get(endpoint.sourceId)?.has(endpoint.field)
+        ) {
+          errors.push(`窗口节点 ${id || '?'} 使用了模型外字段：${field}`);
+        }
+      }
+    } else if (kind === 'merge') {
+      if (dependencies.length < 2) errors.push(`合并节点 ${id || '?'} 至少需要两个依赖`);
+      if (!CALCULATION_MERGES.has(String(node.merge?.operation ?? ''))) {
+        errors.push(`合并节点 ${id || '?'} 的运算方式不支持：${node.merge?.operation ?? ''}`);
+      }
+    }
+  }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string, path: string[]): void => {
+    if (visiting.has(id)) {
+      errors.push(`计算节点存在循环依赖：${[...path, id].join(' -> ')}`);
+      return;
+    }
+    if (visited.has(id)) return;
+    visiting.add(id);
+    for (const dependency of edges.get(id) ?? []) visit(dependency, [...path, id]);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const id of nodeIds) visit(id, []);
+  return errors;
+}
+
 function validateModel(model: JsonRecord): string[] {
   const errors: string[] = [];
   if (!model.report?.id || !model.report?.name) errors.push('模型缺少报表 id/name');
-  if (!model.result_grain?.description || !(model.result_grain?.keys ?? []).length) {
-    errors.push('模型必须明确结果粒度和稳定键');
+  const grainDescription = String(model.result_grain?.description ?? '').trim();
+  const grainKeys = model.result_grain?.keys;
+  const keylessSingleRow =
+    Array.isArray(grainKeys) &&
+    grainKeys.length === 0 &&
+    /单行|单条|汇总为一行|single[\s_-]?row/i.test(grainDescription);
+  if (
+    !grainDescription ||
+    !Array.isArray(grainKeys) ||
+    (!grainKeys.length && !keylessSingleRow)
+  ) {
+    errors.push('模型必须明确结果粒度和稳定键；单行汇总可使用空 keys');
   }
   const sources = new Map<string, Set<string>>();
   for (const source of model.sources ?? []) {
     if (!source.id || sources.has(String(source.id))) errors.push('模型来源 id 缺失或重复');
+    if (!source.profile_id || !source.database || !source.table || !source.alias) {
+      errors.push(`来源 ${source.id ?? '?'} 缺少物理定位`);
+    }
     const names = new Set<string>((source.fields ?? []).map(fieldName).filter(Boolean));
     if (!names.size) errors.push(`来源 ${source.id ?? '?'} 没有字段白名单`);
     sources.set(String(source.id), names);
+    if (source.alias) sources.set(String(source.alias), names);
   }
   for (const relation of model.relationships ?? []) {
+    const relationType = normalizeRelationType(String(relation.type ?? ''));
+    if (!RELATION_TYPES.has(relationType)) {
+      errors.push(`不支持的关联类型：${relation.type ?? ''}`);
+    }
+    const cardinality = normalizeCardinality(String(relation.cardinality ?? ''));
+    if (!CARDINALITIES.has(cardinality)) {
+      errors.push(`不支持的关系基数：${relation.cardinality ?? ''}`);
+    }
     for (const endpoint of ['from', 'to'] as const) {
       const ep = parseEndpoint(relation[endpoint]);
       if (!ep.sourceId || !ep.field || !sources.get(ep.sourceId)?.has(ep.field)) {
@@ -161,9 +335,22 @@ function validateModel(model: JsonRecord): string[] {
     errors.push('recommended_strategy 必须是 sql|enrichment|group_queries|script');
   }
   if (!(model.query_contracts ?? []).length) errors.push('模型至少需要一个查询契约');
+  const queryIds = new Set<string>();
   for (const query of model.query_contracts ?? []) {
+    const queryId = String(query.id ?? '');
+    if (!queryId || queryIds.has(queryId)) errors.push('查询契约 id 缺失或重复');
+    queryIds.add(queryId);
     if (!(query.sources ?? []).length) errors.push(`查询契约 ${query.id ?? '?'} 没有来源`);
+    if (!query.result_grain) errors.push(`查询契约 ${query.id ?? '?'} 缺少结果粒度`);
     if (!(query.output ?? []).length) errors.push(`查询契约 ${query.id ?? '?'} 没有输出契约`);
+    const outputNames = new Set<string>();
+    for (const column of query.output ?? []) {
+      const name = String(typeof column === 'string' ? column : column.name ?? '').trim();
+      if (!name || outputNames.has(name)) {
+        errors.push(`查询契约 ${query.id ?? '?'} 的输出列缺失或重复`);
+      }
+      outputNames.add(name);
+    }
     for (const source of query.sources ?? []) {
       const modelSource = (model.sources ?? []).find((item: JsonRecord) => sourceKey(item) === sourceKey(source));
       const allowed = new Set<string>((modelSource?.fields ?? []).map(fieldName));
@@ -174,6 +361,7 @@ function validateModel(model: JsonRecord): string[] {
       }
     }
   }
+  errors.push(...validateCalculationGraph(model, sources));
   return errors;
 }
 
@@ -261,6 +449,42 @@ export interface ReportModelMetric {
   confidence: string;
 }
 
+export type ReportModelCalculationKind =
+  | 'aggregate'
+  | 'formula'
+  | 'comparison'
+  | 'window'
+  | 'merge';
+
+export interface ReportModelCalculationNode {
+  id: string;
+  label: string;
+  kind: ReportModelCalculationKind;
+  outputType: string;
+  dependencies: string[];
+  expression: string;
+  sourceField: string;
+  aggregation: string;
+  condition: string;
+  comparisonMode: string;
+  comparisonOffset: number;
+  windowFunction: string;
+  partitionBy: string[];
+  orderBy: string[];
+  frame: string;
+  mergeOperation: string;
+  joinKeys: string[];
+  executionHint: 'auto' | 'sql' | 'script';
+  output: boolean;
+  description: string;
+}
+
+export interface ReportModelCalculationGraph {
+  version: '1';
+  nodes: ReportModelCalculationNode[];
+  persisted: boolean;
+}
+
 export interface ReportModelFilter {
   id: string;
   label: string;
@@ -315,6 +539,7 @@ export interface ReportModelDetail {
   relationships: EditableModelRelationship[];
   filters: ReportModelFilter[];
   metrics: ReportModelMetric[];
+  calculationGraph: ReportModelCalculationGraph;
   timeSemantics: ReportModelTimeSemantics | null;
   queryContracts: ReportModelQueryContract[];
   comparison: ReportModelComparison | null;
@@ -361,7 +586,6 @@ export async function readReportModel(
       (field: JsonRecord | string): { name: string; role: string } =>
         typeof field === 'string' ? { name: field, role: 'source' } : { name: fieldName(field), role: String((field as JsonRecord).role ?? 'source') },
     );
-    const selectedNames = new Set(selectedFields.map((f: { name: string }) => f.name));
     const table =
       allTables.find((item) => sourceKey(item.physical ?? {}) === sourceKey(source)) ??
       compactTables.find((item: JsonRecord) => sourceKey(item.physical ?? {}) === sourceKey(source));
@@ -386,6 +610,29 @@ export async function readReportModel(
         }),
     };
   });
+  const persistedCalculationNodes = Array.isArray(model.calculation_graph?.nodes)
+    ? (model.calculation_graph.nodes as JsonRecord[])
+    : null;
+  const calculationNodes = persistedCalculationNodes ?? (model.metrics ?? []).map((metric: JsonRecord) => ({
+    id: metric.id,
+    label: metric.label ?? metric.id,
+    kind: 'aggregate',
+    output_type: metric.output_type ?? 'number',
+    depends_on: [],
+    source: {
+      field:
+        metric.aggregation === 'count_distinct' && metric.dedup_key
+          ? metric.dedup_key
+          : metric.source_alias && metric.source_field
+            ? `${metric.source_alias}.${metric.source_field}`
+            : metric.dedup_key ?? '',
+      aggregation: metric.aggregation,
+      condition: metric.condition ?? '',
+    },
+    execution_hint: 'auto',
+    output: true,
+    description: metric.evidence ?? '',
+  }));
 
   return {
     reportId: String(model.report?.id ?? reportId),
@@ -444,6 +691,34 @@ export async function readReportModel(
       evidence: String(m.evidence ?? ''),
       confidence: String(m.confidence ?? 'hypothesis'),
     })),
+    calculationGraph: {
+      version: '1',
+      persisted: persistedCalculationNodes !== null,
+      nodes: calculationNodes.map((node: JsonRecord): ReportModelCalculationNode => ({
+        id: String(node.id ?? ''),
+        label: String(node.label ?? node.id ?? ''),
+        kind: String(node.kind ?? 'formula') as ReportModelCalculationKind,
+        outputType: String(node.output_type ?? 'number'),
+        dependencies: Array.isArray(node.depends_on) ? node.depends_on.map(String) : [],
+        expression: String(node.expression ?? ''),
+        sourceField: String(node.source?.field ?? ''),
+        aggregation: String(node.source?.aggregation ?? ''),
+        condition: String(node.source?.condition ?? ''),
+        comparisonMode: String(node.comparison?.mode ?? ''),
+        comparisonOffset: Number(node.comparison?.offset ?? 1),
+        windowFunction: String(node.window?.function ?? ''),
+        partitionBy: Array.isArray(node.window?.partition_by)
+          ? node.window.partition_by.map(String)
+          : [],
+        orderBy: Array.isArray(node.window?.order_by) ? node.window.order_by.map(String) : [],
+        frame: String(node.window?.frame ?? ''),
+        mergeOperation: String(node.merge?.operation ?? ''),
+        joinKeys: Array.isArray(node.merge?.join_keys) ? node.merge.join_keys.map(String) : [],
+        executionHint: String(node.execution_hint ?? 'auto') as 'auto' | 'sql' | 'script',
+        output: node.output !== false,
+        description: String(node.description ?? ''),
+      })),
+    },
     timeSemantics: model.time_semantics && typeof model.time_semantics === 'object'
       ? {
           status: String(model.time_semantics.status ?? ''),
@@ -489,6 +764,11 @@ export interface ReportModelEdit {
   sources: Array<{ id: string; fields: Array<{ name: string; role?: string }> }>;
   relationships: EditableModelRelationship[];
   comparison?: ReportModelComparison | null;
+  /** Full replacement of the structured calculation DAG. Omit to preserve the current graph. */
+  calculationGraph?: {
+    version: '1';
+    nodes: ReportModelCalculationNode[];
+  };
   /** Per-metric source field mapping edits: { id, sourceField, dedupKey, sourceAlias? } */
   metricEdits?: Array<{
     id: string;
@@ -577,6 +857,12 @@ export async function writeReportModel(
       new Set<string>((source.fields ?? []).map(fieldName)),
     ]),
   );
+  const selectedByAlias = new Map(
+    [...existingSources.values()].map((source) => [
+      String(source.alias),
+      new Set<string>((source.fields ?? []).map(fieldName)),
+    ]),
+  );
   const relationKeys = new Set<string>();
   model.relationships = edit.relationships.map((relationship) => {
     if (!RELATION_TYPES.has(relationship.type)) {
@@ -625,7 +911,46 @@ export async function writeReportModel(
     const metrics = model.metrics ?? [];
     for (const medit of edit.metricEdits) {
       const metric = metrics.find((m: JsonRecord) => String(m.id) === medit.id);
-      if (!metric) continue;
+      const sourceAlias = medit.sourceAlias?.trim();
+      const sourceField = medit.sourceField?.trim();
+      if ((sourceAlias && !sourceField) || (!sourceAlias && sourceField)) {
+        throw new ReportModelError('INVALID', `指标 ${medit.id} 的来源别名和字段必须同时设置`);
+      }
+      if (sourceAlias && sourceField && !selectedByAlias.get(sourceAlias)?.has(sourceField)) {
+        throw new ReportModelError(
+          'INVALID',
+          `指标 ${medit.id} 的来源字段不在模型白名单中：${sourceAlias}.${sourceField}`,
+        );
+      }
+      if (medit.dedupKey) {
+        const endpoint = parseEndpoint(medit.dedupKey);
+        if (
+          !endpoint.sourceId ||
+          !endpoint.field ||
+          !selectedByAlias.get(endpoint.sourceId)?.has(endpoint.field)
+        ) {
+          throw new ReportModelError(
+            'INVALID',
+            `指标 ${medit.id} 的去重键不在模型白名单中：${medit.dedupKey}`,
+          );
+        }
+      }
+      if (!metric) {
+        let updated = false;
+        for (const contract of model.query_contracts ?? []) {
+          for (const column of contract.output_contract ?? contract.output ?? []) {
+            if (String((column as JsonRecord).name ?? '') !== medit.id) continue;
+            if (sourceAlias && sourceField) {
+              (column as JsonRecord).source = `${sourceAlias}.${sourceField}`;
+              updated = true;
+            }
+          }
+        }
+        if (!updated) {
+          throw new ReportModelError('INVALID', `模型中不存在可编辑指标或输出字段：${medit.id}`);
+        }
+        continue;
+      }
       if (medit.sourceField) metric.source_field = medit.sourceField;
       if (medit.sourceAlias) metric.source_alias = medit.sourceAlias;
       if (medit.dedupKey) metric.dedup_key = medit.dedupKey;
@@ -658,7 +983,35 @@ export async function writeReportModel(
         if (paramIdx >= 0) parameters.splice(paramIdx, 1);
         continue;
       }
-      const existing = filters.find((f: JsonRecord) => String(f.id) === fedit.id);
+      if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(fedit.id)) {
+        throw new ReportModelError('INVALID', `筛选参数 ID 不合法：${fedit.id}`);
+      }
+      const existing = filters.find((filter) => String(filter.id) === fedit.id);
+      const existingClause = String(existing?.sql_binding?.clause ?? 'where');
+      const existingExpression = String(existing?.sql_binding?.expression ?? '');
+      const clause = String(fedit.clause ?? existingClause);
+      const expression = String(fedit.expression ?? existingExpression);
+      const bindingChanged =
+        clause !== existingClause || expression !== existingExpression || !existing;
+      if (bindingChanged && !['where', 'having'].includes(clause)) {
+        throw new ReportModelError('INVALID', `模型编辑器不支持新增或改写 ${clause} 筛选`);
+      }
+      if (bindingChanged && expression) {
+        const match = expression.match(
+          /^([A-Za-z][A-Za-z0-9_]*)\.(?:`([^`]+)`|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))$/,
+        );
+        const alias = match?.[1] ?? '';
+        const field = match?.[2] ?? match?.[3] ?? match?.[4] ?? '';
+        if (!alias || !field || !selectedByAlias.get(alias)?.has(field)) {
+          throw new ReportModelError(
+            'INVALID',
+            `筛选 ${fedit.id} 的来源字段不在模型白名单中：${expression}`,
+          );
+        }
+      }
+      if (!expression && !existing) {
+        throw new ReportModelError('INVALID', `新增筛选 ${fedit.id} 必须选择来源字段`);
+      }
       const filterEntry: JsonRecord = existing ?? { id: fedit.id };
       if (fedit.label) filterEntry.label = fedit.label;
       if (fedit.valueType) filterEntry.value_type = fedit.valueType;
@@ -713,6 +1066,58 @@ export async function writeReportModel(
     }
     model.filters = filters;
     model.parameters = parameters;
+  }
+
+  if (edit.calculationGraph) {
+    model.calculation_graph = {
+      version: '1',
+      nodes: edit.calculationGraph.nodes.map((node) => ({
+        id: node.id.trim(),
+        label: node.label.trim(),
+        kind: node.kind,
+        output_type: node.outputType.trim() || 'number',
+        depends_on: node.dependencies.map((dependency) => dependency.trim()).filter(Boolean),
+        ...(node.expression.trim() ? { expression: node.expression.trim() } : {}),
+        ...(node.kind === 'aggregate'
+          ? {
+              source: {
+                field: node.sourceField.trim(),
+                aggregation: node.aggregation.trim(),
+                ...(node.condition.trim() ? { condition: node.condition.trim() } : {}),
+              },
+            }
+          : {}),
+        ...(node.kind === 'comparison'
+          ? {
+              comparison: {
+                mode: node.comparisonMode.trim(),
+                offset: Number(node.comparisonOffset || 1),
+              },
+            }
+          : {}),
+        ...(node.kind === 'window'
+          ? {
+              window: {
+                function: node.windowFunction.trim(),
+                partition_by: node.partitionBy.map((field) => field.trim()).filter(Boolean),
+                order_by: node.orderBy.map((field) => field.trim()).filter(Boolean),
+                ...(node.frame.trim() ? { frame: node.frame.trim() } : {}),
+              },
+            }
+          : {}),
+        ...(node.kind === 'merge'
+          ? {
+              merge: {
+                operation: node.mergeOperation.trim(),
+                join_keys: node.joinKeys.map((field) => field.trim()).filter(Boolean),
+              },
+            }
+          : {}),
+        execution_hint: node.executionHint,
+        output: Boolean(node.output),
+        ...(node.description.trim() ? { description: node.description.trim() } : {}),
+      })),
+    };
   }
 
   // Write comparison settings from the editor into the model.

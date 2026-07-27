@@ -14,6 +14,7 @@ function indexKey(values) {
 }
 function createContext(input) {
     return Object.freeze({
+        isPreview: Boolean(input.isPreview),
         filters: Object.freeze({ ...(input.filters ?? {}) }),
         context: Object.freeze({ ...(input.context ?? {}) }),
         async *queryStream(queryId, values = []) {
@@ -31,6 +32,30 @@ function createContext(input) {
             finally {
                 await rpc("closeQueryStream", { streamId }).catch(() => undefined);
             }
+        },
+        async *queryStreamWithFilters(queryId, filtersOverride = {}) {
+            const opened = await rpc("openQueryStreamWithFilters", {
+                queryId,
+                filtersOverride,
+            });
+            const streamId = String(opened.streamId);
+            try {
+                while (true) {
+                    const next = await rpc("nextQueryStream", { streamId });
+                    for (const row of next.rows ?? [])
+                        yield row;
+                    if (next.done)
+                        break;
+                }
+            }
+            finally {
+                await rpc("closeQueryStream", { streamId }).catch(() => undefined);
+            }
+        },
+        async beginSheet(name) {
+            if (input.isPreview)
+                return;
+            await rpc("beginSheet", { name });
         },
         async loadIndex(queryId, values = [], keyFields = []) {
             if (!keyFields.length)
@@ -89,11 +114,16 @@ process.on("message", async (message) => {
         process.send?.({ type: "completed" });
     }
     catch (error) {
+        const details = error;
+        const permissionDetail = [details.permission, details.resource]
+            .filter(Boolean)
+            .map(String)
+            .join(" ");
         process.send?.({
             type: "failed",
             error: {
                 code: String(error?.code ?? "SCRIPT_FAILED"),
-                message: error instanceof Error ? error.message : String(error),
+                message: `${error instanceof Error ? error.message : String(error)}${permissionDetail ? `（${permissionDetail}）` : ""}`,
             },
         });
     }

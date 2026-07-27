@@ -166,6 +166,16 @@ confirmation hash from `confirmation.json`. There is no second user approval: th
 artifact is the only approval input. Studio deterministically validates, approves, and promotes
 the result.
 
+Complex metrics must be represented by the optional, backward-compatible
+`calculation_graph: {version:"1", nodes:[...]}` in `report-model.json`. Each node has a stable
+`id`, Chinese `label`, `kind` (`aggregate|formula|comparison|window|merge`), `output_type`,
+`depends_on`, `execution_hint` (`auto|sql|script`), and whether it is an `output`. Kind-specific
+configuration uses `source`, `expression`, `comparison`, `window`, or `merge`. Dependencies must
+refer to a base metric, query output, or another node; cycles are forbidden. Aggregate and window
+fields must be inside the selected source whitelist. Use this graph for multi-level formulas,
+ratios, period comparisons, ranks/running totals/moving averages, and cross-query arithmetic
+instead of hiding business logic only in SQL text or scripts.
+
 When `recommended_strategy` is `sql`, `enrichment`, or `group_queries`, also write
 `declarative-configuration.json` in the same revision. It is stored in the current model package
 as generation input; no report package is generated during modeling.
@@ -201,6 +211,7 @@ the model hash and plan reference, and reseal checksums.
 - 增/删 relationship
 - 修改 comparison（环比/同比）配置
 - 修改 filters / metrics 的口径描述
+- 增删和修改 `calculation_graph` 节点、公式、依赖与执行偏好
 
 **禁止的修改：**
 - 改变 `result_grain` 或 `strategy`

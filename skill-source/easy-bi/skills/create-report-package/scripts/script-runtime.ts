@@ -1,4 +1,6 @@
 import { fork, type ChildProcess } from "node:child_process";
+import { realpath } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 type JsonRecord = Record<string, any>;
@@ -16,6 +18,10 @@ export type ScriptResourceBudget = {
 
 export type ScriptQueryHandlers = {
   queryStream(queryId: string, values: unknown[]): Promise<AsyncIterable<JsonRecord>>;
+  queryStreamWithFilters(
+    queryId: string,
+    filtersOverride: unknown,
+  ): Promise<AsyncIterable<JsonRecord>>;
   loadIndex(queryId: string, values: unknown[]): Promise<JsonRecord[]>;
   batchLookup(queryId: string, keys: unknown[], values: unknown[]): Promise<JsonRecord[]>;
 };
@@ -54,13 +60,19 @@ export async function runScriptIsolated(options: {
   budget?: JsonRecord;
   handlers: ScriptQueryHandlers;
   onEmit(row: JsonRecord): Promise<void> | void;
+  onBeginSheet?(name: string): Promise<void> | void;
+  isPreview?: boolean;
   signal?: AbortSignal;
 }): Promise<{ outputRows: number; queryRows: number; queryCount: number }> {
   const budget = normalizeScriptBudget(options.budget);
   if (options.signal?.aborted) {
     throw new ScriptExecutionError("SCRIPT_CANCELED", "脚本报表执行已取消");
   }
-  const runnerPath = fileURLToPath(new URL("./script-runner.js", import.meta.url));
+  const runnerPath = await realpath(
+    fileURLToPath(new URL("./script-runner.js", import.meta.url)),
+  );
+  const scriptPath = await realpath(options.scriptPath);
+  const runnerPackageRoot = resolve(dirname(runnerPath), "../..");
   const streams = new Map<string, AsyncIterator<JsonRecord>>();
   let streamSequence = 0;
   let queryCount = 0;
@@ -130,8 +142,8 @@ export async function runScriptIsolated(options: {
     child = fork(runnerPath, [], {
       execArgv: [
         "--permission",
-        `--allow-fs-read=${runnerPath}`,
-        `--allow-fs-read=${options.scriptPath}`,
+        `--allow-fs-read=${runnerPackageRoot}`,
+        `--allow-fs-read=${dirname(scriptPath)}`,
         `--max-old-space-size=${Math.max(16, budget.max_memory_mb)}`,
       ],
       stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -156,8 +168,12 @@ export async function runScriptIsolated(options: {
       if (message?.type === "ready") {
         child?.send({
           type: "start",
-          scriptPath: options.scriptPath,
-          input: { filters: options.filters ?? {}, context: options.context ?? {} },
+          scriptPath,
+          input: {
+            filters: options.filters ?? {},
+            context: options.context ?? {},
+            isPreview: Boolean(options.isPreview),
+          },
         });
         return;
       }
@@ -184,6 +200,15 @@ export async function runScriptIsolated(options: {
           const iterable = await options.handlers.queryStream(
             String(payload.queryId),
             payload.values ?? [],
+          );
+          const streamId = `stream-${++streamSequence}`;
+          streams.set(streamId, iterable[Symbol.asyncIterator]());
+          sendResult(requestId, true, { streamId });
+        } else if (message.method === "openQueryStreamWithFilters") {
+          countQuery();
+          const iterable = await options.handlers.queryStreamWithFilters(
+            String(payload.queryId),
+            payload.filtersOverride,
           );
           const streamId = `stream-${++streamSequence}`;
           streams.set(streamId, iterable[Symbol.asyncIterator]());
@@ -248,6 +273,13 @@ export async function runScriptIsolated(options: {
             );
           }
           await options.onEmit(payload.row);
+          sendResult(requestId, true, null);
+        } else if (message.method === "beginSheet") {
+          const name = String(payload.name ?? "").trim();
+          if (!name) {
+            throw new ScriptExecutionError("INVALID_SHEET_NAME", "Sheet 名称不能为空");
+          }
+          if (!options.isPreview) await options.onBeginSheet?.(name);
           sendResult(requestId, true, null);
         } else {
           throw new ScriptExecutionError("UNKNOWN_SCRIPT_CALL", `未知脚本调用：${message.method}`);

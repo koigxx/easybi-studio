@@ -32,6 +32,7 @@ function indexKey(values: unknown[]): string {
 
 function createContext(input: JsonRecord): JsonRecord {
   return Object.freeze({
+    isPreview: Boolean(input.isPreview),
     filters: Object.freeze({ ...(input.filters ?? {}) }),
     context: Object.freeze({ ...(input.context ?? {}) }),
     async *queryStream(queryId: string, values: unknown[] = []) {
@@ -46,6 +47,29 @@ function createContext(input: JsonRecord): JsonRecord {
       } finally {
         await rpc("closeQueryStream", { streamId }).catch(() => undefined);
       }
+    },
+    async *queryStreamWithFilters(
+      queryId: string,
+      filtersOverride: JsonRecord = {},
+    ) {
+      const opened = await rpc("openQueryStreamWithFilters", {
+        queryId,
+        filtersOverride,
+      });
+      const streamId = String(opened.streamId);
+      try {
+        while (true) {
+          const next = await rpc("nextQueryStream", { streamId });
+          for (const row of next.rows ?? []) yield row;
+          if (next.done) break;
+        }
+      } finally {
+        await rpc("closeQueryStream", { streamId }).catch(() => undefined);
+      }
+    },
+    async beginSheet(name: string) {
+      if (input.isPreview) return;
+      await rpc("beginSheet", { name });
     },
     async loadIndex(
       queryId: string,
@@ -110,11 +134,18 @@ process.on("message", async (message: JsonRecord) => {
     await module.run(createContext(message.input ?? {}));
     process.send?.({ type: "completed" });
   } catch (error) {
+    const details = error as JsonRecord;
+    const permissionDetail = [details.permission, details.resource]
+      .filter(Boolean)
+      .map(String)
+      .join(" ");
     process.send?.({
       type: "failed",
       error: {
         code: String((error as JsonRecord)?.code ?? "SCRIPT_FAILED"),
-        message: error instanceof Error ? error.message : String(error),
+        message: `${error instanceof Error ? error.message : String(error)}${
+          permissionDetail ? `（${permissionDetail}）` : ""
+        }`,
       },
     });
   }

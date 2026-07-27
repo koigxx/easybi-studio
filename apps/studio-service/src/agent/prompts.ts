@@ -86,7 +86,10 @@ export function buildReportPhasePrompt(
   unitId?: string,
   strategy?: string,
 ): string {
-  const phaseBase = phase === 'MODELING' ? 'work/report-model' : 'work/report-build';
+  const phaseBase =
+    phase === 'DISCOVERY' || phase === 'MODELING'
+      ? 'work/report-model'
+      : 'work/report-build';
   const root = reportId && reportRevision
     ? `${phaseBase}/${reportId}/${reportRevision}`
     : `${phaseBase}/<report-id>/<revision>`;

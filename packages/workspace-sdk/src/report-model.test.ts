@@ -199,4 +199,288 @@ describe('current report model', () => {
       }),
     ).rejects.toMatchObject({ code: 'INVALID' });
   });
+
+  it('accepts a keyless single-row aggregate model consistently with the Skill validator', async () => {
+    const modelPath = join(ws, 'reports', 'models', 'r1', 'report-model.json');
+    const model = JSON.parse(await readFile(modelPath, 'utf8')) as TestModel & {
+      result_grain: { description: string; keys: string[] };
+    };
+    model.result_grain = { description: '全部数据汇总为一行', keys: [] };
+    model.approval = { status: 'approved', model_hash: hashModel(model) };
+    await json(modelPath, model);
+    const detail = await readReportModel(ws, 'r1');
+    expect(detail.status).toBe('approved');
+    expect(detail.resultGrain.keys).toEqual([]);
+  });
+
+  it('rejects unsupported joins and metric lineage outside the selected whitelist', async () => {
+    const detail = await readReportModel(ws, 'r1');
+    const sources = [
+      { id: 't0', fields: [{ name: 'id' }, { name: 'customer_id' }] },
+      { id: 't1', fields: [{ name: 'id' }] },
+    ];
+    await expect(
+      writeReportModel(ws, 'r1', {
+        expectedRevision: detail.revision,
+        reviewedBy: 'tester',
+        sources,
+        relationships: [
+          { from: 't0.customer_id', to: 't1.id', type: 'full', cardinality: 'n:1' },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID' });
+
+    await expect(
+      writeReportModel(ws, 'r1', {
+        expectedRevision: detail.revision,
+        reviewedBy: 'tester',
+        sources,
+        relationships: [
+          { from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1' },
+        ],
+        metricEdits: [{ id: 'id', sourceAlias: 't0', sourceField: 'missing' }],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID' });
+  });
+
+  it('rejects a new filter whose binding is not a selected model field', async () => {
+    const detail = await readReportModel(ws, 'r1');
+    await expect(
+      writeReportModel(ws, 'r1', {
+        expectedRevision: detail.revision,
+        reviewedBy: 'tester',
+        sources: [
+          { id: 't0', fields: [{ name: 'id' }, { name: 'customer_id' }] },
+          { id: 't1', fields: [{ name: 'id' }] },
+        ],
+        relationships: [
+          { from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1' },
+        ],
+        filterEdits: [
+          {
+            id: 'unsafe_filter',
+            label: '非法筛选',
+            expression: 't0.`missing`',
+            clause: 'where',
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID' });
+  });
+
+  it('persists a structured calculation DAG and exposes it for visual editing', async () => {
+    const detail = await readReportModel(ws, 'r1');
+    const saved = await writeReportModel(ws, 'r1', {
+      expectedRevision: detail.revision,
+      reviewedBy: 'tester',
+      sources: [
+        { id: 't0', fields: [{ name: 'id' }, { name: 'customer_id' }] },
+        { id: 't1', fields: [{ name: 'id' }] },
+      ],
+      relationships: [
+        { from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1' },
+      ],
+      calculationGraph: {
+        version: '1',
+        nodes: [
+          {
+            id: 'driver_count',
+            label: '司机数',
+            kind: 'aggregate',
+            outputType: 'integer',
+            dependencies: [],
+            expression: '',
+            sourceField: 't0.id',
+            aggregation: 'count_distinct',
+            condition: '',
+            comparisonMode: '',
+            comparisonOffset: 1,
+            windowFunction: '',
+            partitionBy: [],
+            orderBy: [],
+            frame: '',
+            mergeOperation: '',
+            joinKeys: [],
+            executionHint: 'sql',
+            output: true,
+            description: '按司机主键去重',
+          },
+          {
+            id: 'driver_count_double',
+            label: '司机数两倍',
+            kind: 'formula',
+            outputType: 'number',
+            dependencies: ['driver_count'],
+            expression: '{driver_count} * 2',
+            sourceField: '',
+            aggregation: '',
+            condition: '',
+            comparisonMode: '',
+            comparisonOffset: 1,
+            windowFunction: '',
+            partitionBy: [],
+            orderBy: [],
+            frame: '',
+            mergeOperation: '',
+            joinKeys: [],
+            executionHint: 'auto',
+            output: true,
+            description: '',
+          },
+          {
+            id: 'driver_count_chain',
+            label: '司机数环比',
+            kind: 'comparison',
+            outputType: 'percentage',
+            dependencies: ['driver_count'],
+            expression: '',
+            sourceField: '',
+            aggregation: '',
+            condition: '',
+            comparisonMode: 'chain',
+            comparisonOffset: 1,
+            windowFunction: '',
+            partitionBy: [],
+            orderBy: [],
+            frame: '',
+            mergeOperation: '',
+            joinKeys: [],
+            executionHint: 'auto',
+            output: true,
+            description: '',
+          },
+          {
+            id: 'driver_count_rank',
+            label: '司机数排名',
+            kind: 'window',
+            outputType: 'integer',
+            dependencies: ['driver_count'],
+            expression: '',
+            sourceField: '',
+            aggregation: '',
+            condition: '',
+            comparisonMode: '',
+            comparisonOffset: 1,
+            windowFunction: 'rank',
+            partitionBy: ['t0.customer_id'],
+            orderBy: ['t0.id desc'],
+            frame: '',
+            mergeOperation: '',
+            joinKeys: [],
+            executionHint: 'sql',
+            output: true,
+            description: '',
+          },
+          {
+            id: 'combined_count',
+            label: '组合指标',
+            kind: 'merge',
+            outputType: 'number',
+            dependencies: ['driver_count', 'driver_count_double'],
+            expression: '',
+            sourceField: '',
+            aggregation: '',
+            condition: '',
+            comparisonMode: '',
+            comparisonOffset: 1,
+            windowFunction: '',
+            partitionBy: [],
+            orderBy: [],
+            frame: '',
+            mergeOperation: 'add',
+            joinKeys: ['customer_id'],
+            executionHint: 'script',
+            output: true,
+            description: '',
+          },
+        ],
+      },
+    });
+    expect(saved.calculationGraph.persisted).toBe(true);
+    expect(saved.calculationGraph.nodes.map((node) => node.id)).toEqual([
+      'driver_count',
+      'driver_count_double',
+      'driver_count_chain',
+      'driver_count_rank',
+      'combined_count',
+    ]);
+    expect(saved.calculationGraph.nodes[1]?.dependencies).toEqual(['driver_count']);
+  });
+
+  it('rejects calculation fields outside the model and dependency cycles', async () => {
+    const detail = await readReportModel(ws, 'r1');
+    const base = {
+      expectedRevision: detail.revision,
+      reviewedBy: 'tester',
+      sources: [
+        { id: 't0', fields: [{ name: 'id' }, { name: 'customer_id' }] },
+        { id: 't1', fields: [{ name: 'id' }] },
+      ],
+      relationships: [
+        { from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1' },
+      ],
+    };
+    const node = {
+      label: '计算',
+      outputType: 'number',
+      expression: '',
+      sourceField: '',
+      aggregation: '',
+      condition: '',
+      comparisonMode: '',
+      comparisonOffset: 1,
+      windowFunction: '',
+      partitionBy: [] as string[],
+      orderBy: [] as string[],
+      frame: '',
+      mergeOperation: '',
+      joinKeys: [] as string[],
+      executionHint: 'auto' as const,
+      output: true,
+      description: '',
+    };
+    await expect(
+      writeReportModel(ws, 'r1', {
+        ...base,
+        calculationGraph: {
+          version: '1',
+          nodes: [
+            {
+              ...node,
+              id: 'unsafe_count',
+              kind: 'aggregate',
+              dependencies: [],
+              sourceField: 't0.missing',
+              aggregation: 'count',
+            },
+          ],
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID' });
+
+    await expect(
+      writeReportModel(ws, 'r1', {
+        ...base,
+        calculationGraph: {
+          version: '1',
+          nodes: [
+            {
+              ...node,
+              id: 'a',
+              kind: 'formula',
+              dependencies: ['b'],
+              expression: '{b} + 1',
+            },
+            {
+              ...node,
+              id: 'b',
+              kind: 'formula',
+              dependencies: ['a'],
+              expression: '{a} + 1',
+            },
+          ],
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'INVALID' });
+  });
 });
