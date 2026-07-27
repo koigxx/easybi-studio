@@ -188,6 +188,55 @@ describe('current report model', () => {
     ]));
   });
 
+  it('reseals only live calculation outputs and removes retired flat model lineage', async () => {
+    const modelPath = join(ws, 'reports', 'models', 'r1', 'report-model.json');
+    const model = JSON.parse(await readFile(modelPath, 'utf8')) as TestModel & {
+      metrics: unknown[];
+      output_fields?: unknown[];
+    };
+    model.metrics = [{
+      id: 'legacy_metric', label: '旧指标', aggregation: 'sum',
+      source: { table_alias: 't0', field: 'id' },
+      source_alias: 't0', source_field: 'id', source_table: 'driver', dedup_key: 't0.id',
+    }];
+    model.output_fields = [{
+      id: 'removed_calculation', label: '已删除计算', kind: 'calculation', route: 'calculation_graph', calculation_node: 'removed_calculation',
+    }];
+    model.approval = { status: 'approved', model_hash: hashModel(model) };
+    await json(modelPath, model);
+    const detail = await readReportModel(ws, 'r1');
+
+    await writeReportModel(ws, 'r1', {
+      expectedRevision: detail.revision,
+      reviewedBy: 'tester',
+      sources: [
+        { id: 't0', fields: [{ name: 'id' }, { name: 'customer_id' }] },
+        { id: 't1', fields: [{ name: 'id' }] },
+      ],
+      relationships: [{ from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1' }],
+      calculationGraph: {
+        version: '1',
+        nodes: [{
+          id: 'current_calculation', label: '当前计算', kind: 'aggregate', outputType: 'number',
+          dependencies: [], expression: '', sourceField: 't0.id', aggregation: 'sum', condition: '',
+          comparisonMode: '', comparisonOffset: 1, windowFunction: '', partitionBy: [], orderBy: [],
+          frame: '', mergeOperation: '', joinKeys: [], executionHint: 'sql', output: true, description: '',
+        }],
+      },
+    });
+    const saved = JSON.parse(await readFile(modelPath, 'utf8')) as {
+      metrics: Array<Record<string, unknown>>;
+      output_fields: Array<Record<string, unknown>>;
+    };
+    expect(saved.metrics[0]).toMatchObject({ source: { table_alias: 't0', field: 'id' } });
+    expect(saved.metrics[0]).not.toHaveProperty('source_alias');
+    expect(saved.metrics[0]).not.toHaveProperty('source_field');
+    expect(saved.metrics[0]).not.toHaveProperty('dedup_key');
+    expect(saved.output_fields).toEqual([
+      expect.objectContaining({ id: 'current_calculation', calculation_node: 'current_calculation' }),
+    ]);
+  });
+
   it('edits fields and relationships, approves the model, and updates its minimal source lock', async () => {
     const detail = await readReportModel(ws, 'r1');
     const saved = await writeReportModel(ws, 'r1', {

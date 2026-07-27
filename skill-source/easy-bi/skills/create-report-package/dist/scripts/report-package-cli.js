@@ -795,12 +795,12 @@ export async function inspectReport(options) {
     const warnings = [];
     const resolvedFields = [];
     const metricAggregation = (label, configured) => {
+        if (typeof configured === "string" && configured.trim())
+            return configured;
         if (/订单(数|数量)|运单(数|数量)|派车单(数|数量)/u.test(label))
             return "count_distinct";
         if (/件数|数量|重量|体积|金额|费用|运费/u.test(label))
             return "sum";
-        if (typeof configured === "string" && configured.trim())
-            return configured;
         if (/比例|比率|率$/u.test(label))
             return "ratio";
         if (/均值|平均/u.test(label))
@@ -5670,10 +5670,6 @@ export async function finalizeStagedPackage(options) {
             label: col.label ?? col.name,
             expression: col.expression ?? `\`${col.name}\``,
         }));
-    // Inherit comparison from the report model when the declarative config doesn't
-    // set one. Model-saved comparison serves as the default; AI can still override.
-    const modelComparison = model.comparison;
-    const hasDeclComparison = !!declarative?.comparison;
     const configuration = strategy === "script"
         ? { semantic_plan: await readJson(paths.semanticPlan), execution_plan: executionPlan }
         : {
@@ -5689,10 +5685,6 @@ export async function finalizeStagedPackage(options) {
             output_fields: model.output_fields ?? deriveOutputFields(model),
             semantic_plan: await readJson(paths.semanticPlan),
             execution_plan: executionPlan,
-            // Only inherit model comparison when AI didn't set one explicitly.
-            ...(modelComparison?.enabled && !hasDeclComparison
-                ? { comparison: modelComparison }
-                : {}),
         };
     // The AI's declarative output for group_queries uses a nested per-group format
     // (query_groups[]) that differs from what configurePlan expects (group_queries.queries[]).
@@ -5720,32 +5712,33 @@ export async function finalizeStagedPackage(options) {
                 return raw.filter((m) => String(m.label ?? "").includes("派车单"));
             return raw.filter((m) => !String(m.label ?? "").includes("派车单"));
         };
-        // Merge user edits from model metrics into the declarative query_groups BEFORE
-        // building configuration. This ensures user-adjusted source fields, dedup keys,
-        // and conditions propagate into the generated report package.
+        // Merge user edits from the canonical structured model lineage into the
+        // declarative query groups before building the configuration.
         const modelMetricById = new Map((model.metrics ?? []).map((m) => [String(m.id), m]));
         for (const g of declarative.query_groups) {
             for (const dm of (g.metrics ?? [])) {
                 const mm = modelMetricById.get(String(dm.id));
                 if (!mm)
                     continue;
-                // dedup_key → override declarative metric's `field` (the aggregation target)
-                if (mm.dedup_key) {
-                    dm.field = String(mm.dedup_key);
+                const source = mm.source;
+                const sourceAlias = String(source?.table_alias ?? source?.alias ?? "");
+                const sourceField = String(source?.field ?? "");
+                // distinct_key overrides the aggregation target when present.
+                if (mm.distinct_key) {
+                    dm.field = String(mm.distinct_key);
                 }
-                // source_alias + source_field → update the condition expression's column reference
-                if (mm.source_alias && mm.source_field) {
-                    const newCol = `${String(mm.source_alias)}.${String(mm.source_field)}`;
+                if (sourceAlias && sourceField) {
+                    const newCol = `${sourceAlias}.${sourceField}`;
                     const oldCondition = String(dm.condition ?? "");
                     if (oldCondition) {
                         // Replace the alias.field in the condition (e.g. "t0.status = 'X'" → "t0.waybill_status = 'X'")
                         dm.condition = oldCondition.replace(/^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/, newCol);
                     }
                 }
-                // Also carry over source_alias/source_field for later use by collectGroupQueryMetrics
-                dm.source_alias = mm.source_alias ?? dm.source_alias;
-                dm.source_field = mm.source_field ?? dm.source_field;
-                dm.dedup_key = mm.dedup_key ?? dm.dedup_key;
+                if (sourceAlias && sourceField) {
+                    dm.source = { table_alias: sourceAlias, field: sourceField };
+                }
+                dm.distinct_key = mm.distinct_key ?? dm.distinct_key;
             }
         }
         configuration.group_queries = {

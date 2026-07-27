@@ -396,7 +396,6 @@ export const workspaceApi = {
     expectedRevision: string,
     sources: ReportModelEditSource[],
     relationships: ReportModelRelationship[],
-    comparison?: ReportModelComparison | null,
     calculationGraph?: Omit<ReportModelCalculationGraph, 'persisted'>,
     metricEdits?: Array<{ id: string; sourceField?: string; sourceAlias?: string; dedupKey?: string }>,
     filterEdits?: Array<{
@@ -418,7 +417,6 @@ export const workspaceApi = {
       expectedRevision,
       sources,
       relationships,
-      comparison,
       calculationGraph,
       metricEdits,
       filterEdits,
@@ -496,13 +494,6 @@ export interface ReportModelEditSource {
   id: string;
   fields: Array<{ name: string; role?: string }>;
 }
-export interface ReportModelComparison {
-  enabled: boolean;
-  modes: string[];
-  period_param: string;
-  lookback_months: number;
-}
-
 export interface ReportModelMetric {
   id: string;
   label: string;
@@ -513,6 +504,7 @@ export interface ReportModelMetric {
   sourceField: string;
   dedupKey: string;
   condition: string | null;
+  conditions: ReportModelRule[];
   evidence: string;
   confidence: string;
 }
@@ -591,6 +583,16 @@ export interface ReportModelQueryContract {
     condition?: string | null;
     nullable?: boolean;
   }>;
+  filters: ReportModelRule[];
+}
+
+export interface ReportModelRule {
+  field: string;
+  operator: string;
+  value: unknown;
+  parameter: string;
+  source: string;
+  type: string;
 }
 
 export interface ReportModelOutputField {
@@ -622,7 +624,6 @@ export interface ReportModelDetail {
   outputFields: ReportModelOutputField[];
   timeSemantics?: ReportModelTimeSemantics | null;
   queryContracts?: ReportModelQueryContract[];
-  comparison: ReportModelComparison | null;
   errors: string[];
 }
 

@@ -22,7 +22,6 @@ import {
   type ReportModelCalculationGraph,
   type ReportModelCalculationKind,
   type ReportModelCalculationNode,
-  type ReportModelComparison,
   type ReportModelDetail,
   type ReportModelFilter,
   type ReportModelMetric,
@@ -35,7 +34,7 @@ const TAB_DEFS: { id: EditorTab; label: string; icon: typeof Table2 }[] = [
   { id: 'fields', label: '字段目录', icon: FileText },
   { id: 'calculations', label: '计算模型', icon: Calculator },
   { id: 'sources', label: '数据源', icon: Database },
-  { id: 'comparison', label: '环比/同比', icon: Edit3 },
+  { id: 'comparison', label: '时间对比', icon: Edit3 },
 ];
 
 const ROLE_TAG_LABEL: Record<string, string> = {
@@ -232,7 +231,6 @@ export function ReportModelEditor({
           fields: s.fields.map((f) => ({ name: f.name, role: f.role })),
         })),
         model.relationships,
-        model.comparison,
         calculationDirty
           ? { version: '1', nodes: model.calculationGraph.nodes }
           : undefined,
@@ -421,7 +419,7 @@ export function ReportModelEditor({
                     <div style={{ marginBottom: 8 }}>
                       <div style={{ fontSize: 13, fontWeight: 600 }}>表与字段</div>
                       <div style={{ marginTop: 2, fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
-                        管理该报表使用的物理字段。可从知识库添加新字段，或修改字段角色。
+                        管理该报表使用的物理字段。可从知识库添加新字段，并查看字段在模型中的角色。
                       </div>
                     </div>
                     <div
@@ -482,7 +480,7 @@ export function ReportModelEditor({
                                   width: 280,
                                   maxHeight: 360,
                                   zIndex: 50,
-                                  background: '#fff',
+                                  background: 'var(--ide-bg-elevated)',
                                   border: '1px solid var(--ide-border-default)',
                                   borderRadius: 6,
                                   boxShadow: '0 8px 24px rgba(0,0,0,.2)',
@@ -689,10 +687,7 @@ export function ReportModelEditor({
 
               {/* Tab 4: 环比/同比 */}
               {activeTab === 'comparison' && (
-                <ComparisonSection
-                  model={model}
-                  onChange={(comparison) => mutate((draft) => { draft.comparison = comparison; })}
-                />
+                <ComparisonSection model={model} />
               )}
             </>
           )}
@@ -1530,10 +1525,9 @@ function FieldDirectoryTab({
     onFiltersChange(filterEdits.filter((_, i) => i !== index));
   }
 
-  // Build a unified list of all output fields: group keys first, then metrics,
-  // matching the natural output order from the query contracts.
+  // `outputFields` is the canonical business-facing output registry. Query
+  // contracts and calculation nodes only enrich each output with its lineage.
   const outputFields = useMemo(() => {
-    const seen = new Set<string>();
     const fields: Array<{
       name: string;
       label: string;
@@ -1543,50 +1537,43 @@ function FieldDirectoryTab({
       formula?: string;
       metric?: ReportModelMetric;
     }> = [];
-    for (const qc of model.queryContracts ?? []) {
-      for (const col of qc.outputColumns) {
-        if (seen.has(col.name)) continue;
-        seen.add(col.name);
-        if (col.role === 'group_key') {
-          fields.push({ name: col.name, label: col.label, type: col.type, source: col.source, kind: 'dimension' });
-        } else {
-          const m = model.metrics.find((mm) => mm.label === col.label || mm.id === col.name);
-          fields.push({
-            name: col.name,
-            label: col.label,
-            type: col.type,
-            source: col.source,
-            kind: 'metric',
-            formula: m ? formatSqlFormula(m) : undefined,
-            metric: m,
-          });
-        }
+    for (const output of model.outputFields) {
+      const metric = model.metrics.find(
+        (item) => item.id === output.metricId || item.id === output.id || item.label === output.label,
+      );
+      const contract = (model.queryContracts ?? []).find((item) => item.id === output.queryId);
+      const column = contract?.outputColumns.find((item) => item.name === output.queryColumn);
+      if (output.route === 'calculation_graph') {
+        const node = model.calculationGraph.nodes.find((item) => item.id === output.calculationNode);
+        const dependencies = (node?.dependencies ?? []).map((id) =>
+          model.calculationGraph.nodes.find((item) => item.id === id)?.label ??
+          model.metrics.find((item) => item.id === id)?.label ?? id,
+        );
+        const mode = node?.kind === 'comparison'
+          ? ({ chain: '环比', yoy: '同比', difference: '差额', rate: '变化率' }[node.comparisonMode] ?? '时间对比')
+          : calculationKindLabel(node?.kind ?? 'formula');
+        fields.push({
+          name: output.id,
+          label: output.label,
+          type: output.type || node?.outputType || 'number',
+          source: dependencies.length ? `依赖：${dependencies.join('、')}` : '计算结果',
+          kind: 'timeshifted',
+          formula: `${mode}${node?.comparisonOffset ? ` · 偏移 ${node.comparisonOffset} 期` : ''}`,
+        });
+        continue;
       }
-    }
-    // 2. Time-shifted comparison fields (环比/同比) — derived from comparison config
-    const comp = model.comparison;
-    if (comp?.enabled && comp.modes.length) {
-      for (const m of model.metrics) {
-        for (const mode of comp.modes) {
-          const label = mode === 'chain' ? '环比' : '同比';
-          const lookback = mode === 'chain' ? (comp.lookback_months ?? 1) : 12;
-          const unit = lookback === 1 ? '前1月' : `前${lookback}月`;
-          const name = `${m.id}_${mode}_subtract`;
-          if (seen.has(name)) continue;
-          seen.add(name);
-          fields.push({
-            name,
-            label: `${label}${m.label}`,
-            type: 'number',
-            source: `${m.id} (${m.label})`,
-            kind: 'timeshifted',
-            formula: `${m.label}(本期) - ${m.label}(${unit})`,
-          });
-        }
-      }
+      fields.push({
+        name: output.id,
+        label: output.label,
+        type: output.type || column?.type || '',
+        source: output.source || column?.source || '',
+        kind: output.kind === 'data' ? 'dimension' : 'metric',
+        formula: metric ? formatSqlFormula(metric) : undefined,
+        metric,
+      });
     }
     return fields;
-  }, [model.queryContracts, model.metrics, model.comparison]);
+  }, [model.outputFields, model.queryContracts, model.metrics, model.calculationGraph.nodes]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -1910,180 +1897,70 @@ function FieldDirectoryTab({
         <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', marginBottom: 6 }}>
           AI 从知识库自动识别并注入的过滤条件，确保查询结果正确。
         </div>
-        <div className="ide-card" style={{ padding: '8px 12px', fontSize: 11.5, display: 'flex', flexDirection: 'column', gap: 5 }}>
-          {/* Logical delete */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span className="ide-badge ide-badge-neutral" style={{ fontSize: 9.5 }}>逻辑删除</span>
-            {model.sources.flatMap((s) =>
-              s.fields.filter((f) => f.role === 'system_condition').map((f) => `${s.alias}.${f.name} = 0`)
-            ).length > 0 ? (
-              model.sources.flatMap((s) =>
-                s.fields.filter((f) => f.role === 'system_condition').map((f) => (
-                  <span key={`${s.alias}.${f.name}`} className="ide-text-mono" style={{ fontSize: 11 }}>
-                    {s.alias}.{f.name} = 0
-                  </span>
-                ))
-              )
-            ) : (
-              <span className="ide-text-mono" style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>is_delete = 0</span>
-            )}
-          </div>
-          {/* Tenant isolation */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span className="ide-badge ide-badge-neutral" style={{ fontSize: 9.5 }}>租户隔离</span>
-            {model.sources.flatMap((s) =>
-              s.fields.filter((f) => f.role === 'tenant_scope').map((f) => `${s.alias}.${f.name}`)
-            ).length > 0 ? (
-              <span className="ide-text-mono" style={{ fontSize: 11 }}>
-                {model.sources.flatMap((s) =>
-                  s.fields.filter((f) => f.role === 'tenant_scope').map((f) => `${s.alias}.${f.name}`)
-                ).join(', ')} = :tenantId
-              </span>
-            ) : (
-              <span className="ide-text-mono" style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>tenant_id = :tenantId（请求上下文注入）</span>
-            )}
-          </div>
-          {/* Exclusion rules */}
-          {model.sources.flatMap((s) =>
-            s.fields.filter((f) => f.role === 'exclusion_filter')
-          ).length > 0 && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span className="ide-badge ide-badge-warning" style={{ fontSize: 9.5 }}>排除规则</span>
-              {model.sources.flatMap((s) =>
-                s.fields.filter((f) => f.role === 'exclusion_filter').map((f) => (
-                  <span key={`${s.alias}.${f.name}`} className="ide-text-mono" style={{ fontSize: 11 }}>
-                    {s.alias}.{f.name} = 0
-                  </span>
-                ))
-              )}
-            </div>
-          )}
-          {/* Time semantics */}
-          {model.timeSemantics && (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span className="ide-badge ide-badge-info" style={{ fontSize: 9.5 }}>时间筛选列</span>
-              <span className="ide-text-mono" style={{ fontSize: 11 }}>
-                {model.timeSemantics.alias}.{model.timeSemantics.field}
-              </span>
-              <span style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
-                ({model.timeSemantics.nativeType}{model.timeSemantics.required ? ', 必填' : ', 可选'})
-              </span>
-            </div>
-          )}
-        </div>
+        <SystemRules model={model} />
       </section>
     </div>
   );
 }
 
-/** Extract candidate time columns from the primary source (t0) fields. */
-function candidateTimeColumns(model: ReportModelDetail): Array<{ name: string; label: string }> {
-  const primary = model.sources.find((s) => s.id === 't0') ?? model.sources[0];
-  if (!primary) return [];
-  return primary.fields.map((f) => ({ name: f.name, label: f.label || f.name }));
+function ruleText(rule: { field: string; operator: string; value: unknown; parameter: string }): string {
+  const subject = rule.field || '字段';
+  const right = rule.parameter ? `:${rule.parameter}` : rule.value == null ? '' : Array.isArray(rule.value) ? rule.value.join('、') : String(rule.value);
+  return [subject, rule.operator || '规则', right].filter(Boolean).join(' ');
 }
 
-function ComparisonSection({
-  model,
-  onChange,
-}: {
-  model: ReportModelDetail;
-  onChange: (c: ReportModelComparison | null) => void;
-}): JSX.Element {
-  const comp = model.comparison;
-  const enabled = comp?.enabled ?? false;
-  const modes = comp?.modes ?? [];
-  const periodParam = comp?.period_param ?? '';
-  const candidates = candidateTimeColumns(model);
-  const canUse = model.strategy !== 'group_queries';
+function SystemRules({ model }: { model: ReportModelDetail }): JSX.Element {
+  const rules = [
+    ...(model.queryContracts ?? []).flatMap((contract) => contract.filters),
+    ...model.metrics.flatMap((metric) => metric.conditions),
+  ].filter((rule, index, all) =>
+    all.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(rule)) === index,
+  );
+  return (
+    <div className="ide-card" style={{ padding: '8px 12px', fontSize: 11.5, display: 'flex', flexDirection: 'column', gap: 5 }}>
+      {rules.length ? rules.map((rule, index) => (
+        <div key={`${rule.field}-${rule.operator}-${index}`} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className={`ide-badge ${rule.type === 'business_condition' ? 'ide-badge-warning' : 'ide-badge-neutral'}`} style={{ fontSize: 9.5 }}>
+            {rule.type === 'business_condition' ? '业务排除' : rule.type === 'security_scope' ? '租户隔离' : rule.type === 'system_condition' ? '系统条件' : '查询条件'}
+          </span>
+          <span className="ide-text-mono" style={{ fontSize: 11 }}>{ruleText(rule)}</span>
+        </div>
+      )) : (
+        <span style={{ color: 'var(--ide-text-tertiary)' }}>当前模型未声明系统条件。</span>
+      )}
+      {model.timeSemantics && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className="ide-badge ide-badge-info" style={{ fontSize: 9.5 }}>默认时间筛选</span>
+          <span className="ide-text-mono" style={{ fontSize: 11 }}>{model.timeSemantics.alias}.{model.timeSemantics.field}</span>
+          <span style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>
+            ({model.timeSemantics.nativeType}{model.timeSemantics.required ? ', 必填' : ', 可选'})
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
 
-  function update(patch: Partial<ReportModelComparison>): void {
-    const next: ReportModelComparison = {
-      enabled: enabled,
-      modes: [...modes],
-      period_param: periodParam,
-      lookback_months: 1,
-      ...comp,
-      ...patch,
-    };
-    onChange(next.enabled || comp ? next : null);
-  }
-
+function ComparisonSection({ model }: { model: ReportModelDetail }): JSX.Element {
+  const nodes = model.calculationGraph.nodes.filter((node) => node.kind === 'comparison');
   return (
     <section>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>环比/同比</div>
-      <div className="ide-card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, userSelect: 'none' }}>
-          <input
-            type="checkbox"
-            checked={enabled}
-            disabled={!canUse}
-            onChange={(e) => {
-              if (e.target.checked) {
-                onChange({
-                  enabled: true,
-                  modes: ['chain'],
-                  period_param: candidates.find((c) => c.name === 'create_time')?.name ?? candidates[0]?.name ?? '',
-                  lookback_months: 1,
-                });
-              } else {
-                onChange(null);
-              }
-            }}
-            style={{ cursor: 'pointer' }}
-          />
-          <span style={{ color: 'var(--ide-text-secondary)' }}>启用环比/同比</span>
-          {!canUse && (
-            <span style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>
-              （当前策略 group_queries 暂不支持环比/同比）
-            </span>
-          )}
-        </label>
-
-        {enabled && (
-          <>
-            <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-              <label style={{ fontSize: 12 }}>
-                <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>对比模式</div>
-                <div style={{ display: 'flex', gap: 12 }}>
-                  {(['chain', 'yoy'] as const).map((mode) => (
-                    <label key={mode} style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 12 }}>
-                      <input
-                        type="checkbox"
-                        checked={modes.includes(mode)}
-                        onChange={(e) => {
-                          const next = e.target.checked
-                            ? [...modes, mode]
-                            : modes.filter((m) => m !== mode);
-                          if (next.length) update({ modes: next });
-                        }}
-                        style={{ cursor: 'pointer' }}
-                      />
-                      {mode === 'chain' ? '环比' : '同比'}
-                    </label>
-                  ))}
-                </div>
-              </label>
-
-              <label style={{ flex: '0 0 220px', fontSize: 12 }}>
-                <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>基准时间列</div>
-                <select
-                  className="ide-select"
-                  value={periodParam}
-                  onChange={(e) => update({ period_param: e.target.value })}
-                >
-                  {candidates.map((c) => (
-                    <option key={c.name} value={c.name}>{c.label} ({c.name})</option>
-                  ))}
-                </select>
-              </label>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>时间对比</div>
+      <div className="ide-card" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {nodes.length === 0 ? (
+          <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>当前没有环比、同比或变化率计算。请在「计算模型」中新增对比指标。</span>
+        ) : nodes.map((node) => {
+          const dependency = node.dependencies.map((id) => model.metrics.find((metric) => metric.id === id)?.label ?? id).join('、');
+          const mode = { chain: '环比', yoy: '同比', difference: '差额', rate: '变化率' }[node.comparisonMode] ?? '时间对比';
+          return (
+            <div key={node.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', fontSize: 12 }}>
+              <span><strong>{node.label}</strong><span style={{ color: 'var(--ide-text-tertiary)' }}> · 基于 {dependency || '未设置指标'}</span></span>
+              <span className="ide-badge ide-badge-info">{mode} · {node.comparisonOffset} 期 · {node.executionHint === 'script' ? '脚本' : node.executionHint === 'sql' ? 'SQL' : '自动'}</span>
             </div>
-            <div style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', lineHeight: 1.5 }}>
-              环比对比前一等长周期，同比对比去年同周期。对比窗口会自动根据筛选时间范围扩展，无需手动配置回溯月数。
-            </div>
-          </>
-        )}
+          );
+        })}
       </div>
+      <div style={{ marginTop: 8, fontSize: 11, color: 'var(--ide-text-tertiary)' }}>时间对比由计算图统一维护；请在「计算模型」中修改依赖指标、对比方式和期数。</div>
     </section>
   );
 }

@@ -119,12 +119,6 @@ export function registerWorkspaceStateRoutes(
         grain?: string | null;
         fanoutRisk?: boolean;
       }>;
-      comparison?: {
-        enabled: boolean;
-        modes: string[];
-        period_param: string;
-        lookback_months: number;
-      } | null;
       calculationGraph?: {
         version: '1';
         nodes: Array<{
@@ -203,7 +197,6 @@ export function registerWorkspaceStateRoutes(
           reviewedBy,
           sources: body.sources,
           relationships: body.relationships,
-          comparison: body.comparison,
           calculationGraph: body.calculationGraph,
           metricEdits: body.metricEdits,
           filterEdits: body.filterEdits,

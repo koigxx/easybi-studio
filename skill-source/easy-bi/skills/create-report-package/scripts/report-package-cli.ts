@@ -947,9 +947,9 @@ export async function inspectReport(options: {
   const warnings: JsonRecord[] = [];
   const resolvedFields: JsonRecord[] = [];
   const metricAggregation = (label: string, configured: unknown): string => {
+    if (typeof configured === "string" && configured.trim()) return configured;
     if (/订单(数|数量)|运单(数|数量)|派车单(数|数量)/u.test(label)) return "count_distinct";
     if (/件数|数量|重量|体积|金额|费用|运费/u.test(label)) return "sum";
-    if (typeof configured === "string" && configured.trim()) return configured;
     if (/比例|比率|率$/u.test(label)) return "ratio";
     if (/均值|平均/u.test(label)) return "avg";
     return "count_distinct";
@@ -6200,11 +6200,6 @@ export async function finalizeStagedPackage(options: {
         label: col.label ?? col.name,
         expression: col.expression ?? `\`${col.name}\``,
       }));
-  // Inherit comparison from the report model when the declarative config doesn't
-  // set one. Model-saved comparison serves as the default; AI can still override.
-  const modelComparison = (model as JsonRecord).comparison as JsonRecord | undefined;
-  const hasDeclComparison = !!(declarative?.comparison as JsonRecord | undefined);
-
   const configuration: JsonRecord = strategy === "script"
     ? { semantic_plan: await readJson(paths.semanticPlan), execution_plan: executionPlan }
     : {
@@ -6220,10 +6215,6 @@ export async function finalizeStagedPackage(options: {
         output_fields: model.output_fields ?? deriveOutputFields(model),
         semantic_plan: await readJson(paths.semanticPlan),
         execution_plan: executionPlan,
-        // Only inherit model comparison when AI didn't set one explicitly.
-        ...(modelComparison?.enabled && !hasDeclComparison
-          ? { comparison: modelComparison }
-          : {}),
       };
   // The AI's declarative output for group_queries uses a nested per-group format
   // (query_groups[]) that differs from what configurePlan expects (group_queries.queries[]).
@@ -6256,9 +6247,8 @@ export async function finalizeStagedPackage(options: {
       if (gid === "shipping") return raw.filter((m) => String(m.label ?? "").includes("派车单"));
       return raw.filter((m) => !String(m.label ?? "").includes("派车单"));
     };
-    // Merge user edits from model metrics into the declarative query_groups BEFORE
-    // building configuration. This ensures user-adjusted source fields, dedup keys,
-    // and conditions propagate into the generated report package.
+    // Merge user edits from the canonical structured model lineage into the
+    // declarative query groups before building the configuration.
     const modelMetricById = new Map<string, JsonRecord>(
       ((model as JsonRecord).metrics ?? []).map((m: JsonRecord) => [String(m.id), m]),
     );
@@ -6266,13 +6256,15 @@ export async function finalizeStagedPackage(options: {
       for (const dm of (g.metrics ?? []) as JsonRecord[]) {
         const mm = modelMetricById.get(String(dm.id));
         if (!mm) continue;
-        // dedup_key → override declarative metric's `field` (the aggregation target)
-        if (mm.dedup_key) {
-          (dm as JsonRecord).field = String(mm.dedup_key);
+        const source = mm.source as JsonRecord | undefined;
+        const sourceAlias = String(source?.table_alias ?? source?.alias ?? "");
+        const sourceField = String(source?.field ?? "");
+        // distinct_key overrides the aggregation target when present.
+        if (mm.distinct_key) {
+          (dm as JsonRecord).field = String(mm.distinct_key);
         }
-        // source_alias + source_field → update the condition expression's column reference
-        if (mm.source_alias && mm.source_field) {
-          const newCol = `${String(mm.source_alias)}.${String(mm.source_field)}`;
+        if (sourceAlias && sourceField) {
+          const newCol = `${sourceAlias}.${sourceField}`;
           const oldCondition = String((dm as JsonRecord).condition ?? "");
           if (oldCondition) {
             // Replace the alias.field in the condition (e.g. "t0.status = 'X'" → "t0.waybill_status = 'X'")
@@ -6282,10 +6274,10 @@ export async function finalizeStagedPackage(options: {
             );
           }
         }
-        // Also carry over source_alias/source_field for later use by collectGroupQueryMetrics
-        (dm as JsonRecord).source_alias = mm.source_alias ?? (dm as JsonRecord).source_alias;
-        (dm as JsonRecord).source_field = mm.source_field ?? (dm as JsonRecord).source_field;
-        (dm as JsonRecord).dedup_key = mm.dedup_key ?? (dm as JsonRecord).dedup_key;
+        if (sourceAlias && sourceField) {
+          (dm as JsonRecord).source = { table_alias: sourceAlias, field: sourceField };
+        }
+        (dm as JsonRecord).distinct_key = mm.distinct_key ?? (dm as JsonRecord).distinct_key;
       }
     }
     configuration.group_queries = {

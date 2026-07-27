@@ -120,6 +120,24 @@ function physicalFieldLabel(value: JsonRecord): string {
   );
 }
 
+function normalizeFilterComponent(value: unknown, valueType: string, defaultOperator: string): string {
+  const component = String(value ?? '').trim();
+  if (component === 'text') return defaultOperator === 'eq' ? 'text-exact' : 'text-contains';
+  if (component === 'date_range_picker') return valueType === 'date_range' ? 'date-range-day' : 'datetime-range';
+  return component || (valueType === 'string' ? 'text-contains' : 'datetime-range');
+}
+
+function readRule(value: JsonRecord): ReportModelRule {
+  return {
+    field: String(value.field ?? ''),
+    operator: String(value.operator ?? ''),
+    value: value.value ?? null,
+    parameter: String(value.parameter ?? ''),
+    source: String(value.source ?? ''),
+    type: String(value.type ?? ''),
+  };
+}
+
 function assertReportId(reportId: string): void {
   if (!REPORT_ID.test(reportId)) throw new ReportModelError('INVALID', '报表 ID 不合法');
 }
@@ -449,11 +467,13 @@ export interface EditableModelRelationship {
   fanoutRisk?: boolean;
 }
 
-export interface ReportModelComparison {
-  enabled: boolean;
-  modes: string[];
-  period_param: string;
-  lookback_months: number;
+export interface ReportModelRule {
+  field: string;
+  operator: string;
+  value: unknown;
+  parameter: string;
+  source: string;
+  type: string;
 }
 
 export interface ReportModelMetric {
@@ -466,6 +486,7 @@ export interface ReportModelMetric {
   sourceField: string;
   dedupKey: string;
   condition: string | null;
+  conditions: ReportModelRule[];
   evidence: string;
   confidence: string;
 }
@@ -546,6 +567,7 @@ export interface ReportModelQueryContract {
     condition?: string | null;
     nullable?: boolean;
   }>;
+  filters: ReportModelRule[];
 }
 
 /** One visible business field and its deterministic execution route. */
@@ -580,7 +602,6 @@ export interface ReportModelDetail {
   outputFields: ReportModelOutputField[];
   timeSemantics: ReportModelTimeSemantics | null;
   queryContracts: ReportModelQueryContract[];
-  comparison: ReportModelComparison | null;
   errors: string[];
 }
 
@@ -659,11 +680,11 @@ export async function readReportModel(
     depends_on: [],
     source: {
       field:
-        metric.aggregation === 'count_distinct' && metric.dedup_key
-          ? metric.dedup_key
-          : metric.source_alias && metric.source_field
-            ? `${metric.source_alias}.${metric.source_field}`
-            : metric.dedup_key ?? '',
+        metric.aggregation === 'count_distinct' && metric.distinct_key
+          ? metric.distinct_key
+          : metric.source?.table_alias && metric.source?.field
+            ? `${metric.source.table_alias}.${metric.source.field}`
+            : metric.distinct_key ?? '',
       aggregation: metric.aggregation,
       condition: metric.condition ?? '',
     },
@@ -672,9 +693,7 @@ export async function readReportModel(
     description: metric.evidence ?? '',
   }));
 
-  // Model format v1.35+ keeps source lineage in the structured `source` object.
-  // Older models used the flat source_alias/source_field pair.  Normalize both
-  // forms here so Studio has one stable display/editing contract.
+  // `source` / `distinct_key` are the canonical model lineage fields.
   const metrics: ReportModelMetric[] = (model.metrics ?? []).map((m: JsonRecord): ReportModelMetric => {
     const nestedSource = m.source && typeof m.source === 'object' ? m.source as JsonRecord : {};
     return {
@@ -682,11 +701,12 @@ export async function readReportModel(
       label: String(m.label ?? m.id ?? ''),
       entity: String(m.entity ?? ''),
       aggregation: String(m.aggregation ?? ''),
-      sourceTable: String(m.source_table ?? nestedSource.table ?? ''),
-      sourceAlias: String(m.source_alias ?? nestedSource.table_alias ?? nestedSource.alias ?? ''),
-      sourceField: String(m.source_field ?? nestedSource.field ?? ''),
-      dedupKey: String(m.dedup_key ?? m.distinct_key ?? ''),
+      sourceTable: String(nestedSource.table ?? ''),
+      sourceAlias: String(nestedSource.table_alias ?? nestedSource.alias ?? ''),
+      sourceField: String(nestedSource.field ?? ''),
+      dedupKey: String(m.distinct_key ?? ''),
       condition: m.condition ? String(m.condition) : null,
+      conditions: Array.isArray(m.conditions) ? m.conditions.map(readRule) : [],
       evidence: String(m.evidence ?? ''),
       confidence: String(m.confidence ?? 'hypothesis'),
     };
@@ -761,7 +781,7 @@ export async function readReportModel(
         clause: String(f.sql_binding?.clause ?? 'where'),
         valueAdapter: String(f.sql_binding?.value_adapter ?? 'direct'),
       },
-      component: String(f.component ?? ''),
+      component: normalizeFilterComponent(f.component, String(f.value_type ?? ''), String(f.default_operator ?? '')),
     })),
     metrics,
     calculationGraph: {
@@ -868,16 +888,9 @@ export async function readReportModel(
             ...(col.nullable !== undefined ? { nullable: Boolean(col.nullable) } : {}),
           }];
         }),
+        filters: Array.isArray(qc.filters) ? qc.filters.map(readRule) : [],
       };
     }),
-    comparison: model.comparison && typeof model.comparison === 'object'
-      ? {
-          enabled: Boolean(model.comparison.enabled),
-          modes: Array.isArray(model.comparison.modes) ? model.comparison.modes.map(String) : [],
-          period_param: String(model.comparison.period_param ?? ''),
-          lookback_months: Number(model.comparison.lookback_months ?? 1),
-        }
-      : null,
     errors,
   };
 }
@@ -887,7 +900,6 @@ export interface ReportModelEdit {
   reviewedBy: string;
   sources: Array<{ id: string; fields: Array<{ name: string; role?: string }> }>;
   relationships: EditableModelRelationship[];
-  comparison?: ReportModelComparison | null;
   /** Full replacement of the structured calculation DAG. Omit to preserve the current graph. */
   calculationGraph?: {
     version: '1';
@@ -1061,9 +1073,21 @@ export async function writeReportModel(
       }
       if (!metric) {
         let updated = false;
+        const targetOutputs = (model.output_fields ?? []).filter(
+          (field: JsonRecord) => String(field.id ?? '') === medit.id,
+        );
         for (const contract of model.query_contracts ?? []) {
-          for (const column of contract.output_contract ?? contract.output ?? []) {
-            if (String((column as JsonRecord).name ?? '') !== medit.id) continue;
+          for (const column of [
+            ...(contract.output_contract ?? contract.output ?? []),
+            ...(contract.aggregations ?? []),
+          ]) {
+            const columnName = String((column as JsonRecord).name ?? '');
+            const isTarget = columnName === medit.id || targetOutputs.some(
+              (field: JsonRecord) =>
+                String(field.query_id ?? '') === String(contract.id ?? '') &&
+                String(field.query_column ?? field.id ?? '') === columnName,
+            );
+            if (!isTarget) continue;
             if (sourceAlias && sourceField) {
               (column as JsonRecord).source = `${sourceAlias}.${sourceField}`;
               updated = true;
@@ -1075,17 +1099,34 @@ export async function writeReportModel(
         }
         continue;
       }
-      if (medit.sourceField) metric.source_field = medit.sourceField;
-      if (medit.sourceAlias) metric.source_alias = medit.sourceAlias;
-      if (medit.dedupKey) metric.dedup_key = medit.dedupKey;
+      if (sourceAlias && sourceField) {
+        metric.source = {
+          ...(metric.source && typeof metric.source === 'object' ? metric.source : {}),
+          table_alias: sourceAlias,
+          field: sourceField,
+        };
+      }
+      if (medit.dedupKey) metric.distinct_key = medit.dedupKey;
       // Update query_contract output columns to match
+      const targetOutputs = (model.output_fields ?? []).filter(
+        (field: JsonRecord) => String(field.id ?? '') === String(metric.id ?? ''),
+      );
       for (const contract of model.query_contracts ?? []) {
-        for (const col of (contract.output_contract ?? contract.output ?? [])) {
-          if (String((col as JsonRecord).name ?? '') === String(metric.output_column ?? metric.id)) {
+        for (const col of [
+          ...(contract.output_contract ?? contract.output ?? []),
+          ...(contract.aggregations ?? []),
+        ]) {
+          const columnName = String((col as JsonRecord).name ?? '');
+          const isTarget = columnName === String(metric.output_column ?? metric.id) || targetOutputs.some(
+            (field: JsonRecord) =>
+              String(field.query_id ?? '') === String(contract.id ?? '') &&
+              String(field.query_column ?? field.id ?? '') === columnName,
+          );
+          if (isTarget) {
             if (medit.dedupKey) (col as JsonRecord).source = medit.dedupKey;
             if (medit.sourceField) {
               const from = (col as JsonRecord).condition
-                ? String((col as JsonRecord).condition).replace(/^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/, `${medit.sourceAlias ?? metric.source_alias}.${medit.sourceField}`)
+                ? String((col as JsonRecord).condition).replace(/^([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/, `${sourceAlias}.${sourceField}`)
                 : undefined;
               if (from) (col as JsonRecord).condition = from;
             }
@@ -1243,27 +1284,36 @@ export async function writeReportModel(
       })),
     };
     model.calculation_plan = calculationPlan(model);
-    const existingOutputs = new Set((model.output_fields ?? []).map((field: JsonRecord) => String(field.id)));
+    const existingCalculationOutputs = (model.output_fields ?? []).filter(
+      (field: JsonRecord) => String(field.route ?? '') === 'calculation_graph',
+    );
     const nodeOutputs = (model.calculation_graph.nodes ?? []).filter((node: JsonRecord) => node.output !== false);
     model.output_fields = [
-      ...(model.output_fields ?? []),
-      ...nodeOutputs.filter((node: JsonRecord) => !existingOutputs.has(String(node.id))).map((node: JsonRecord) => ({
-        id: node.id, label: node.label, kind: 'calculation', route: 'calculation_graph', calculation_node: node.id,
-      })),
+      ...(model.output_fields ?? []).filter((field: JsonRecord) => String(field.route ?? '') !== 'calculation_graph'),
+      ...nodeOutputs.map((node: JsonRecord) => {
+        const existing = existingCalculationOutputs.find(
+          (field: JsonRecord) => String(field.calculation_node ?? field.id ?? '') === String(node.id),
+        );
+        return {
+          ...(existing ?? {}),
+          id: String(existing?.id ?? node.id),
+          label: String(node.label),
+          kind: 'calculation',
+          route: 'calculation_graph',
+          calculation_node: String(node.id),
+        };
+      }),
     ];
   }
-
-  // Write comparison settings from the editor into the model.
-  if (edit.comparison) {
-    model.comparison = {
-      enabled: Boolean(edit.comparison.enabled),
-      modes: (edit.comparison.modes ?? []).map(String),
-      period_param: String(edit.comparison.period_param ?? ''),
-      lookback_months: Number(edit.comparison.lookback_months ?? 1),
-    };
-  } else if (edit.comparison === null) {
-    delete model.comparison;
+  // The Studio-owned model format has completed its migration to structured
+  // lineage. Remove obsolete flat aliases whenever a model is resealed.
+  for (const metric of model.metrics ?? []) {
+    delete metric.source_alias;
+    delete metric.source_field;
+    delete metric.source_table;
+    delete metric.dedup_key;
   }
+  delete model.comparison;
   model.generated_at = new Date().toISOString();
   model.open_questions = [];
   model.approval = { status: 'draft' };
