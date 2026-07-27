@@ -77,6 +77,50 @@ describe('extractReportConfig', () => {
     expect(texts(d).some((t) => t.includes('[object'))).toBe(false);
   });
 
+  it('reads structured modeling fallbacks while preserving the legacy field binding', () => {
+    const draft = extractReportConfig({
+      knowledge: {
+        report_requirements: [{
+          id: 'customer-summary',
+          name: '客户汇总',
+          result_grain: { description: '一行一个客户每月', keys: ['customer_id', 'month'] },
+          scope: { exclude: '排除取消订单' },
+          time_semantics: { field: 't0.create_time', granularity: 'month', default_filter: true },
+          relationship_overrides: [{
+            from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1', description: '订单关联客户',
+          }],
+          required_fields: [{
+            id: 'valid_order_count',
+            label: '有效订单数',
+            kind: 'metric',
+            roles: ['output', 'metric'],
+            field: 'orders.id',
+            binding: { mode: 'manual', field: 'orders.id', profile_id: 'main', database: 'oms', table: 'orders' },
+            metric: {
+              source_field: 'orders.id',
+              distinct_field: 'orders.id',
+              conditions: [{ field: 'orders.status', operator: 'not_in', values: ['CANCELED', 'REJECTED'] }],
+            },
+            display: { type: 'integer', format: '0' },
+          }],
+        }],
+      },
+    });
+    const report = draft.requirements[0]!;
+    const field = report.requiredFields[0]!;
+    expect(report.resultGrain).toEqual({ description: '一行一个客户每月', keys: ['customer_id', 'month'] });
+    expect(report.timeSemantics).toEqual({ field: 't0.create_time', granularity: 'month', defaultFilter: true });
+    expect(report.relationshipOverrides?.[0]?.cardinality).toBe('n:1');
+    expect(field.id).toBe('valid_order_count');
+    expect(field.kind).toBe('metric');
+    expect(field.binding).toEqual({ mode: 'manual', field: 'orders.id', profileId: 'main', database: 'oms', table: 'orders' });
+    expect(field.metric).toEqual({
+      sourceField: 'orders.id',
+      distinctField: 'orders.id',
+      conditions: [{ field: 'orders.status', operator: 'not_in', values: ['CANCELED', 'REJECTED'] }],
+    });
+  });
+
   it('tolerates missing knowledge / arrays', () => {
     expect(extractReportConfig({})).toEqual({ requirements: [], scenarios: [] });
     expect(extractReportConfig(null)).toEqual({ requirements: [], scenarios: [] });
@@ -114,6 +158,46 @@ describe('mergeReportConfig', () => {
       field: 'oms_main_order_simple.main_order_no',
       label: '运单号(改)',
     });
+  });
+
+  it('serializes structured report inputs without dropping the legacy field mirror', () => {
+    const draft = extractReportConfig({
+      knowledge: {
+        report_requirements: [{
+          id: 'customer-summary',
+          name: '客户汇总',
+          required_fields: [{ label: '订单数', field: 'orders.id' }],
+        }],
+      },
+    });
+    const report = draft.requirements[0]!;
+    report.resultGrain = { description: '一行一个客户', keys: ['customer_id'] };
+    report.scope = { include: '仅有效订单' };
+    report.timeSemantics = { field: 'orders.create_time', granularity: 'month', defaultFilter: true };
+    report.relationshipOverrides = [{ from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1' }];
+    report.requiredFields[0] = {
+      ...report.requiredFields[0]!,
+      id: 'order_count',
+      kind: 'metric',
+      binding: { mode: 'manual', field: 'orders.id', database: 'oms', table: 'orders' },
+      metric: { aggregation: 'count_distinct', distinctField: 'orders.id' },
+    };
+    const merged = mergeReportConfig({ knowledge: {} }, draft) as { knowledge: { report_requirements: Array<Record<string, unknown>> } };
+    const serialized = merged.knowledge.report_requirements[0]!;
+    expect(serialized.result_grain).toEqual({ description: '一行一个客户', keys: ['customer_id'] });
+    expect(serialized.scope).toEqual({ include: '仅有效订单' });
+    expect(serialized.time_semantics).toEqual({ field: 'orders.create_time', granularity: 'month', default_filter: true });
+    expect(serialized.relationship_overrides).toEqual([{ from: 't0.customer_id', to: 't1.id', type: 'left', cardinality: 'n:1' }]);
+    expect(serialized.required_fields).toEqual([{
+      label: '订单数',
+      field: 'orders.id',
+      id: 'order_count',
+      kind: 'metric',
+      aggregation: 'count_distinct',
+      binding_mode: 'manual',
+      binding: { mode: 'manual', field: 'orders.id', database: 'oms', table: 'orders' },
+      metric: { distinct_field: 'orders.id' },
+    }]);
   });
 
   it('preserves all other config fields', () => {

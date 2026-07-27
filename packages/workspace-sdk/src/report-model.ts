@@ -287,6 +287,27 @@ function validateCalculationGraph(model: JsonRecord, sourceFields: Map<string, S
   return errors;
 }
 
+function calculationPlan(model: JsonRecord): JsonRecord {
+  const nodes = Array.isArray(model.calculation_graph?.nodes) ? model.calculation_graph.nodes as JsonRecord[] : [];
+  const byId = new Map(nodes.map((node) => [String(node.id), node]));
+  const ordered: JsonRecord[] = [];
+  const visited = new Set<string>();
+  const visit = (id: string): void => {
+    if (visited.has(id)) return;
+    visited.add(id);
+    const node = byId.get(id); if (!node) return;
+    for (const dependency of node.depends_on ?? []) visit(String(dependency));
+    ordered.push(node);
+  };
+  for (const node of nodes) visit(String(node.id));
+  return { version: '1', strategy: model.recommended_strategy, steps: ordered.map((node, index) => ({
+    order: index + 1, id: node.id, kind: node.kind, dependencies: node.depends_on ?? [],
+    execution: node.execution_hint === 'auto' || !node.execution_hint
+      ? (node.kind === 'merge' || model.recommended_strategy === 'script' ? 'script' : 'sql')
+      : node.execution_hint,
+  })) };
+}
+
 function validateModel(model: JsonRecord): string[] {
   const errors: string[] = [];
   if (!model.report?.id || !model.report?.name) errors.push('模型缺少报表 id/name');
@@ -527,6 +548,17 @@ export interface ReportModelQueryContract {
   }>;
 }
 
+/** One visible business field and its deterministic execution route. */
+export interface ReportModelOutputField {
+  id: string;
+  label: string;
+  kind: 'data' | 'metric' | 'calculation';
+  route: 'query' | 'metric' | 'calculation_graph';
+  queryId: string;
+  metricId: string;
+  calculationNode: string;
+}
+
 export interface ReportModelDetail {
   reportId: string;
   reportName: string;
@@ -540,6 +572,7 @@ export interface ReportModelDetail {
   filters: ReportModelFilter[];
   metrics: ReportModelMetric[];
   calculationGraph: ReportModelCalculationGraph;
+  outputFields: ReportModelOutputField[];
   timeSemantics: ReportModelTimeSemantics | null;
   queryContracts: ReportModelQueryContract[];
   comparison: ReportModelComparison | null;
@@ -719,6 +752,25 @@ export async function readReportModel(
         description: String(node.description ?? ''),
       })),
     },
+    outputFields: (() => {
+      const configured = Array.isArray(model.output_fields) ? model.output_fields as JsonRecord[] : [];
+      if (configured.length) return configured.map((field) => ({
+        id: String(field.id ?? ''), label: String(field.label ?? field.id ?? ''),
+        kind: String(field.kind ?? 'data') as ReportModelOutputField['kind'],
+        route: String(field.route ?? 'query') as ReportModelOutputField['route'],
+        queryId: String(field.query_id ?? ''), metricId: String(field.metric_id ?? ''), calculationNode: String(field.calculation_node ?? ''),
+      }));
+      const seen = new Set<string>();
+      return (model.query_contracts ?? []).flatMap((contract: JsonRecord) =>
+        (contract.output_contract ?? contract.output ?? []).flatMap((column: JsonRecord | string) => {
+          const item = typeof column === 'string' ? { name: column } : column;
+          const id = String(item.name ?? item.id ?? '');
+          if (!id || seen.has(id)) return [];
+          seen.add(id);
+          return [{ id, label: String(item.label ?? id), kind: 'data' as const, route: 'query' as const, queryId: String(contract.id ?? ''), metricId: '', calculationNode: '' }];
+        }),
+      );
+    })(),
     timeSemantics: model.time_semantics && typeof model.time_semantics === 'object'
       ? {
           status: String(model.time_semantics.status ?? ''),
@@ -1118,6 +1170,15 @@ export async function writeReportModel(
         ...(node.description.trim() ? { description: node.description.trim() } : {}),
       })),
     };
+    model.calculation_plan = calculationPlan(model);
+    const existingOutputs = new Set((model.output_fields ?? []).map((field: JsonRecord) => String(field.id)));
+    const nodeOutputs = (model.calculation_graph.nodes ?? []).filter((node: JsonRecord) => node.output !== false);
+    model.output_fields = [
+      ...(model.output_fields ?? []),
+      ...nodeOutputs.filter((node: JsonRecord) => !existingOutputs.has(String(node.id))).map((node: JsonRecord) => ({
+        id: node.id, label: node.label, kind: 'calculation', route: 'calculation_graph', calculation_node: node.id,
+      })),
+    ];
   }
 
   // Write comparison settings from the editor into the model.

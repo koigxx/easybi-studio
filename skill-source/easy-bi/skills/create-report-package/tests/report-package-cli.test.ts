@@ -2189,6 +2189,8 @@ test("staged report model builds query/script context packs without leaking phys
   });
   const modelPath = join(fixture.workspace, "work", "driver-model.json");
   const model = await initializeReportModel({ plan: fixture.plan, out: modelPath });
+  assert.equal(model.input_lock.knowledge.snapshot_hash, JSON.parse(await readFile(fixture.plan, "utf8")).knowledge.snapshot_hash);
+  assert.ok(Array.isArray(model.output_fields));
   model.result_grain.keys = ["code"];
   model.open_questions = [];
   model.recommended_strategy = "script";
@@ -2220,6 +2222,14 @@ test("staged report model builds query/script context packs without leaking phys
       },
     ],
   };
+  model.output_fields.push({
+    id: "driver_count_double",
+    label: "司机数两倍",
+    kind: "calculation",
+    route: "calculation_graph",
+    query_id: "main",
+    calculation_node: "driver_count_double",
+  });
   const cyclic = structuredClone(model);
   cyclic.calculation_graph.nodes[0].depends_on = ["driver_count_double"];
   assert.match(validateReportModelValue(cyclic).join("\n"), /循环依赖/);
@@ -2240,6 +2250,7 @@ test("staged report model builds query/script context packs without leaking phys
   assert.equal(queryContext.payload.knowledge.tables.length, 1);
   assert.equal(queryContext.payload.query_contract.id, "main");
   assert.equal(queryContext.payload.calculation_graph.nodes.length, 2);
+  assert.ok(queryContext.payload.output_fields.some((field: any) => field.id === "driver_count_double"));
 
   const outputDir = join(fixture.workspace, "work", "query-outputs");
   await mkdir(outputDir, { recursive: true });
@@ -2259,6 +2270,7 @@ test("staged report model builds query/script context packs without leaking phys
   assert.equal(serialized.includes("physical_fields"), false);
   assert.equal(serialized.includes("schema_fingerprint"), false);
   assert.equal(scriptContext.payload.calculation_graph.nodes.length, 2);
+  assert.ok(scriptContext.payload.calculation_plan.steps.some((step: any) => step.id === "driver_count_double"));
   assert.deepEqual(scriptContext.payload.allowed_api, [
     "queryStream",
     "queryStreamWithFilters",
@@ -2690,6 +2702,7 @@ test("a staged model is promoted as one minimal current model package", async ()
     [
       "checksums.sha256",
       "execution-plan.json",
+      "input.lock.json",
       "model.manifest.json",
       "report-model.json",
       "semantic-plan.json",

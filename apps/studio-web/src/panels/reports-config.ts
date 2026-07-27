@@ -12,18 +12,79 @@
 /** What a field is used for in the report. A field may play several roles. */
 export type FieldRole = 'output' | 'filter' | 'group' | 'metric';
 export const FIELD_ROLES: FieldRole[] = ['output', 'filter', 'group', 'metric'];
-export type MetricAggregation = 'count' | 'count_distinct' | 'sum' | 'avg' | 'ratio';
+export type ReportFieldKind = 'data' | 'metric' | 'formula' | 'comparison' | 'window' | 'merge';
+export const REPORT_FIELD_KINDS: ReportFieldKind[] = [
+  'data',
+  'metric',
+  'formula',
+  'comparison',
+  'window',
+  'merge',
+];
+export type MetricAggregation =
+  | 'count'
+  | 'count_distinct'
+  | 'sum'
+  | 'avg'
+  | 'min'
+  | 'max'
+  | 'first'
+  | 'last'
+  | 'ratio';
 export const METRIC_AGGREGATIONS: MetricAggregation[] = [
   'count',
   'count_distinct',
   'sum',
   'avg',
+  'min',
+  'max',
+  'first',
+  'last',
   'ratio',
 ];
 
+/** Optional user-facing fallback binding. The legacy `field` mirror remains for Skill compatibility. */
+export interface ReportFieldBindingDraft {
+  mode: 'auto' | 'manual' | 'pending';
+  field: string;
+  profileId?: string;
+  database?: string;
+  table?: string;
+}
+
+export type MetricConditionOperator =
+  | 'eq'
+  | 'ne'
+  | 'in'
+  | 'not_in'
+  | 'gt'
+  | 'gte'
+  | 'lt'
+  | 'lte'
+  | 'is_null'
+  | 'not_null';
+
+export interface ReportMetricConditionDraft {
+  field: string;
+  operator: MetricConditionOperator;
+  values?: string[];
+}
+
+/** Business-level metric details. These are intentionally free of SQL and table aliases. */
+export interface ReportMetricDraft {
+  aggregation?: MetricAggregation;
+  sourceField?: string;
+  distinctField?: string;
+  conditions?: ReportMetricConditionDraft[];
+}
+
 export interface ReportFieldDraft {
+  /** Stable field identity. Hidden in the ordinary editor and preserved across label changes. */
+  id?: string;
   /** The human-editable display text (a plain string, or an object's label/field). */
   text: string;
+  /** `data` is the backwards-compatible default. */
+  kind?: ReportFieldKind;
   /** Roles this field plays. Empty/absent means output-only (backward compatible). */
   roles: FieldRole[];
   /**
@@ -34,6 +95,16 @@ export interface ReportFieldDraft {
   description?: string;
   /** Optional metric aggregation. Used only when the metric role is selected. */
   aggregation?: MetricAggregation;
+  /** Optional structured physical binding used when AI needs an explicit fallback. */
+  binding?: ReportFieldBindingDraft;
+  /** Optional metric source, distinct key, and structured business conditions. */
+  metric?: ReportMetricDraft;
+  /** Optional filter presentation settings. Physical type/operator still default from knowledge. */
+  filter?: { required?: boolean; operator?: string; multiple?: boolean; defaultValue?: unknown };
+  /** Optional time interpretation override. `auto` keeps the create_time default policy. */
+  time?: { role?: 'auto' | 'default_filter' | 'comparison'; granularity?: 'auto' | 'day' | 'month' | 'year' };
+  /** Optional output-only formatting. Never participates in SQL or calculation semantics. */
+  display?: { type?: string; format?: string; unit?: string; decimalPlaces?: number };
   /** Present when the original entry was an object; preserved on merge. */
   raw?: Record<string, unknown>;
 }
@@ -44,6 +115,24 @@ export interface ReportRequirementDraft {
   /** Free-text business notes / metric definitions (口径). Optional. */
   description: string;
   requiredFields: ReportFieldDraft[];
+  /** Plain-language result grain. Stable keys are optional technical fallbacks. */
+  resultGrain?: { description: string; keys?: string[] };
+  /** Optional inclusion/exclusion explanation used by modeling, never rendered as SQL. */
+  scope?: { include?: string; exclude?: string };
+  /** Optional report-level time preference; missing means automatic knowledge-driven selection. */
+  timeSemantics?: {
+    field?: string;
+    granularity?: 'auto' | 'day' | 'month' | 'year';
+    defaultFilter?: boolean;
+  };
+  /** Manual relationship fallback for knowledge bases without usable relationship evidence. */
+  relationshipOverrides?: Array<{
+    from: string;
+    to: string;
+    type: 'left' | 'inner';
+    cardinality: '1:1' | 'n:1' | '1:n' | 'n:n';
+    description?: string;
+  }>;
   /** Comparison (环比/同比) configuration for this report. */
   comparison?: {
     enabled: boolean;
@@ -73,6 +162,116 @@ function normalizeRoles(value: unknown): FieldRole[] {
   return FIELD_ROLES.filter((r) => seen.has(r));
 }
 
+function normalizeFieldKind(value: unknown): ReportFieldKind | undefined {
+  const kind = String(value ?? '') as ReportFieldKind;
+  return REPORT_FIELD_KINDS.includes(kind) ? kind : undefined;
+}
+
+function normalizeAggregation(value: unknown): MetricAggregation | undefined {
+  const aggregation = String(value ?? '') as MetricAggregation;
+  return METRIC_AGGREGATIONS.includes(aggregation) ? aggregation : undefined;
+}
+
+function normalizeStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const result = value.map(String).map((item) => item.trim()).filter(Boolean);
+  return result.length ? result : undefined;
+}
+
+function readBinding(rec: Record<string, unknown>): ReportFieldBindingDraft | undefined {
+  if (!rec.binding && !rec.binding_mode) return undefined;
+  const binding = asRecord(rec.binding);
+  const field = String(binding.field ?? rec.field ?? rec.physical_field ?? '').trim();
+  if (!field) return undefined;
+  const mode = String(binding.mode ?? rec.binding_mode ?? 'manual');
+  return {
+    mode: mode === 'auto' || mode === 'pending' ? mode : 'manual',
+    field,
+    ...(typeof binding.profile_id === 'string' && binding.profile_id.trim()
+      ? { profileId: binding.profile_id.trim() }
+      : {}),
+    ...(typeof binding.database === 'string' && binding.database.trim()
+      ? { database: binding.database.trim() }
+      : {}),
+    ...(typeof binding.table === 'string' && binding.table.trim()
+      ? { table: binding.table.trim() }
+      : {}),
+  };
+}
+
+function readMetric(rec: Record<string, unknown>): ReportMetricDraft | undefined {
+  const metric = asRecord(rec.metric);
+  const aggregation = normalizeAggregation(metric.aggregation ?? rec.aggregation);
+  const sourceField = String(metric.source_field ?? rec.source_field ?? '').trim();
+  const distinctField = String(metric.distinct_field ?? rec.distinct_field ?? '').trim();
+  const conditions = Array.isArray(metric.conditions)
+    ? metric.conditions
+        .filter((value) => typeof value === 'object' && value !== null && !Array.isArray(value))
+        .map((value) => {
+          const condition = value as Record<string, unknown>;
+          const field = String(condition.field ?? '').trim();
+          const operator = String(condition.operator ?? '') as MetricConditionOperator;
+          const allowed = ['eq', 'ne', 'in', 'not_in', 'gt', 'gte', 'lt', 'lte', 'is_null', 'not_null'];
+          if (!field || !allowed.includes(operator)) return null;
+          const values = normalizeStringArray(condition.values);
+          return { field, operator, ...(values ? { values } : {}) };
+        })
+        .filter((condition): condition is NonNullable<typeof condition> => condition !== null)
+    : [];
+  if (!aggregation && !sourceField && !distinctField && !conditions.length) return undefined;
+  return {
+    ...(aggregation ? { aggregation } : {}),
+    ...(sourceField ? { sourceField } : {}),
+    ...(distinctField ? { distinctField } : {}),
+    ...(conditions.length ? { conditions } : {}),
+  };
+}
+
+function readFilter(rec: Record<string, unknown>): ReportFieldDraft['filter'] | undefined {
+  const filter = asRecord(rec.filter);
+  const required = typeof filter.required === 'boolean' ? filter.required : undefined;
+  const operator = typeof filter.operator === 'string' && filter.operator.trim()
+    ? filter.operator.trim()
+    : undefined;
+  const multiple = typeof filter.multiple === 'boolean' ? filter.multiple : undefined;
+  const defaultValue = filter.default_value ?? filter.defaultValue;
+  if (required === undefined && !operator && multiple === undefined && defaultValue === undefined) return undefined;
+  return {
+    ...(required !== undefined ? { required } : {}),
+    ...(operator ? { operator } : {}),
+    ...(multiple !== undefined ? { multiple } : {}),
+    ...(defaultValue !== undefined ? { defaultValue } : {}),
+  };
+}
+
+function readTime(rec: Record<string, unknown>): ReportFieldDraft['time'] | undefined {
+  const time = asRecord(rec.time);
+  const role = String(time.role ?? '');
+  const granularity = String(time.granularity ?? '');
+  const validRole = ['auto', 'default_filter', 'comparison'].includes(role)
+    ? (role as NonNullable<ReportFieldDraft['time']>['role'])
+    : undefined;
+  const validGranularity = ['auto', 'day', 'month', 'year'].includes(granularity)
+    ? (granularity as NonNullable<ReportFieldDraft['time']>['granularity'])
+    : undefined;
+  return validRole || validGranularity
+    ? { ...(validRole ? { role: validRole } : {}), ...(validGranularity ? { granularity: validGranularity } : {}) }
+    : undefined;
+}
+
+function readDisplay(rec: Record<string, unknown>): ReportFieldDraft['display'] | undefined {
+  const display = asRecord(rec.display);
+  const type = typeof display.type === 'string' && display.type.trim() ? display.type.trim() : undefined;
+  const format = typeof display.format === 'string' && display.format.trim() ? display.format.trim() : undefined;
+  const unit = typeof display.unit === 'string' && display.unit.trim() ? display.unit.trim() : undefined;
+  const decimalPlaces = Number.isInteger(display.decimal_places ?? display.decimalPlaces)
+    ? Number(display.decimal_places ?? display.decimalPlaces)
+    : undefined;
+  return type || format || unit || decimalPlaces !== undefined
+    ? { ...(type ? { type } : {}), ...(format ? { format } : {}), ...(unit ? { unit } : {}), ...(decimalPlaces !== undefined ? { decimalPlaces } : {}) }
+    : undefined;
+}
+
 /** Read a required-field entry (string or object) into an editable draft. */
 function toFieldDraft(entry: unknown): ReportFieldDraft {
   if (typeof entry === 'string') return { text: entry, roles: [], description: '' };
@@ -87,12 +286,17 @@ function toFieldDraft(entry: unknown): ReportFieldDraft {
             ? rec.name
             : '';
     return {
+      id: typeof rec.id === 'string' && rec.id.trim() ? rec.id.trim() : undefined,
       text,
+      kind: normalizeFieldKind(rec.kind),
       roles: normalizeRoles(rec.roles),
       description: typeof rec.description === 'string' ? rec.description : '',
-      aggregation: METRIC_AGGREGATIONS.includes(rec.aggregation as MetricAggregation)
-        ? (rec.aggregation as MetricAggregation)
-        : undefined,
+      aggregation: normalizeAggregation(rec.aggregation),
+      binding: readBinding(rec),
+      metric: readMetric(rec),
+      filter: readFilter(rec),
+      time: readTime(rec),
+      display: readDisplay(rec),
       raw: rec,
     };
   }
@@ -111,14 +315,59 @@ function fromFieldDraft(f: ReportFieldDraft): string | Record<string, unknown> {
   // "output-only" is the default; don't persist it to keep configs clean.
   const meaningfulRoles = roles.filter((r) => r !== 'output');
   const nonOutputRoles = roles.length > 0 && (roles.length > 1 || roles[0] !== 'output');
-  if (f.raw) {
+  const metric = f.metric ?? {};
+  const aggregation = f.aggregation ?? metric.aggregation;
+  const binding = f.binding;
+  const hasStructuredConfig =
+    !!f.id ||
+    !!f.kind ||
+    !!binding ||
+    !!f.metric ||
+    !!f.filter ||
+    !!f.time ||
+    !!f.display;
+  if (f.raw || hasStructuredConfig) {
     const out: Record<string, unknown> = { ...f.raw, label: text };
+    if (f.id?.trim()) out.id = f.id.trim();
+    else delete out.id;
+    if (f.kind && f.kind !== 'data') out.kind = f.kind;
+    else delete out.kind;
     if (roles.length) out.roles = roles;
     else delete out.roles;
     if (description) out.description = description;
     else delete out.description;
-    if (roles.includes('metric') && f.aggregation) out.aggregation = f.aggregation;
+    if ((roles.includes('metric') || f.kind === 'metric') && aggregation) out.aggregation = aggregation;
     else delete out.aggregation;
+    if (binding?.field.trim()) {
+      out.field = binding.field.trim();
+      out.binding_mode = binding.mode;
+      out.binding = {
+        mode: binding.mode,
+        field: binding.field.trim(),
+        ...(binding.profileId ? { profile_id: binding.profileId } : {}),
+        ...(binding.database ? { database: binding.database } : {}),
+        ...(binding.table ? { table: binding.table } : {}),
+      };
+    } else {
+      delete out.binding;
+      delete out.binding_mode;
+      if (f.raw && typeof f.raw.field === 'string') out.field = f.raw.field;
+    }
+    const conditions = metric.conditions?.map((condition) => ({
+      field: condition.field,
+      operator: condition.operator,
+      ...(condition.values?.length ? { values: condition.values } : {}),
+    }));
+    if (metric.sourceField || metric.distinctField || conditions?.length) {
+      out.metric = {
+        ...(metric.sourceField ? { source_field: metric.sourceField } : {}),
+        ...(metric.distinctField ? { distinct_field: metric.distinctField } : {}),
+        ...(conditions?.length ? { conditions } : {}),
+      };
+    } else delete out.metric;
+    if (f.filter && Object.keys(f.filter).length) out.filter = f.filter;
+    if (f.time && Object.keys(f.time).length) out.time = f.time;
+    if (f.display && Object.keys(f.display).length) out.display = f.display;
     return out;
   }
   // No original object: only upgrade to an object when roles or a description
@@ -126,7 +375,7 @@ function fromFieldDraft(f: ReportFieldDraft): string | Record<string, unknown> {
   if (nonOutputRoles || meaningfulRoles.length || description) {
     const out: Record<string, unknown> = { label: text, roles };
     if (description) out.description = description;
-    if (roles.includes('metric') && f.aggregation) out.aggregation = f.aggregation;
+    if (roles.includes('metric') && aggregation) out.aggregation = aggregation;
     return out;
   }
   return text;
@@ -137,6 +386,52 @@ function isEmptyField(f: ReportFieldDraft): boolean {
   if (f.text.trim().length > 0) return false;
   // Keep an object entry only if it still has a field binding.
   return !(f.raw && typeof f.raw.field === 'string' && f.raw.field.trim().length > 0);
+}
+
+function readResultGrain(rec: Record<string, unknown>): ReportRequirementDraft['resultGrain'] | undefined {
+  const grain = asRecord(rec.result_grain);
+  const description = typeof grain.description === 'string' ? grain.description.trim() : '';
+  const keys = normalizeStringArray(grain.keys);
+  return description || keys ? { ...(description ? { description } : { description: '' }), ...(keys ? { keys } : {}) } : undefined;
+}
+
+function readScope(rec: Record<string, unknown>): ReportRequirementDraft['scope'] | undefined {
+  const scope = asRecord(rec.scope);
+  const include = typeof scope.include === 'string' && scope.include.trim() ? scope.include.trim() : undefined;
+  const exclude = typeof scope.exclude === 'string' && scope.exclude.trim() ? scope.exclude.trim() : undefined;
+  return include || exclude ? { ...(include ? { include } : {}), ...(exclude ? { exclude } : {}) } : undefined;
+}
+
+function readTimeSemantics(rec: Record<string, unknown>): ReportRequirementDraft['timeSemantics'] | undefined {
+  const time = asRecord(rec.time_semantics);
+  const field = typeof time.field === 'string' && time.field.trim() ? time.field.trim() : undefined;
+  const granularity = ['auto', 'day', 'month', 'year'].includes(String(time.granularity))
+    ? (String(time.granularity) as NonNullable<ReportRequirementDraft['timeSemantics']>['granularity'])
+    : undefined;
+  const defaultFilter = typeof time.default_filter === 'boolean' ? time.default_filter : undefined;
+  return field || granularity || defaultFilter !== undefined
+    ? { ...(field ? { field } : {}), ...(granularity ? { granularity } : {}), ...(defaultFilter !== undefined ? { defaultFilter } : {}) }
+    : undefined;
+}
+
+function readRelationshipOverrides(rec: Record<string, unknown>): ReportRequirementDraft['relationshipOverrides'] | undefined {
+  if (!Array.isArray(rec.relationship_overrides)) return undefined;
+  const result = rec.relationship_overrides
+    .filter((value) => typeof value === 'object' && value !== null && !Array.isArray(value))
+    .map((value) => {
+      const relationship = value as Record<string, unknown>;
+      const from = String(relationship.from ?? '').trim();
+      const to = String(relationship.to ?? '').trim();
+      const type = String(relationship.type ?? '').toLowerCase();
+      const cardinality = String(relationship.cardinality ?? '').toLowerCase();
+      if (!from || !to || !['left', 'inner'].includes(type) || !['1:1', 'n:1', '1:n', 'n:n'].includes(cardinality)) return null;
+      const description = typeof relationship.description === 'string' && relationship.description.trim()
+        ? relationship.description.trim()
+        : undefined;
+      return { from, to, type: type as 'left' | 'inner', cardinality: cardinality as '1:1' | 'n:1' | '1:n' | 'n:n', ...(description ? { description } : {}) };
+    })
+    .filter((relationship): relationship is NonNullable<typeof relationship> => relationship !== null);
+  return result.length ? result : undefined;
 }
 
 /** Read report_requirements + report_scenarios out of a build config value. */
@@ -155,6 +450,10 @@ export function extractReportConfig(configValue: unknown): ReportConfigDraft {
       name: String(rec.name ?? ''),
       description: typeof rec.description === 'string' ? rec.description : '',
       requiredFields: fields,
+      resultGrain: readResultGrain(rec),
+      scope: readScope(rec),
+      timeSemantics: readTimeSemantics(rec),
+      relationshipOverrides: readRelationshipOverrides(rec),
       ...(comp && typeof comp.enabled === 'boolean' ? {
         comparison: {
           enabled: Boolean(comp.enabled),
@@ -188,6 +487,36 @@ function requirementToConfig(r: ReportRequirementDraft): Record<string, unknown>
       period_param: r.comparison.period_param,
       lookback_months: r.comparison.lookback_months,
     };
+  }
+  if (r.resultGrain?.description.trim() || r.resultGrain?.keys?.length) {
+    req.result_grain = {
+      ...(r.resultGrain.description.trim() ? { description: r.resultGrain.description.trim() } : {}),
+      ...(r.resultGrain.keys?.map((key) => key.trim()).filter(Boolean).length
+        ? { keys: r.resultGrain.keys.map((key) => key.trim()).filter(Boolean) }
+        : {}),
+    };
+  }
+  if (r.scope?.include?.trim() || r.scope?.exclude?.trim()) {
+    req.scope = {
+      ...(r.scope.include?.trim() ? { include: r.scope.include.trim() } : {}),
+      ...(r.scope.exclude?.trim() ? { exclude: r.scope.exclude.trim() } : {}),
+    };
+  }
+  if (r.timeSemantics?.field?.trim() || r.timeSemantics?.granularity || r.timeSemantics?.defaultFilter !== undefined) {
+    req.time_semantics = {
+      ...(r.timeSemantics.field?.trim() ? { field: r.timeSemantics.field.trim() } : {}),
+      ...(r.timeSemantics.granularity ? { granularity: r.timeSemantics.granularity } : {}),
+      ...(r.timeSemantics.defaultFilter !== undefined ? { default_filter: r.timeSemantics.defaultFilter } : {}),
+    };
+  }
+  if (r.relationshipOverrides?.length) {
+    req.relationship_overrides = r.relationshipOverrides.map((relationship) => ({
+      from: relationship.from.trim(),
+      to: relationship.to.trim(),
+      type: relationship.type,
+      cardinality: relationship.cardinality,
+      ...(relationship.description?.trim() ? { description: relationship.description.trim() } : {}),
+    }));
   }
   return req;
 }
@@ -287,7 +616,7 @@ export function toggleRole(f: ReportFieldDraft, role: FieldRole): ReportFieldDra
 
 /** Read the optional field binding (db.table.column) from a draft field. */
 export function fieldBinding(f: ReportFieldDraft): string {
-  return f.raw && typeof f.raw.field === 'string' ? f.raw.field : '';
+  return f.binding?.field ?? (f.raw && typeof f.raw.field === 'string' ? f.raw.field : '');
 }
 
 /**
@@ -297,19 +626,17 @@ export function fieldBinding(f: ReportFieldDraft): string {
  */
 export function setFieldBinding(f: ReportFieldDraft, binding: string): ReportFieldDraft {
   const trimmed = binding.trim();
-  const roles = f.roles ?? [];
-  // Only carry `description` when it holds content, so callers comparing plain
-  // (text, roles) drafts by value keep matching.
-  const desc = (f.description ?? '').trim();
-  const carry = {
-    ...(desc ? { description: f.description } : {}),
-    ...(f.aggregation ? { aggregation: f.aggregation } : {}),
-  };
-  if (!trimmed) return { text: f.text, roles, ...carry };
+  if (!trimmed) {
+    const { field: _legacyField, physical_field: _physicalField, binding: _binding, binding_mode: _mode, label: _label, ...remaining } = f.raw ?? {};
+    const { binding: _draftBinding, raw: _draftRaw, ...base } = f;
+    return {
+      ...base,
+      ...(Object.keys(remaining).length ? { raw: remaining } : {}),
+    };
+  }
   return {
-    text: f.text,
-    roles,
-    ...carry,
+    ...f,
+    binding: f.binding ? { ...f.binding, mode: 'manual', field: trimmed } : undefined,
     raw: { ...(f.raw ?? {}), field: trimmed, label: f.text },
   };
 }
@@ -403,23 +730,24 @@ export function parseImportedReports(text: string): {
     );
   }
 
-  const requirements: ReportRequirementDraft[] = rawReqs.map((r, index) => {
-    const rec = asRecord(r);
-    // Fields may be under `fields` (simple) or `required_fields` (config shape).
-    const rawFields = Array.isArray(rec.fields)
-      ? rec.fields
-      : Array.isArray(rec.required_fields)
-        ? rec.required_fields
-        : [];
-    const name = String(rec.name ?? '');
-    const id = String(rec.id ?? '').trim() || deriveReportId(name, index);
-    return {
-      id,
-      name,
-      description: typeof rec.description === 'string' ? rec.description : '',
-      requiredFields: rawFields.map(toImportedFieldDraft),
-    };
+  // Reuse the canonical config reader so a standard export round-trips every
+  // modern report-level and field-level structure instead of silently dropping it.
+  const canonicalRequirements = rawReqs.map((value) => {
+    const record = asRecord(value);
+    return !Array.isArray(record.required_fields) && Array.isArray(record.fields)
+      ? { ...record, required_fields: record.fields }
+      : value;
   });
+  const canonical = extractReportConfig({
+    knowledge: { report_requirements: canonicalRequirements, report_scenarios: rawScenarios ?? [] },
+  });
+  const requirements: ReportRequirementDraft[] = canonical.requirements.map((requirement, index) => ({
+    ...requirement,
+    id: requirement.id.trim() || deriveReportId(requirement.name, index),
+    requiredFields: requirement.requiredFields.map((field) =>
+      field.roles.length ? field : toImportedFieldDraft(field.raw ?? field.text),
+    ),
+  }));
   if (requirements.length === 0) throw new Error('导入的报表需求为空');
 
   const scenarios = Array.isArray(rawScenarios) ? rawScenarios.map((s) => String(s)) : [];
@@ -462,18 +790,31 @@ export function applyImport(
 
 /** Serialize the current draft's report branch to pretty JSON for export/copy. */
 export function exportReportsJson(draft: ReportConfigDraft): string {
-  const requirements = draft.requirements.map((r) => {
-    const req: Record<string, unknown> = {
-      id: r.id.trim(),
-      name: r.name.trim(),
-      required_fields: r.requiredFields.filter((f) => !isEmptyField(f)).map(fromFieldDraft),
-    };
-    const desc = (r.description ?? '').trim();
-    if (desc) req.description = desc;
-    return req;
-  });
+  const requirements = draft.requirements.map(requirementToConfig);
   const scenarios = draft.scenarios.map((s) => s.trim()).filter((s) => s.length > 0);
-  return JSON.stringify({ report_requirements: requirements, report_scenarios: scenarios }, null, 2);
+  return JSON.stringify({
+    easybi_report_config_format: '1',
+    exported_at: new Date().toISOString(),
+    report_requirements: requirements,
+    report_scenarios: scenarios,
+  }, null, 2);
+}
+
+export function previewReportImport(
+  current: ReportConfigDraft,
+  imported: { requirements: ReportRequirementDraft[]; scenarios: string[] },
+): { create: string[]; update: string[]; fields: number; metrics: number; scenarios: number } {
+  const currentIds = new Set(current.requirements.map((item) => item.id));
+  const create: string[] = [];
+  const update: string[] = [];
+  let fields = 0;
+  let metrics = 0;
+  for (const requirement of imported.requirements) {
+    (currentIds.has(requirement.id) ? update : create).push(requirement.name || requirement.id);
+    fields += requirement.requiredFields.length;
+    metrics += requirement.requiredFields.filter((field) => field.kind === 'metric' || field.roles.includes('metric')).length;
+  }
+  return { create, update, fields, metrics, scenarios: imported.scenarios.length };
 }
 
 /** Validate a single requirement draft; returns a Chinese error or null. */

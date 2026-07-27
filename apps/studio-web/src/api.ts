@@ -593,6 +593,16 @@ export interface ReportModelQueryContract {
   }>;
 }
 
+export interface ReportModelOutputField {
+  id: string;
+  label: string;
+  kind: 'data' | 'metric' | 'calculation';
+  route: 'query' | 'metric' | 'calculation_graph';
+  queryId: string;
+  metricId: string;
+  calculationNode: string;
+}
+
 export interface ReportModelDetail {
   reportId: string;
   reportName: string;
@@ -606,6 +616,7 @@ export interface ReportModelDetail {
   filters: ReportModelFilter[];
   metrics: ReportModelMetric[];
   calculationGraph: ReportModelCalculationGraph;
+  outputFields: ReportModelOutputField[];
   timeSemantics?: ReportModelTimeSemantics | null;
   queryContracts?: ReportModelQueryContract[];
   comparison: ReportModelComparison | null;

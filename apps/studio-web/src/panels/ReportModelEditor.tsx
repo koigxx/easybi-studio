@@ -1613,14 +1613,14 @@ function FieldDirectoryTab({
           <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
             {/* Table header */}
             <div style={{
-              display: 'grid', gridTemplateColumns: '40px 140px 70px 200px 1fr', gap: 10, alignItems: 'center',
+              display: 'grid', gridTemplateColumns: '32px minmax(150px, 1.15fr) minmax(72px, .55fr) minmax(150px, 1fr) minmax(190px, 1.6fr)', gap: 10, alignItems: 'center',
               padding: '4px 12px', fontSize: 10.5, color: 'var(--ide-text-tertiary)', fontWeight: 600,
             }}>
               <span>#</span><span>字段名</span><span>类型</span><span>来源列</span><span>计算方式 / 说明</span>
             </div>
             {outputFields.map((f, i) => (
               <div key={f.name} className="ide-card" style={{
-                display: 'grid', gridTemplateColumns: '40px 140px 70px 200px 1fr', gap: 10, alignItems: 'flex-start',
+                display: 'grid', gridTemplateColumns: '32px minmax(150px, 1.15fr) minmax(72px, .55fr) minmax(150px, 1fr) minmax(190px, 1.6fr)', gap: 10, alignItems: 'flex-start',
                 padding: '7px 12px', fontSize: 12,
               }}>
                 <span style={{ color: 'var(--ide-text-tertiary)', fontSize: 10.5 }}>{i + 1}</span>

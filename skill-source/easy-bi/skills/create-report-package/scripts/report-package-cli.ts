@@ -968,7 +968,7 @@ export async function inspectReport(options: {
       roles.includes("metric") ||
       (!explicitBinding &&
         /数量|总数|合计|金额|总额|比例|比率|率$|均值|平均/u.test(String(label ?? raw)));
-    if (inferredMetric && !explicitBinding) {
+    if (inferredMetric) {
       const fieldId = stableId(String(label ?? raw)).replaceAll("-", "_");
       const aggregation =
         typeof requestedObject?.aggregation === "string"
@@ -991,6 +991,9 @@ export async function inspectReport(options: {
         roles: roles.length ? roles : ["metric", "output"],
         metric_intent: {
           aggregation,
+          source_field: String(requestedObject?.metric?.source_field ?? requestedObject?.source_field ?? requestedObject?.field ?? "").trim() || null,
+          distinct_field: String(requestedObject?.metric?.distinct_field ?? requestedObject?.distinct_field ?? "").trim() || null,
+          conditions: requestedObject?.metric?.conditions ?? [],
           entity: String(label ?? raw).includes("派车单")
             ? "派车单"
             : String(label ?? raw).includes("运单")
@@ -4341,12 +4344,82 @@ function initialQueryContracts(plan: JsonRecord): JsonRecord[] {
   }];
 }
 
+/** Canonical output registry: every business field has one stable id and one route. */
+function deriveOutputFields(model: JsonRecord): JsonRecord[] {
+  if (Array.isArray(model.output_fields) && model.output_fields.length) return model.output_fields;
+  const graphIds = new Set((model.calculation_graph?.nodes ?? []).map((node: JsonRecord) => String(node.id)));
+  const metricIds = new Set((model.metrics ?? []).map((metric: JsonRecord) => String(metric.id)));
+  const seen = new Set<string>();
+  const result: JsonRecord[] = [];
+  for (const contract of model.query_contracts ?? []) {
+    for (const raw of contract.output ?? contract.output_contract ?? []) {
+      const column = typeof raw === "string" ? { name: raw } : raw;
+      const id = String(column.name ?? column.id ?? "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      result.push({
+        id,
+        label: String(column.label ?? id),
+        kind: graphIds.has(id) ? "calculation" : metricIds.has(id) ? "metric" : "data",
+        route: graphIds.has(id) ? "calculation_graph" : metricIds.has(id) ? "metric" : "query",
+        query_id: String(contract.id ?? ""),
+        ...(graphIds.has(id) ? { calculation_node: id } : {}),
+        ...(metricIds.has(id) ? { metric_id: id } : {}),
+      });
+    }
+  }
+  return result;
+}
+
+/** Deterministic planner owned by the CLI, never left to a chat prompt. */
+function deriveCalculationPlan(model: JsonRecord): JsonRecord {
+  const nodes = Array.isArray(model.calculation_graph?.nodes) ? model.calculation_graph.nodes as JsonRecord[] : [];
+  const byId = new Map(nodes.map((node) => [String(node.id), node]));
+  const ordered: JsonRecord[] = [];
+  const visited = new Set<string>();
+  const visit = (id: string): void => {
+    if (visited.has(id)) return;
+    visited.add(id);
+    const node = byId.get(id);
+    if (!node) return;
+    for (const dep of node.depends_on ?? []) visit(String(dep));
+    ordered.push(node);
+  };
+  for (const node of nodes) visit(String(node.id));
+  return {
+    version: "1",
+    strategy: model.recommended_strategy,
+    steps: ordered.map((node, index) => ({
+      order: index + 1,
+      id: node.id,
+      kind: node.kind,
+      dependencies: node.depends_on ?? [],
+      execution: node.execution_hint === "auto" || !node.execution_hint
+        ? (node.kind === "merge" || model.recommended_strategy === "script" ? "script" : "sql")
+        : node.execution_hint,
+    })),
+  };
+}
+
 export async function initializeReportModel(options: { plan: string; out: string }): Promise<JsonRecord> {
   const plan = await readJson(resolve(options.plan));
   const model: JsonRecord = {
     model_format_version: REPORT_MODEL_FORMAT_VERSION,
     generated_at: new Date().toISOString(),
     report: plan.report,
+    input_lock: {
+      lock_format_version: "1",
+      knowledge: {
+        catalog_version: plan.knowledge?.catalog_version,
+        snapshot_hash: plan.knowledge?.snapshot_hash,
+      },
+      report_requirement: {
+        id: plan.report?.id,
+        name: plan.report?.name,
+        fields: (plan.fields ?? []).map((field: JsonRecord) => ({ id: field.id, label: field.label, roles: field.roles ?? [] })),
+        blockers: (plan.blockers ?? []).map((blocker: JsonRecord) => ({ id: blocker.field_id, code: blocker.code, label: blocker.label })),
+      },
+    },
     result_grain: {
       description: plan.semantic_plan?.result_grain ?? "待确认",
       keys: (plan.semantic_plan?.dimensions ?? []).map((item: JsonRecord) => item.id),
@@ -4377,6 +4450,9 @@ export async function initializeReportModel(options: { plan: string; out: string
     exclusions: plan.semantic_plan?.exclusions ?? [],
     recommended_strategy: plan.execution_plan?.strategy ?? "sql",
     query_contracts: initialQueryContracts(plan),
+    output_fields: (plan.fields ?? []).map((field: JsonRecord) => ({
+      id: field.id, label: field.label, kind: "data", route: "query", query_id: "main",
+    })),
     open_questions: (() => {
       const seen = new Map<string, JsonRecord>();
       const add = (item: JsonRecord) => { seen.set(String(item.id ?? ''), item); };
@@ -4404,6 +4480,7 @@ export async function initializeReportModel(options: { plan: string; out: string
     })(),
     approval: { status: "draft" },
   };
+  model.calculation_plan = deriveCalculationPlan(model);
   await writeJson(resolve(options.out), model);
   return model;
 }
@@ -4564,7 +4641,17 @@ function normalizeFinalReportModelValue(model: JsonRecord): JsonRecord {
         ["1:n", "n:n"].includes(String(relationship.cardinality ?? "").toLowerCase()),
     };
   });
-  return { ...model, sources, relationships, query_contracts: queryContracts };
+  const queryIds = new Set(queryContracts.map((query: JsonRecord) => String(query.id ?? "")));
+  const normalized = {
+    ...model,
+    sources,
+    relationships,
+    query_contracts: queryContracts,
+    output_fields: Array.isArray(model.output_fields)
+      ? model.output_fields.filter((field: JsonRecord) => !field.query_id || queryIds.has(String(field.query_id)))
+      : model.output_fields,
+  };
+  return { ...normalized, output_fields: deriveOutputFields(normalized), calculation_plan: deriveCalculationPlan(normalized) };
 }
 
 export function validateDiscoveryReportModelValue(model: JsonRecord): string[] {
@@ -4729,6 +4816,30 @@ function validateCalculationGraphValue(
   return errors;
 }
 
+function validateOutputFieldsValue(model: JsonRecord): string[] {
+  if (model.output_fields == null) return [];
+  if (!Array.isArray(model.output_fields)) return ["output_fields 必须是数组"];
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  const graphIds = new Set((model.calculation_graph?.nodes ?? []).map((node: JsonRecord) => String(node.id)));
+  const metricIds = new Set((model.metrics ?? []).map((metric: JsonRecord) => String(metric.id)));
+  const queryIds = new Set((model.query_contracts ?? []).map((query: JsonRecord) => String(query.id)));
+  for (const field of model.output_fields) {
+    const id = String(field?.id ?? "").trim();
+    const label = String(field?.label ?? "").trim();
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(id) || seen.has(id)) errors.push(`输出字段 id 缺失、非法或重复：${id || "?"}`);
+    seen.add(id);
+    if (!label) errors.push(`输出字段 ${id || "?"} 缺少名称`);
+    if (!["data", "metric", "calculation"].includes(String(field?.kind ?? ""))) errors.push(`输出字段 ${id || "?"} 类型不支持`);
+    if (!["query", "metric", "calculation_graph"].includes(String(field?.route ?? ""))) errors.push(`输出字段 ${id || "?"} 缺少生成路径`);
+    if (field?.query_id && !queryIds.has(String(field.query_id))) errors.push(`输出字段 ${id || "?"} 引用了未知查询契约：${field.query_id}`);
+    if (field?.calculation_node && !graphIds.has(String(field.calculation_node))) errors.push(`输出字段 ${id || "?"} 引用了未知计算节点：${field.calculation_node}`);
+    if (field?.metric_id && !metricIds.has(String(field.metric_id))) errors.push(`输出字段 ${id || "?"} 引用了未知指标：${field.metric_id}`);
+    if (field?.route === "calculation_graph" && !field?.calculation_node) errors.push(`输出字段 ${id || "?"} 缺少 calculation_node`);
+  }
+  return errors;
+}
+
 export function validateReportModelValue(model: JsonRecord, requireApproved = false): string[] {
   const errors: string[] = [];
   const strategy = String(model.recommended_strategy ?? "");
@@ -4855,6 +4966,7 @@ export function validateReportModelValue(model: JsonRecord, requireApproved = fa
   }
   if (!(model.query_contracts ?? []).length) errors.push("模型至少需要一个查询契约");
   errors.push(...validateCalculationGraphValue(model, sourceFields));
+  errors.push(...validateOutputFieldsValue(model));
   if (requireApproved) {
     if ((model.open_questions ?? []).length) errors.push("仍有待确认问题，不能批准模型");
     if (model.approval?.status !== "approved") errors.push("模型尚未批准");
@@ -5245,7 +5357,9 @@ export async function buildPhaseContext(options: {
       knowledge: { tables },
       output_contract: {
         model_format_version: REPORT_MODEL_FORMAT_VERSION,
-        required_root_fields: ["report", "result_grain", "sources", "relationships", "metrics", "filters", "recommended_strategy", "query_contracts", "confirmation", "open_questions"],
+        required_root_fields: ["report", "input_lock", "result_grain", "sources", "relationships", "metrics", "filters", "recommended_strategy", "query_contracts", "output_fields", "confirmation", "open_questions"],
+        input_lock: "必须原样保留 knowledge snapshot 与 report requirement 引用；不得吸收聊天外的第四种业务输入",
+        output_fields: "每个业务输出字段一项：id/label/kind(data|metric|calculation)/route(query|metric|calculation_graph)，派生字段必须关联 calculation_node；不得遗漏 requirement_intents 中的字段",
         recommended_strategy: ["sql", "enrichment", "group_queries", "script"],
         calculation_graph: {
           required_for: ["多级派生指标", "占比/差额", "同比环比", "窗口累计/排名", "跨查询运算"],
@@ -5292,6 +5406,8 @@ export async function buildPhaseContext(options: {
     payload = {
       query_contract: contract,
       calculation_graph: model.calculation_graph ?? null,
+      output_fields: model.output_fields ?? [],
+      calculation_plan: deriveCalculationPlan(model),
       knowledge: { tables },
       sql_dialect: contract.sql_dialect ?? plan.sql_dialect,
     };
@@ -5329,6 +5445,8 @@ export async function buildPhaseContext(options: {
       semantic_plan: plan.semantic_plan,
       execution_plan: plan.execution_plan,
       calculation_graph: model.calculation_graph ?? null,
+      output_fields: model.output_fields ?? [],
+      calculation_plan: deriveCalculationPlan(model),
       query_outputs: queryOutputs,
       allowed_api: ["queryStream", "queryStreamWithFilters", "loadIndex", "batchLookup", "beginSheet", "emit"],
     };
@@ -5663,6 +5781,11 @@ export async function finalizeStagedModel(options: {
     const plan = await readJson(planPath);
     await mkdir(candidate, { recursive: true });
     await writeJson(join(candidate, "report-model.json"), model);
+    await writeJson(join(candidate, "input.lock.json"), model.input_lock ?? {
+      lock_format_version: "1",
+      knowledge: plan.knowledge ?? null,
+      report_requirement: { id: model.report?.id, name: model.report?.name },
+    });
     await writeJson(join(candidate, "semantic-plan.json"), await readJson(paths.semanticPlan));
     await writeJson(join(candidate, "execution-plan.json"), await readJson(paths.executionPlan));
     try {
@@ -5679,6 +5802,8 @@ export async function finalizeStagedModel(options: {
       report_id: model.report?.id,
       model_hash: model.approval?.model_hash,
       knowledge: plan.knowledge ?? null,
+      input_lock: "input.lock.json",
+      output_field_count: (model.output_fields ?? []).length,
       tables: compactKnowledge.tables,
     };
     await writeJson(join(candidate, "source.lock.json"), sourceLock);

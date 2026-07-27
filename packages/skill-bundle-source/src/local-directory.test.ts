@@ -54,7 +54,7 @@ describe('LocalDirectorySource against the canonical Easy BI source', () => {
     expect(health.available).toBe(true);
     const versions = await src.listVersions('easybi');
     expect(versions).toHaveLength(1);
-    expect(versions[0]?.version).toBe('1.33.1');
+    expect(versions[0]?.version).toBe('1.34.0');
   });
 
   it('fetches a whitelisted snapshot with manifest + SHA-256 and no forbidden content', async () => {
@@ -63,7 +63,7 @@ describe('LocalDirectorySource against the canonical Easy BI source', () => {
     const fetched = await src.fetch('easybi', 'current', snapshotDir);
 
     expect(fetched.bundleId).toBe('easybi');
-    expect(fetched.version).toBe('1.33.1');
+    expect(fetched.version).toBe('1.34.0');
     expect(fetched.bundleSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(fetched.manifest.files && fetched.manifest.files.length).toBeGreaterThan(0);
 

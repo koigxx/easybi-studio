@@ -176,6 +176,15 @@ fields must be inside the selected source whitelist. Use this graph for multi-le
 ratios, period comparisons, ranks/running totals/moving averages, and cross-query arithmetic
 instead of hiding business logic only in SQL text or scripts.
 
+The final model also carries three deterministic contracts. `input_lock` records exactly the
+knowledge snapshot and report requirement revision used for this model; it is immutable during
+modeling. `output_fields` is the business-facing field registry: every requested result field has
+one stable `id`, `label`, `kind` (`data|metric|calculation`) and route
+(`query|metric|calculation_graph`); a calculation route must reference its graph node. The CLI
+derives `calculation_plan` from the graph in dependency order and decides SQL versus script for
+`auto` nodes. Do not introduce a separate user-maintained calculation-requirement document: any
+temporary clarification belongs in the Context Pack and the single confirmation artifact.
+
 When `recommended_strategy` is `sql`, `enrichment`, or `group_queries`, also write
 `declarative-configuration.json` in the same revision. It is stored in the current model package
 as generation input; no report package is generated during modeling.

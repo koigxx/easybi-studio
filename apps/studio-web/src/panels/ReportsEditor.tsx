@@ -1,50 +1,22 @@
-import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, Save, Plus, Trash2, X, Link2, Upload, Copy, ArrowLeft, Pencil, ChevronRight, ChevronDown, GripVertical, ArrowUp, ArrowDown } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Download, FilePenLine, FileUp, Plus, RefreshCw, Trash2, Upload, X } from 'lucide-react';
 import { api, type Project } from '../api.js';
-import { SectionTitle, ErrorBanner, EmptyState } from '../components/ui/common.js';
+import { EmptyState, ErrorBanner, SectionTitle } from '../components/ui/common.js';
 import {
+  exportReportsJson,
   extractReportConfig,
   mergeReportConfig,
-  validateReportConfig,
   parseImportedReports,
-  applyImport,
-  exportReportsJson,
-  newField,
-  fieldBinding,
-  setFieldBinding,
-  hasRole,
-  toggleRole,
-  FIELD_ROLES,
-  METRIC_AGGREGATIONS,
-  type FieldRole,
-  type MetricAggregation,
+  previewReportImport,
+  validateReportConfig,
   type ReportConfigDraft,
 } from './reports-config.js';
-
-const ROLE_LABELS: Record<FieldRole, string> = {
-  output: '输出',
-  filter: '筛选',
-  group: '分组',
-  metric: '聚合',
-};
-const ROLE_HINTS: Record<FieldRole, string> = {
-  output: '原样输出，不加工（如订单号、客户名）',
-  filter: '作为可筛选项（操作符/控件由知识库语义自动推断）',
-  group: '作为分组维度（按此字段分组，一组一行）',
-  metric: '对该字段做聚合计算（COUNT/SUM/AVG 等），数据来源与去重方式由 AI 建模阶段确定',
-};
-const AGGREGATION_LABELS: Record<MetricAggregation, string> = {
-  count: '计数 COUNT',
-  count_distinct: '去重计数 COUNT DISTINCT',
-  sum: '求和 SUM',
-  avg: '平均值 AVG',
-  ratio: '比率 RATIO',
-};
+import { RequirementEditor } from './RequirementEditor.js';
 
 /**
- * Report information editor (report_requirements + report_scenarios), mounted as
- * a tab inside the Config page. Self-loading: reads the full build config, edits
- * only the report branches, and merges back with an optimistic revision.
+ * Configuration-page report management. Detailed editing deliberately reuses the
+ * same RequirementEditor as the Reports page: there is one user-visible report
+ * contract, not a second, divergent field editor.
  */
 export function ReportsEditor({ project }: { project: Project }): JSX.Element {
   const [draft, setDraft] = useState<ReportConfigDraft | null>(null);
@@ -52,783 +24,132 @@ export function ReportsEditor({ project }: { project: Project }): JSX.Element {
   const [revision, setRevision] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  // Master/detail: which report is open for editing (null = list view).
-  const [editingIndex, setEditingIndex] = useState<number | null>(null);
-  // Which field row is focused, and which rows have their binding box opened.
-  const [selected, setSelected] = useState<string | null>(null);
-  const [opened, setOpened] = useState<Set<string>>(new Set());
-  // Drag-and-drop reorder state.
-  const [dragSource, setDragSource] = useState<{ ri: number; fi: number } | null>(null);
-  const [dragOver, setDragOver] = useState<{ ri: number; fi: number } | null>(null);
-  // Import dialog state.
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState('');
-  const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
-  const [importError, setImportError] = useState<string | null>(null);
-
-  const fieldKey = (ri: number, fi: number): string => `${ri}:${fi}`;
+  const [importPreview, setImportPreview] = useState<ReturnType<typeof previewReportImport> | null>(null);
+  const [importAction, setImportAction] = useState<'create' | 'overwrite'>('create');
+  const [importTargetId, setImportTargetId] = useState('');
+  const [importTargetSearch, setImportTargetSearch] = useState('');
+  const [importSourceIndex, setImportSourceIndex] = useState(0);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportReportId, setExportReportId] = useState('');
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [newOpen, setNewOpen] = useState(false);
+  const [newId, setNewId] = useState('');
+  const [newName, setNewName] = useState('');
 
   const load = useCallback(async () => {
     setError(null);
-    setStatus(null);
     try {
-      const cfg = await api.getBuildConfig(project.id);
-      setRawConfig(cfg.value);
-      setRevision(cfg.revision);
-      setDraft(extractReportConfig(cfg.value));
-      setEditingIndex(null); // Reloading resets to the list view.
-    } catch (e) {
-      setError(String((e as Error).message ?? e));
-    }
+      const config = await api.getBuildConfig(project.id);
+      setRawConfig(config.value); setRevision(config.revision); setDraft(extractReportConfig(config.value));
+    } catch (cause) { setError(String((cause as Error).message ?? cause)); }
   }, [project.id]);
+  useEffect(() => { void load(); }, [load]);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  function patch(next: Partial<ReportConfigDraft>): void {
-    if (!draft) return;
-    setDraft({ ...draft, ...next });
-    setStatus(null);
-  }
-
-  async function save(): Promise<void> {
-    if (!draft) return;
-    setError(null);
-    setStatus(null);
-    const invalid = validateReportConfig(draft);
-    if (invalid) {
-      setError(invalid);
-      return;
-    }
-    setSaving(true);
+  async function persist(next: ReportConfigDraft, message: string): Promise<boolean> {
+    const invalid = validateReportConfig(next);
+    if (invalid) { setError(invalid); return false; }
     try {
-      const merged = mergeReportConfig(rawConfig, draft);
-      const r = await api.saveBuildConfig(project.id, merged, revision);
-      setRevision(r.revision);
-      setStatus('报表配置已保存至 config/easy-bi.json（原子写入，已备份上一版本）');
-      await load();
-    } catch (e) {
-      setError(String((e as Error).message ?? e));
-    } finally {
-      setSaving(false);
-    }
+      const result = await api.saveBuildConfig(project.id, mergeReportConfig(rawConfig, next), revision);
+      setRevision(result.revision); setDraft(next); setStatus(message); return true;
+    } catch (cause) { setError(String((cause as Error).message ?? cause)); return false; }
   }
 
-  function runImport(): void {
+  async function addReport(): Promise<void> {
     if (!draft) return;
-    setImportError(null);
-    try {
-      const imported = parseImportedReports(importText);
-      patch(applyImport(draft, imported, importMode));
-      setImportOpen(false);
-      setImportText('');
-      setStatus(
-        `已导入 ${imported.requirements.length} 条报表需求（${
-          importMode === 'merge' ? '合并，同 ID 覆盖' : '替换现有'
-        }）。请检查后点击「保存报表配置」写入。`,
-      );
-    } catch (e) {
-      setImportError(String((e as Error).message ?? e));
-    }
+    const id = newId.trim(); const name = newName.trim();
+    if (!id || !name) { setError('请填写报表 ID 和名称'); return; }
+    if (draft.requirements.some((item) => item.id === id)) { setError(`报表 ID 已存在：${id}`); return; }
+    const next = { ...draft, requirements: [...draft.requirements, { id, name, description: '', requiredFields: [] }] };
+    if (await persist(next, `已创建报表需求「${name}」`)) { setNewOpen(false); setNewId(''); setNewName(''); setEditingId(id); }
   }
 
-  async function copyExport(): Promise<void> {
+  async function removeReport(id: string, name: string): Promise<void> {
+    if (!draft || !window.confirm(`确认删除报表需求「${name || id}」？相关旧模型和报表包不会自动保留。`)) return;
+    await persist({ ...draft, requirements: draft.requirements.filter((item) => item.id !== id) }, `已删除报表需求「${name || id}」`);
+  }
+
+  function uniqueImportedId(id: string, occupied: Set<string>): string {
+    const base = id.trim() || 'imported-report';
+    if (!occupied.has(base)) return base;
+    let sequence = 2;
+    while (occupied.has(`${base}-copy-${sequence}`)) sequence += 1;
+    return `${base}-copy-${sequence}`;
+  }
+  function importPlan() {
+    if (!draft) return null;
+    const imported = parseImportedReports(importText);
+    const source = imported.requirements[importSourceIndex];
+    if (importAction === 'overwrite' && !importTargetId) throw new Error('请选择要覆盖的现有报表');
+    if (importAction === 'overwrite' && !source) throw new Error('请选择要导入的源报表');
+    if (importAction === 'overwrite') {
+      const target = draft.requirements.find((item) => item.id === importTargetId);
+      if (!target) throw new Error('目标报表不存在，请重新选择');
+      const replacement = { ...source!, id: target.id };
+      return {
+        imported,
+        next: { ...draft, requirements: draft.requirements.map((item) => item.id === target.id ? replacement : item) },
+        preview: { create: [], update: [target.name], fields: replacement.requiredFields.length, metrics: replacement.requiredFields.filter((field) => field.kind === 'metric' || field.roles.includes('metric')).length, scenarios: 0 },
+      };
+    }
+    const occupied = new Set(draft.requirements.map((item) => item.id));
+    const additions = imported.requirements.map((item) => {
+      const id = uniqueImportedId(item.id, occupied); occupied.add(id);
+      return { ...item, id };
+    });
+    return { imported, next: { ...draft, requirements: [...draft.requirements, ...additions], scenarios: [...draft.scenarios, ...imported.scenarios.filter((item) => !draft.scenarios.includes(item))] }, preview: previewReportImport({ requirements: [], scenarios: [] }, { requirements: additions, scenarios: imported.scenarios }) };
+  }
+  async function importReports(): Promise<void> {
     if (!draft) return;
-    const json = exportReportsJson(draft);
     try {
-      await navigator.clipboard.writeText(json);
-      setStatus('已复制当前报表配置 JSON 到剪贴板');
-    } catch {
-      // Clipboard unavailable (insecure context): fall back to opening the
-      // import box prefilled so the user can copy it manually.
-      setImportText(json);
-      setImportOpen(true);
-      setStatus('剪贴板不可用，已在导入框中填入当前配置 JSON，可手动复制');
-    }
+      const plan = importPlan();
+      if (!plan) return;
+      if (!importPreview) { setImportPreview(plan.preview); return; }
+      if (await persist(plan.next, importAction === 'overwrite' ? `已覆盖报表「${plan.preview.update[0]}」` : `已新增 ${plan.preview.create.length} 条报表需求`)) { setImportOpen(false); setImportText(''); setImportPreview(null); }
+    } catch (cause) { setError(String((cause as Error).message ?? cause)); }
   }
 
-  if (!draft) {
-    return (
-      <div style={{ maxWidth: 900 }}>
-        {error ? <ErrorBanner>{error}</ErrorBanner> : <span>加载中…</span>}
-      </div>
-    );
+  function downloadExport(): void {
+    if (!draft || !exportReportId) { setError('请选择要导出的报表'); return; }
+    const selected = draft.requirements.find((item) => item.id === exportReportId);
+    if (!selected) { setError('要导出的报表不存在'); return; }
+    const blob = new Blob([exportReportsJson({ requirements: [selected], scenarios: [] })], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob); const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `easybi-report-${selected.id}-${new Date().toISOString().slice(0, 10)}.json`; anchor.click(); URL.revokeObjectURL(url);
+    setExportOpen(false); setStatus(`已导出报表「${selected.name}」的可回导 JSON 文件`);
+  }
+  async function readImportFile(file: File | undefined): Promise<void> {
+    if (!file) return;
+    try { setImportText(await file.text()); setImportPreview(null); setStatus(`已读取文件：${file.name}，请先预览导入变更。`); }
+    catch (cause) { setError(String((cause as Error).message ?? cause)); }
   }
 
-  function updateReq(
-    index: number,
-    next: Partial<ReportConfigDraft['requirements'][number]>,
-  ): void {
-    patch({ requirements: draft!.requirements.map((r, i) => (i === index ? { ...r, ...next } : r)) });
-  }
-  function updateField(reqIndex: number, fieldIndex: number, value: string): void {
-    patch({
-      requirements: draft!.requirements.map((r, i) =>
-        i === reqIndex
-          ? {
-              ...r,
-              requiredFields: r.requiredFields.map((f, j) =>
-                j === fieldIndex ? setFieldBinding({ ...f, text: value }, fieldBinding(f)) : f,
-              ),
-            }
-          : r,
-      ),
-    });
-  }
-  function updateFieldBinding(reqIndex: number, fieldIndex: number, binding: string): void {
-    patch({
-      requirements: draft!.requirements.map((r, i) =>
-        i === reqIndex
-          ? {
-              ...r,
-              requiredFields: r.requiredFields.map((f, j) =>
-                j === fieldIndex ? setFieldBinding(f, binding) : f,
-              ),
-            }
-          : r,
-      ),
-    });
-  }
-  function updateFieldDescription(reqIndex: number, fieldIndex: number, value: string): void {
-    patch({
-      requirements: draft!.requirements.map((r, i) =>
-        i === reqIndex
-          ? {
-              ...r,
-              requiredFields: r.requiredFields.map((f, j) =>
-                j === fieldIndex ? { ...f, description: value } : f,
-              ),
-            }
-          : r,
-      ),
-    });
-  }
-  function toggleFieldRole(reqIndex: number, fieldIndex: number, role: FieldRole): void {
-    patch({
-      requirements: draft!.requirements.map((r, i) =>
-        i === reqIndex
-          ? {
-              ...r,
-              requiredFields: r.requiredFields.map((f, j) =>
-                j === fieldIndex ? toggleRole(f, role) : f,
-              ),
-            }
-          : r,
-      ),
-    });
-  }
-  function updateFieldAggregation(
-    reqIndex: number,
-    fieldIndex: number,
-    aggregation: MetricAggregation,
-  ): void {
-    patch({
-      requirements: draft!.requirements.map((requirement, index) =>
-        index === reqIndex
-          ? {
-              ...requirement,
-              requiredFields: requirement.requiredFields.map((field, position) =>
-                position === fieldIndex ? { ...field, aggregation } : field,
-              ),
-            }
-          : requirement,
-      ),
-    });
-  }
-
-  function moveField(reqIndex: number, fromIndex: number, toIndex: number): void {
-    if (fromIndex === toIndex) return;
-    patch({
-      requirements: draft!.requirements.map((r, i) => {
-        if (i !== reqIndex) return r;
-        const fields = [...r.requiredFields];
-        const [moved] = fields.splice(fromIndex, 1);
-        fields.splice(toIndex, 0, moved!);
-        return { ...r, requiredFields: fields };
-      }),
-    });
-  }
-
-  return (
-    <div style={{ maxWidth: 900, display: 'flex', flexDirection: 'column', gap: 20 }}>
-      {error && <ErrorBanner>{error}</ErrorBanner>}
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-        <button
-          className="ide-btn ide-btn-primary ide-btn-sm"
-          onClick={() => void save()}
-          disabled={saving}
-        >
-          <Save className="w-3.5 h-3.5" />
-          {saving ? '保存中…' : '保存报表配置'}
-        </button>
-        <button className="ide-btn ide-btn-sm" onClick={() => void load()} disabled={saving}>
-          <RefreshCw className="w-3.5 h-3.5" />
-          重新加载
-        </button>
-        <button
-          className="ide-btn ide-btn-sm"
-          onClick={() => {
-            setImportError(null);
-            setImportText('');
-            setImportMode('merge');
-            setImportOpen(true);
-          }}
-          disabled={saving}
-          title="从 JSON 批量导入报表需求（支持粘贴或上传文件）"
-        >
-          <Upload className="w-3.5 h-3.5" />
-          导入
-        </button>
-        <button
-          className="ide-btn ide-btn-sm"
-          onClick={() => void copyExport()}
-          disabled={saving}
-          title="复制当前报表配置为 JSON（可用于备份或迁移）"
-        >
-          <Copy className="w-3.5 h-3.5" />
-          导出
-        </button>
-        <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>
-          写入 config/easy-bi.json · knowledge.report_requirements / report_scenarios · revision{' '}
-          <code className="ide-chip">{revision.slice(0, 12)}…</code>
-        </span>
-        {status && <span style={{ color: 'var(--state-success)', fontSize: 12.5 }}>{status}</span>}
-      </div>
-
-      {editingIndex === null || !draft.requirements[editingIndex] ? (
-        <>
-          {/* ── List view: only report names, click to edit ── */}
-          <section>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-              <SectionTitle>报表需求</SectionTitle>
-              <button
-                className="ide-btn ide-btn-sm"
-                onClick={() => {
-                  const next = [
-                    ...draft.requirements,
-                    { id: '', name: '', description: '', requiredFields: [] },
-                  ];
-                  patch({ requirements: next });
-                  setEditingIndex(next.length - 1); // Open the new report immediately.
-                  setSelected(null);
-                  setOpened(new Set());
-                }}
-              >
-                <Plus className="w-3.5 h-3.5" />
-                新增报表
-              </button>
-            </div>
-            {draft.requirements.length === 0 ? (
-              <EmptyState title="暂无报表需求" hint="点击「新增报表」添加第一条。" />
-            ) : (
-              <div className="ide-card" style={{ padding: 0, overflow: 'hidden' }}>
-                <table className="ide-table">
-                  <thead>
-                    <tr>
-                      <th>报表</th>
-                      <th>ID</th>
-                      <th style={{ textAlign: 'right', width: 72 }}>字段数</th>
-                      <th style={{ width: 88, textAlign: 'right' }}>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {draft.requirements.map((r, ri) => (
-                      <tr
-                        key={ri}
-                        onClick={() => {
-                          setEditingIndex(ri);
-                          setSelected(null);
-                          setOpened(new Set());
-                        }}
-                        style={{ cursor: 'pointer' }}
-                        title="点击编辑该报表"
-                      >
-                        <td>{r.name || <span style={{ color: 'var(--ide-text-tertiary)' }}>（未命名）</span>}</td>
-                        <td className="ide-text-mono" style={{ color: 'var(--ide-text-tertiary)' }}>
-                          {r.id || '—'}
-                        </td>
-                        <td className="ide-num" style={{ textAlign: 'right' }}>
-                          {r.requiredFields.length}
-                        </td>
-                        <td style={{ textAlign: 'right' }}>
-                          <div style={{ display: 'inline-flex', gap: 4 }}>
-                            <button
-                              className="ide-btn ide-btn-sm ide-btn-ghost"
-                              title="编辑该报表"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setEditingIndex(ri);
-                                setSelected(null);
-                                setOpened(new Set());
-                              }}
-                            >
-                              <Pencil className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              className="ide-btn ide-btn-sm ide-btn-ghost"
-                              title="删除该报表需求"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (!window.confirm(`确认删除报表需求「${r.name || r.id || '未命名'}」？`)) return;
-                                patch({ requirements: draft.requirements.filter((_, i) => i !== ri) });
-                              }}
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                            <ChevronRight
-                              className="w-4 h-4"
-                              style={{ color: 'var(--ide-text-tertiary)', alignSelf: 'center' }}
-                            />
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-
-          <section>
-            <SectionTitle>报表场景（report_scenarios）</SectionTitle>
-            <div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', marginBottom: 6 }}>
-              每行一个场景名。
-            </div>
-            <textarea
-              className="ide-textarea ide-scroll"
-              value={draft.scenarios.join('\n')}
-              onChange={(e) => patch({ scenarios: e.target.value.split('\n') })}
-              spellCheck={false}
-              style={{ minHeight: 120, fontSize: 12.5 }}
-              placeholder={'运输订单明细\n承运商结算明细'}
-            />
-          </section>
-        </>
-      ) : (
-        (() => {
-          const ri = editingIndex;
-          const r = draft.requirements[ri]!; // Guaranteed by the outer condition.
-          return (
-            <section style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <button
-                  className="ide-btn ide-btn-sm"
-                  onClick={() => setEditingIndex(null)}
-                  title="返回报表列表"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" />
-                  返回列表
-                </button>
-                <SectionTitle>{r.name || '（未命名报表）'}</SectionTitle>
-                <div style={{ flex: 1 }} />
-                <button
-                  className="ide-btn ide-btn-sm ide-btn-danger"
-                  onClick={() => {
-                    if (!window.confirm(`确认删除报表需求「${r.name || r.id || '未命名'}」？`)) return;
-                    patch({ requirements: draft.requirements.filter((_, i) => i !== ri) });
-                    setEditingIndex(null);
-                  }}
-                  title="删除该报表需求"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  删除报表
-                </button>
-              </div>
-
-              <div className="ide-card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
-                  <label style={{ flex: '0 0 240px', fontSize: 12 }}>
-                    <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>ID</div>
-                    <input
-                      className="ide-input"
-                      value={r.id}
-                      placeholder="transport-order-detail"
-                      onChange={(e) => updateReq(ri, { id: e.target.value })}
-                    />
-                  </label>
-                  <label style={{ flex: 1, fontSize: 12 }}>
-                    <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>名称</div>
-                    <input
-                      className="ide-input"
-                      value={r.name}
-                      placeholder="运输订单明细"
-                      onChange={(e) => updateReq(ri, { name: e.target.value })}
-                    />
-                  </label>
-                </div>
-
-                <label style={{ fontSize: 12 }}>
-                  <div style={{ color: 'var(--ide-text-tertiary)', marginBottom: 4 }}>
-                    业务说明 / 口径（可选）
-                  </div>
-                  <textarea
-                    className="ide-textarea ide-scroll"
-                    value={r.description}
-                    placeholder={'例：仅统计签收复核后的数据；毛利 = 应收 − 各方应付 − 内部成本'}
-                    onChange={(e) => updateReq(ri, { description: e.target.value })}
-                    spellCheck={false}
-                    style={{ minHeight: 54, fontSize: 12.5 }}
-                  />
-                </label>
-
-                <div>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      color: 'var(--ide-text-tertiary)',
-                      marginBottom: 6,
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                    }}
-                  >
-                    <span>字段名</span>
-                    <button
-                      className="ide-btn ide-btn-sm ide-btn-ghost"
-                      onClick={() =>
-                        updateReq(ri, { requiredFields: [...r.requiredFields, newField()] })
-                      }
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      添加字段
-                    </button>
-                  </div>
-                  {r.requiredFields.length === 0 ? (
-                    <div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>暂无字段</div>
-                  ) : (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                      {r.requiredFields.map((f, fi) => {
-                        const key = fieldKey(ri, fi);
-                        const binding = fieldBinding(f);
-                        const isSelected = selected === key;
-                        const expanded = opened.has(key);
-                        const isDragSource =
-                              dragSource !== null && dragSource.ri === ri && dragSource.fi === fi;
-                            const isDragOver =
-                              dragOver !== null && dragOver.ri === ri && dragOver.fi === fi;
-                            return (
-                          <div
-                            key={fi}
-                            style={{
-                              display: 'flex',
-                              flexDirection: 'column',
-                              gap: 3,
-                              opacity: isDragSource ? 0.4 : 1,
-                              transition: 'opacity 0.15s',
-                            }}
-                            onDragOver={(e) => {
-                              e.preventDefault();
-                              e.dataTransfer.dropEffect = 'move';
-                              setDragOver({ ri, fi });
-                            }}
-                            onDragLeave={() => setDragOver(null)}
-                            onDrop={(e) => {
-                              e.preventDefault();
-                              setDragOver(null);
-                              if (dragSource && dragSource.ri === ri) {
-                                moveField(ri, dragSource.fi, fi);
-                              }
-                              setDragSource(null);
-                            }}
-                          >
-                            {isDragOver && (
-                              <div
-                                style={{
-                                  height: 2,
-                                  backgroundColor: 'var(--ide-accent)',
-                                  borderRadius: 1,
-                                  marginBottom: -1,
-                                }}
-                              />
-                            )}
-                            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                              {/* Drag handle — only the grip is draggable so buttons keep their tooltips */}
-                              <span
-                                draggable
-                                style={{
-                                  cursor: 'grab',
-                                  color: 'var(--ide-text-muted)',
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  flexShrink: 0,
-                                  userSelect: 'none',
-                                }}
-                                data-tooltip="拖拽调整字段顺序"
-                                onDragStart={(e) => {
-                                  setDragSource({ ri, fi });
-                                  e.dataTransfer.effectAllowed = 'move';
-                                  e.dataTransfer.setData('text/plain', `${ri}:${fi}`);
-                                }}
-                                onDragEnd={() => {
-                                  setDragSource(null);
-                                  setDragOver(null);
-                                }}
-                              >
-                                <GripVertical className="w-3.5 h-3.5" />
-                              </span>
-                              <input
-                                className="ide-input"
-                                value={f.text}
-                                placeholder="字段名，例如：运输订单号"
-                                onChange={(e) => updateField(ri, fi, e.target.value)}
-                                onFocus={() => setSelected(key)}
-                                style={{ flex: 1 }}
-                              />
-                              <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-                                {FIELD_ROLES.map((role) => {
-                                  const on = hasRole(f, role);
-                                  return (
-                                    <button
-                                      key={role}
-                                      type="button"
-                                      className={'ide-chip-toggle' + (on ? ' ide-chip-toggle-on' : '')}
-                                      data-tooltip={ROLE_HINTS[role]}
-                                      onClick={() => toggleFieldRole(ri, fi, role)}
-                                    >
-                                      {ROLE_LABELS[role]}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                              {/* Expand/collapse toggle for extra details */}
-                              <button
-                                className="ide-btn ide-btn-sm ide-btn-ghost"
-                                onClick={() =>
-                                  setOpened((prev) => {
-                                    const next = new Set(prev);
-                                    if (next.has(key)) next.delete(key);
-                                    else next.add(key);
-                                    return next;
-                                  })
-                                }
-                                data-tooltip={opened.has(key) ? '折叠描述与绑定' : '展开描述与绑定'}
-                                style={{ padding: '2px 3px' }}
-                              >
-                                <ChevronDown
-                                  className="w-3.5 h-3.5"
-                                  style={{
-                                    transform: opened.has(key) ? 'rotate(0deg)' : 'rotate(-90deg)',
-                                    transition: 'transform 0.15s',
-                                  }}
-                                />
-                              </button>
-                              {/* Move buttons */}
-                              <div style={{ display: 'flex', gap: 1, flexShrink: 0 }}>
-                                <button
-                                  className="ide-btn ide-btn-sm ide-btn-ghost"
-                                  onClick={() => moveField(ri, fi, fi - 1)}
-                                  disabled={fi === 0}
-                                  data-tooltip="上移"
-                                  style={{ padding: '2px 3px' }}
-                                >
-                                  <ArrowUp className="w-3 h-3" />
-                                </button>
-                                <button
-                                  className="ide-btn ide-btn-sm ide-btn-ghost"
-                                  onClick={() => moveField(ri, fi, fi + 1)}
-                                  disabled={fi === r.requiredFields.length - 1}
-                                  data-tooltip="下移"
-                                  style={{ padding: '2px 3px' }}
-                                >
-                                  <ArrowDown className="w-3 h-3" />
-                                </button>
-                              </div>
-                              <button
-                                className="ide-btn ide-btn-sm ide-btn-ghost"
-                                onClick={() =>
-                                  updateReq(ri, {
-                                    requiredFields: r.requiredFields.filter((_, j) => j !== fi),
-                                  })
-                                }
-                                data-tooltip="删除字段"
-                              >
-                                <X className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
-                            {expanded && (
-                              <>
-                                <input
-                                  className="ide-input"
-                                  value={f.description}
-                                  placeholder="字段描述（可选，帮助 AI 理解此字段，例：订单数量的总和）"
-                                  onChange={(e) => updateFieldDescription(ri, fi, e.target.value)}
-                                  onFocus={() => setSelected(key)}
-                                  style={{
-                                    marginLeft: 2,
-                                    fontSize: 11.5,
-                                    color: 'var(--ide-text-secondary)',
-                                  }}
-                                />
-                                {hasRole(f, 'metric') && (
-                                  <div
-                                    style={{ display: 'flex', gap: 6, alignItems: 'center', marginLeft: 2 }}
-                                    data-tooltip="聚合计算方式 — 建模阶段 AI 将按此方式对数据进行汇总计算"
-                                  >
-                                    <span style={{ fontSize: 11, color: 'var(--ide-text-tertiary)', whiteSpace: 'nowrap' }}>
-                                      聚合方式
-                                    </span>
-                                    <select
-                                      className="ide-input"
-                                      value={f.aggregation ?? 'count_distinct'}
-                                      onChange={(event) =>
-                                        updateFieldAggregation(
-                                          ri,
-                                          fi,
-                                          event.target.value as MetricAggregation,
-                                        )
-                                      }
-                                      style={{ width: 170, fontSize: 11.5 }}
-                                    >
-                                      {METRIC_AGGREGATIONS.map((aggregation) => (
-                                        <option key={aggregation} value={aggregation}>
-                                          {AGGREGATION_LABELS[aggregation]}
-                                        </option>
-                                      ))}
-                                    </select>
-                                  </div>
-                                )}
-                                <div
-                                  style={{
-                                    display: 'flex',
-                                    gap: 8,
-                                    alignItems: 'center',
-                                    marginLeft: 2,
-                                  }}
-                                >
-                                  <span
-                                    style={{
-                                      fontSize: 11,
-                                      color: 'var(--ide-text-tertiary)',
-                                      whiteSpace: 'nowrap',
-                                    }}
-                                  >
-                                    <Link2 className="w-3 h-3" style={{ display: 'inline', verticalAlign: 'middle', marginRight: 2 }} />
-                                    绑定
-                                  </span>
-                                  <input
-                                    className="ide-input"
-                                    value={binding}
-                                    placeholder="db.table.column"
-                                    onChange={(e) => updateFieldBinding(ri, fi, e.target.value)}
-                                    onFocus={() => setSelected(key)}
-                                    style={{ flex: 1, fontSize: 12 }}
-                                  />
-                                  {binding && (
-                                    <button
-                                      className="ide-btn ide-btn-sm ide-btn-ghost"
-                                      onClick={() => updateFieldBinding(ri, fi, '')}
-                                      data-tooltip="删除绑定"
-                                    >
-                                      <X className="w-3.5 h-3.5" />
-                                    </button>
-                                  )}
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </section>
-          );
-        })()
-      )}
-
-      {importOpen && (
-        <div className="ide-modal-backdrop" onClick={() => setImportOpen(false)}>
-          <div
-            className="ide-modal"
-            onClick={(e) => e.stopPropagation()}
-            style={{ width: 'min(720px, 92vw)', maxHeight: '86vh' }}
-          >
-            <div className="ide-modal-header">
-              <span>导入报表需求</span>
-              <button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={() => setImportOpen(false)}>
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-            <div
-              className="ide-modal-body"
-              style={{ display: 'flex', flexDirection: 'column', gap: 12 }}
-            >
-              {importError && <ErrorBanner>{importError}</ErrorBanner>}
-              <div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', lineHeight: 1.7 }}>
-                粘贴 JSON，或上传文件。最简格式：只写报表名和字段
-                <code className="ide-chip">
-                  [{'{ "name": "报表名", "fields": ["字段一", "字段二"] }'}]
-                </code>
-                。ID 会按名称自动生成（可后续修改），每个字段默认同时作为
-                <b>输出</b>和<b>筛选</b>（不默认分组，需要分组请导入后在编辑器里点开）。
-                字段也可写成对象带上<b>描述</b>，帮助 AI 理解口径：
-                <code className="ide-chip">
-                  {'{ "label": "订单数总和", "description": "订单数量的总和" }'}
-                </code>
-              </div>
-              <div style={{ display: 'flex', gap: 14, alignItems: 'center', flexWrap: 'wrap' }}>
-                <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12.5 }}>
-                  <input
-                    type="radio"
-                    checked={importMode === 'merge'}
-                    onChange={() => setImportMode('merge')}
-                  />
-                  合并（同 ID 覆盖，新 ID 追加）
-                </label>
-                <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12.5 }}>
-                  <input
-                    type="radio"
-                    checked={importMode === 'replace'}
-                    onChange={() => setImportMode('replace')}
-                  />
-                  替换（丢弃现有需求）
-                </label>
-                <label className="ide-btn ide-btn-sm" style={{ cursor: 'pointer' }}>
-                  <Upload className="w-3.5 h-3.5" />
-                  选择文件
-                  <input
-                    type="file"
-                    accept=".json,application/json"
-                    style={{ display: 'none' }}
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (!file) return;
-                      const reader = new FileReader();
-                      reader.onload = () => setImportText(String(reader.result ?? ''));
-                      reader.readAsText(file);
-                      e.target.value = '';
-                    }}
-                  />
-                </label>
-              </div>
-              <textarea
-                className="ide-textarea ide-scroll"
-                value={importText}
-                onChange={(e) => setImportText(e.target.value)}
-                spellCheck={false}
-                placeholder={'[\n  { "name": "毛利明细表", "fields": ["运输订单号", "计费金额", "客户"] },\n  { "name": "订单明细表", "fields": ["订单号", "订单状态", "创建时间"] }\n]'}
-                style={{ minHeight: 260, fontSize: 12.5, fontFamily: 'var(--ide-font-mono, monospace)' }}
-              />
-            </div>
-            <div className="ide-modal-footer" style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <button className="ide-btn ide-btn-sm" onClick={() => setImportOpen(false)}>
-                取消
-              </button>
-              <button
-                className="ide-btn ide-btn-primary ide-btn-sm"
-                onClick={() => runImport()}
-                disabled={!importText.trim()}
-              >
-                <Upload className="w-3.5 h-3.5" />
-                导入到编辑器
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+  if (!draft) return <div style={{ maxWidth: 900 }}>{error ? <ErrorBanner>{error}</ErrorBanner> : '加载中…'}</div>;
+  return <div style={{ maxWidth: 900, display: 'flex', flexDirection: 'column', gap: 18 }}>
+    {error && <ErrorBanner>{error}</ErrorBanner>}
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+      <button className="ide-btn ide-btn-primary ide-btn-sm" onClick={() => setNewOpen(true)}><Plus className="w-3.5 h-3.5" />新增报表</button>
+      <button className="ide-btn ide-btn-sm" onClick={() => { setImportText(''); setImportAction('create'); setImportTargetId(''); setImportTargetSearch(''); setImportSourceIndex(0); setImportPreview(null); setImportOpen(true); }}><Upload className="w-3.5 h-3.5" />导入</button>
+      <button className="ide-btn ide-btn-sm" onClick={() => { setExportReportId(draft.requirements[0]?.id ?? ''); setExportOpen(true); }}><Download className="w-3.5 h-3.5" />导出报表</button>
+      <button className="ide-btn ide-btn-sm" onClick={() => void load()}><RefreshCw className="w-3.5 h-3.5" />重新加载</button>
+      <span style={{ fontSize: 11, color: 'var(--ide-text-tertiary)' }}>config/easy-bi.json · revision {revision.slice(0, 12)}…</span>
+      {status && <span style={{ fontSize: 12, color: 'var(--state-success)' }}>{status}</span>}
     </div>
-  );
+    <section>
+      <SectionTitle>报表需求</SectionTitle>
+      <div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)', marginBottom: 8 }}>在此管理报表清单；点击“维护”使用和报表页完全一致的业务字段、指标与人工兜底配置。</div>
+      {draft.requirements.length === 0 ? <EmptyState title="暂无报表需求" hint="新增报表，或导入已有配置。" /> :
+        <div className="ide-card" style={{ padding: 0, overflow: 'hidden' }}><table className="ide-table"><thead><tr><th>报表</th><th>结果粒度</th><th>字段</th><th>业务指标</th><th style={{ textAlign: 'right' }}>操作</th></tr></thead><tbody>{draft.requirements.map((item) => {
+          const metrics = item.requiredFields.filter((field) => field.kind === 'metric' || field.roles.includes('metric')).length;
+          return <tr key={item.id}><td><div>{item.name}</div><div className="ide-text-mono" style={{ fontSize: 10.5, color: 'var(--ide-text-tertiary)' }}>{item.id}</div></td><td style={{ color: 'var(--ide-text-secondary)' }}>{item.resultGrain?.description || '自动判断'}</td><td className="ide-num">{item.requiredFields.length}</td><td className="ide-num">{metrics}</td><td style={{ textAlign: 'right' }}><div style={{ display: 'inline-flex', gap: 4 }}><button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={() => setEditingId(item.id)} title="维护报表需求"><FilePenLine className="w-3.5 h-3.5" />维护</button><button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={() => void removeReport(item.id, item.name)} title="删除报表"><Trash2 className="w-3.5 h-3.5" /></button></div></td></tr>;
+        })}</tbody></table></div>}
+    </section>
+    <section><SectionTitle>报表场景</SectionTitle><textarea className="ide-textarea ide-scroll" value={draft.scenarios.join('\n')} onChange={(event) => setDraft({ ...draft, scenarios: event.target.value.split('\n') })} placeholder={'运输订单明细\n承运商结算明细'} style={{ minHeight: 100 }} /><button className="ide-btn ide-btn-sm" style={{ marginTop: 8 }} onClick={() => void persist(draft, '已保存报表场景')}>保存场景</button></section>
+    {editingId && <RequirementEditor project={project} requirementId={editingId} onClose={(changed) => { setEditingId(null); if (changed) void load(); }} />}
+    {newOpen && <div className="ide-modal-backdrop" onClick={() => setNewOpen(false)}><div className="ide-modal" onClick={(event) => event.stopPropagation()} style={{ width: 'min(460px, 92vw)' }}><div className="ide-modal-header"><span>新增报表</span><button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={() => setNewOpen(false)}><X className="w-3.5 h-3.5" /></button></div><div className="ide-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}><label>报表 ID<input className="ide-input" value={newId} placeholder="transport-order-detail" onChange={(event) => setNewId(event.target.value)} /></label><label>报表名称<input className="ide-input" value={newName} placeholder="运输订单明细" onChange={(event) => setNewName(event.target.value)} /></label><button className="ide-btn ide-btn-primary" onClick={() => void addReport()}>创建并维护</button></div></div></div>}
+    {importOpen && <div className="ide-modal-backdrop" onClick={() => setImportOpen(false)}><div className="ide-modal" onClick={(event) => event.stopPropagation()} style={{ width: 'min(720px, 92vw)' }}><div className="ide-modal-header"><span>导入报表需求</span><button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={() => setImportOpen(false)}><X className="w-3.5 h-3.5" /></button></div><div className="ide-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}><div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>先选择导入方式。新增导入不会覆盖现有报表；覆盖导入必须选择一张现有报表。</div><div style={{ display: 'flex', gap: 6 }}><button className={'ide-chip-toggle' + (importAction === 'create' ? ' ide-chip-toggle-on' : '')} onClick={() => { setImportAction('create'); setImportTargetId(''); setImportPreview(null); }}>新增导入</button><button className={'ide-chip-toggle' + (importAction === 'overwrite' ? ' ide-chip-toggle-on' : '')} onClick={() => { setImportAction('overwrite'); setImportPreview(null); }}>覆盖导入</button></div>{importAction === 'overwrite' && <div className="ide-card" style={{ padding: 10, display: 'flex', flexDirection: 'column', gap: 7 }}><label style={{ fontSize: 12 }}>搜索现有报表<input className="ide-input" value={importTargetSearch} placeholder="按报表名称或 ID 搜索" onChange={(event) => { setImportTargetSearch(event.target.value); setImportTargetId(''); setImportPreview(null); }} /></label><div className="ide-scroll" style={{ maxHeight: 150, display: 'flex', flexDirection: 'column', gap: 3 }}>{draft.requirements.filter((item) => `${item.name} ${item.id}`.toLowerCase().includes(importTargetSearch.trim().toLowerCase())).map((item) => <button key={item.id} className={'ide-btn ide-btn-sm ide-btn-ghost' + (importTargetId === item.id ? ' ide-chip-toggle-on' : '')} style={{ justifyContent: 'flex-start' }} onClick={() => { setImportTargetId(item.id); setImportPreview(null); }}>{item.name} <span className="ide-text-mono" style={{ color: 'var(--ide-text-tertiary)' }}>({item.id})</span></button>)}{draft.requirements.filter((item) => `${item.name} ${item.id}`.toLowerCase().includes(importTargetSearch.trim().toLowerCase())).length === 0 && <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>未找到匹配的报表</span>}</div></div>}<div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}><input ref={fileInput} type="file" accept="application/json,.json" hidden onChange={(event) => void readImportFile(event.target.files?.[0])} /><button className="ide-btn ide-btn-sm" onClick={() => fileInput.current?.click()}><FileUp className="w-3.5 h-3.5" />选择 JSON 文件</button></div><textarea className="ide-textarea ide-scroll" value={importText} onChange={(event) => { setImportText(event.target.value); setImportPreview(null); }} placeholder="粘贴 JSON" style={{ minHeight: 190 }} />{importAction === 'overwrite' && importText && <label>源报表<select className="ide-input" value={importSourceIndex} onChange={(event) => { setImportSourceIndex(Number(event.target.value)); setImportPreview(null); }}>{(() => { try { return parseImportedReports(importText).requirements.map((item, index) => <option key={`${item.id}-${index}`} value={index}>{item.name || item.id}</option>); } catch { return <option value={0}>请先填写合法 JSON</option>; } })()}</select></label>}{importPreview && <div className="ide-card" style={{ padding: 10, fontSize: 12 }}><strong>导入预览</strong><div style={{ marginTop: 5 }}>新增 {importPreview.create.length} 条；覆盖 {importPreview.update.length} 条；共 {importPreview.fields} 个字段、{importPreview.metrics} 个业务指标、{importPreview.scenarios} 个场景。</div>{importPreview.update.length > 0 && <div style={{ color: 'var(--state-warning)', marginTop: 4 }}>将覆盖：{importPreview.update.join('、')}</div>}</div>}<button className="ide-btn ide-btn-primary" onClick={() => void importReports()}>{importPreview ? '确认导入并保存' : '预览导入变更'}</button></div></div></div>}
+    {exportOpen && <div className="ide-modal-backdrop" onClick={() => setExportOpen(false)}><div className="ide-modal" onClick={(event) => event.stopPropagation()} style={{ width: 'min(460px, 92vw)' }}><div className="ide-modal-header"><span>导出报表</span><button className="ide-btn ide-btn-sm ide-btn-ghost" onClick={() => setExportOpen(false)}><X className="w-3.5 h-3.5" /></button></div><div className="ide-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}><div style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>导出单个报表的完整可回导配置，不包含其他报表。</div><label>选择报表<select className="ide-input" value={exportReportId} onChange={(event) => setExportReportId(event.target.value)}>{draft.requirements.map((item) => <option key={item.id} value={item.id}>{item.name}（{item.id}）</option>)}</select></label><button className="ide-btn ide-btn-primary" onClick={() => downloadExport()}><Download className="w-3.5 h-3.5" />下载 JSON 文件</button></div></div></div>}
+  </div>;
 }

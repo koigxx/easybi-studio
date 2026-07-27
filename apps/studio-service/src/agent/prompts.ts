@@ -113,7 +113,8 @@ export function buildReportPhasePrompt(
   if (phase === 'MODELING') {
     return `${common} 只读取 ${root}/modeling/context.json，其中包含已生成的 discovery model、带 revision/hash 的 confirmation.json 和最小知识切片，运行确定建模阶段命令，` +
       `生成并校验 ${root}/report-model.json、semantic-plan.json、execution-plan.json 和模型内逐查询 query contracts。` +
-      '必须严格沿用 Context Pack 的 model_format_version="1"、report.id/name、sources/relationships/query_contracts 字段名和四种合法 recommended_strategy；不得自创格式版本或字段名。' +
+      '必须严格沿用 Context Pack 的 model_format_version="1"、report.id/name、input_lock、sources/relationships/query_contracts/output_fields 字段名和四种合法 recommended_strategy；不得自创格式版本或字段名。' +
+      'input_lock 必须原样保留。output_fields 必须覆盖每个业务输出字段，并为公式、对比、窗口或跨查询结果关联 calculation_graph 节点；CLI 会据此确定生成路径。' +
       'report-model.json 必须写入 confirmation.discovery_revision 和 confirmation.confirmation_hash，且与 Context Pack 中的统一确认产物完全一致。' +
       `若 recommended_strategy 不是 script，同时生成 ${root}/declarative-configuration.json；不得再提第二轮业务问题，只输出模型摘要，不生成 SQL、report.ts 或报表包。` +
       (userConfirmation ? ' 用户补充说明已经固化在 confirmation.json，不得只依赖本提示文本。' : '');

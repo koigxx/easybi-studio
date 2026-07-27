@@ -14,7 +14,7 @@ import type { AgentEvent } from '@easybi-studio/contracts';
  * synced bundle is unavailable, so DB-less/CI runs still pass.
  */
 const CLAUDE = join(homedir(), '.local', 'bin', 'claude');
-const BUNDLE = join(homedir(), '.easybi-studio', 'skill-cache', 'easybi', '1.33.1');
+const BUNDLE = join(homedir(), '.easybi-studio', 'skill-cache', 'easybi', '1.34.0');
 
 let ok = false;
 try {
