@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { approvePlan, buildKnowledgeContext, buildPhaseContext, createModelConfirmation, initializeReportModel, approveReportModel, approveStagedModel, finalizeStagedModel, finalizeStagedPackage, validateStagedArtifacts, validateReportModelValue, configurePlan, explainPlan, generatePackage, inspectReport, resealPackage, validatePackage, } from "../scripts/report-package-cli.js";
+import { approvePlan, buildKnowledgeContext, buildPhaseContext, compileCalculationPlan, createModelConfirmation, initializeReportModel, approveReportModel, approveStagedModel, finalizeStagedModel, finalizeStagedPackage, validateStagedArtifacts, validateReportModelValue, configurePlan, explainPlan, generatePackage, inspectReport, resealPackage, validatePackage, } from "../scripts/report-package-cli.js";
 async function createFixture() {
     const workspace = await mkdtemp(join(tmpdir(), "easybi-report-"));
     const knowledge = join(workspace, "knowledge", "drafts", "v1");
@@ -1866,6 +1866,12 @@ test("staged report model builds query/script context packs without leaking phys
     await writeFile(modelPath, JSON.stringify(model, null, 2));
     const approved = await approveReportModel(modelPath, "model-reviewer", fixture.plan);
     assert.equal(validateReportModelValue(approved, true).length, 0);
+    const compiled = compileCalculationPlan(approved);
+    assert.equal(compiled.version, "2");
+    assert.deepEqual(compiled.steps.map((step) => step.id), ["driver_count", "driver_count_double"]);
+    assert.equal(compiled.steps[0].target, "query");
+    assert.equal(compiled.steps[1].target, "script");
+    assert.equal(compiled.output_map.find((field) => field.output_id === "driver_count_double")?.calculation_node, "driver_count_double");
     const attachedPlan = JSON.parse(await readFile(fixture.plan, "utf8"));
     assert.equal(attachedPlan.report_model.model_hash, approved.approval.model_hash);
     const queryContext = await buildPhaseContext({
@@ -2259,6 +2265,8 @@ test("a staged model is promoted as one minimal current model package", async ()
     const files = (await import("node:fs/promises")).readdir(out);
     assert.deepEqual((await files).sort(), [
         "checksums.sha256",
+        "compiled-calculation-plan.json",
+        "compiled-output-map.json",
         "execution-plan.json",
         "input.lock.json",
         "model.manifest.json",
@@ -2267,6 +2275,8 @@ test("a staged model is promoted as one minimal current model package", async ()
         "source.lock.json",
     ]);
     const sourceLock = JSON.parse(await readFile(join(out, "source.lock.json"), "utf8"));
+    const compiledPlan = JSON.parse(await readFile(join(out, "compiled-calculation-plan.json"), "utf8"));
+    assert.equal(compiledPlan.version, "2");
     assert.equal(sourceLock.tables.length, 1);
     assert.ok(sourceLock.tables[0].fields.length > 0);
     assert.equal(sourceLock.tables[0].physical_fields, undefined);

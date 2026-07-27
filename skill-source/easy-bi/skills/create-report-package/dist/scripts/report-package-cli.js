@@ -3850,8 +3850,15 @@ function deriveOutputFields(model) {
     }
     return result;
 }
-/** Deterministic planner owned by the CLI, never left to a chat prompt. */
-function deriveCalculationPlan(model) {
+/**
+ * Compile the calculation DAG into an execution-neutral contract.
+ *
+ * This is intentionally not SQL text: SQL is compiled later against one query
+ * contract and its selected sources.  Keeping this intermediate representation
+ * separate prevents an agent from silently moving a business calculation between
+ * SQL and a script while it is generating code.
+ */
+export function compileCalculationPlan(model) {
     const nodes = Array.isArray(model.calculation_graph?.nodes) ? model.calculation_graph.nodes : [];
     const byId = new Map(nodes.map((node) => [String(node.id), node]));
     const ordered = [];
@@ -3869,19 +3876,81 @@ function deriveCalculationPlan(model) {
     };
     for (const node of nodes)
         visit(String(node.id));
-    return {
-        version: "1",
-        strategy: model.recommended_strategy,
-        steps: ordered.map((node, index) => ({
+    const stepById = new Map();
+    const steps = ordered.map((node, index) => {
+        const hint = String(node.execution_hint ?? "auto");
+        const kind = String(node.kind ?? "");
+        // Auto routing is deliberately conservative. Cross-query merge and period
+        // comparison need materialised rows; aggregate/formula/window remain in the
+        // query compiler unless the model explicitly asks for a script.
+        const execution = hint !== "auto"
+            ? hint
+            : (kind === "merge" || kind === "comparison" || model.recommended_strategy === "script"
+                ? "script"
+                : "sql");
+        const step = {
             order: index + 1,
             id: node.id,
-            kind: node.kind,
+            label: node.label,
+            kind,
             dependencies: node.depends_on ?? [],
-            execution: node.execution_hint === "auto" || !node.execution_hint
-                ? (node.kind === "merge" || model.recommended_strategy === "script" ? "script" : "sql")
-                : node.execution_hint,
-        })),
+            execution,
+            target: execution === "sql" ? "query" : "script",
+            output: node.output === true,
+            output_type: node.output_type,
+            // Preserve only the kind-specific declarative payload needed by a lowerer.
+            ...(kind === "aggregate" ? { source: node.source ?? {} } : {}),
+            ...(kind === "formula" ? { expression: node.expression ?? "" } : {}),
+            ...(kind === "comparison" ? { comparison: node.comparison ?? {} } : {}),
+            ...(kind === "window" ? { window: node.window ?? {} } : {}),
+            ...(kind === "merge" ? { merge: node.merge ?? {} } : {}),
+        };
+        stepById.set(String(node.id), step);
+        return step;
+    });
+    const output_map = (deriveOutputFields(model) ?? []).map((field) => {
+        const route = String(field.route ?? "query");
+        const nodeId = String(field.calculation_node ?? field.id ?? "");
+        const step = route === "calculation_graph" ? stepById.get(nodeId) : undefined;
+        return {
+            output_id: field.id,
+            label: field.label,
+            kind: field.kind,
+            route,
+            ...(field.query_id ? { query_id: field.query_id } : {}),
+            ...(route === "calculation_graph" ? {
+                calculation_node: nodeId,
+                execution: step?.execution ?? "unresolved",
+                target: step?.target ?? "unresolved",
+            } : { execution: "query", target: "query" }),
+        };
+    });
+    return {
+        version: "2",
+        strategy: model.recommended_strategy,
+        steps,
+        output_map,
     };
+}
+/** Compatibility name retained for callers installed with an earlier bundle. */
+function deriveCalculationPlan(model) {
+    return compileCalculationPlan(model);
+}
+function calculationPlanErrors(model) {
+    const plan = compileCalculationPlan(model);
+    const steps = new Map((plan.steps ?? []).map((step) => [String(step.id), step]));
+    const errors = [];
+    for (const output of plan.output_map ?? []) {
+        if (String(output.route) !== "calculation_graph")
+            continue;
+        if (!steps.has(String(output.calculation_node))) {
+            errors.push(`输出字段 ${output.output_id} 没有可编译的计算节点：${output.calculation_node}`);
+        }
+        if (String(output.execution) === "unresolved") {
+            errors.push(`输出字段 ${output.output_id} 的计算执行目标无法确定`);
+        }
+    }
+    return errors;
 }
 export async function initializeReportModel(options) {
     const plan = await readJson(resolve(options.plan));
@@ -4976,8 +5045,19 @@ function stagedPaths(rootValue) {
         queryOutputs: join(root, "query-outputs"),
         script: join(root, "scripts", "report.ts"),
         configuration: join(root, "assembled-configuration.json"),
+        compiledCalculationPlan: join(root, "compiled-calculation-plan.json"),
+        compiledOutputMap: join(root, "compiled-output-map.json"),
         result: join(root, "stage-result.json"),
     };
+}
+async function writeCompiledCalculationArtifacts(model, paths) {
+    const plan = compileCalculationPlan(model);
+    await writeJson(paths.compiledCalculationPlan, plan);
+    await writeJson(paths.compiledOutputMap, {
+        format_version: "1",
+        output_map: plan.output_map ?? [],
+    });
+    return plan;
 }
 function contractColumns(value) {
     if (!Array.isArray(value))
@@ -5118,8 +5198,10 @@ export async function validateStagedArtifacts(options) {
         if (options.phase === "modeling") {
             model = normalizeFinalReportModelValue(model);
             await writeJson(paths.reportModel, model);
+            await writeCompiledCalculationArtifacts(model, paths);
         }
         errors.push(...validateReportModelValue(model, options.requireApprovedModel ?? ["query", "script"].includes(options.phase)));
+        errors.push(...calculationPlanErrors(model));
         const semanticPlan = await readRequiredJson(paths.semanticPlan, "语义计划");
         const executionPlan = await readRequiredJson(paths.executionPlan, "执行计划");
         if (!String(semanticPlan.result_grain ?? "").trim())
@@ -5272,6 +5354,12 @@ export async function finalizeStagedModel(options) {
         });
         await writeJson(join(candidate, "semantic-plan.json"), await readJson(paths.semanticPlan));
         await writeJson(join(candidate, "execution-plan.json"), await readJson(paths.executionPlan));
+        const compiledCalculationPlan = await writeCompiledCalculationArtifacts(model, paths);
+        await writeJson(join(candidate, "compiled-calculation-plan.json"), compiledCalculationPlan);
+        await writeJson(join(candidate, "compiled-output-map.json"), {
+            format_version: "1",
+            output_map: compiledCalculationPlan.output_map ?? [],
+        });
         try {
             await stat(paths.declarativeConfiguration);
             await writeJson(join(candidate, "declarative-configuration.json"), await readJson(paths.declarativeConfiguration));
@@ -5296,6 +5384,8 @@ export async function finalizeStagedModel(options) {
             model_hash: model.approval?.model_hash,
             knowledge: plan.knowledge ?? null,
             source_table_count: compactKnowledge.tables.length,
+            calculation_step_count: (compiledCalculationPlan.steps ?? []).length,
+            calculation_output_count: (compiledCalculationPlan.output_map ?? []).filter((item) => item.route === "calculation_graph").length,
             approved_by: options.reviewedBy,
             approved_at: model.approval?.approved_at,
         });
@@ -5412,6 +5502,12 @@ export async function finalizeStagedPackage(options) {
             primary_alias: declPrimaryAlias,
             joins: declJoins,
             select: declSelect,
+            // The query compiler receives the same deterministic IR as the script
+            // compiler. It may only implement steps whose target is "query"; script
+            // targets remain outside SQL and are handled by the script branch.
+            calculation_plan: model.calculation_plan ?? compileCalculationPlan(model),
+            calculation_graph: model.calculation_graph ?? null,
+            output_fields: model.output_fields ?? deriveOutputFields(model),
             semantic_plan: await readJson(paths.semanticPlan),
             execution_plan: executionPlan,
             // Only inherit model comparison when AI didn't set one explicitly.
@@ -7809,6 +7905,7 @@ function usage() {
         "  confirm-discovery --model <discovery-model> --input <confirmation-input.json> --out <confirmation.json> --reviewed-by <name>",
         "  build-phase-context --phase discovery|modeling|query|script|repair --plan <file> --out <file> [--model <file>] [--confirmation <file>] [--query-id <id>] [--query-outputs <dir>] [--failure <file>]",
         "  validate-stage --phase discovery|modeling|query|script --plan <file> --root <work/report-build/id/revision> [--query-id <id>] [--require-approved-model true]",
+        "  compile-model --model <report-model.json> --out-plan <file> --out-output-map <file>",
         "  approve-staged-model --plan <file> --root <work/report-build/id/revision> --reviewed-by <name>",
         "  finalize-staged-model --plan <file> --root <work/report-model/id/revision> --out <reports/models/id> --reviewed-by <name>",
         "  finalize-staged --workspace <workspace> --plan <file> --root <work/report-build/id/revision> --reviewed-by <name>",
@@ -7953,6 +8050,21 @@ async function main() {
         console.log(JSON.stringify(result, null, 2));
         if (!result.ok)
             process.exitCode = 1;
+        return;
+    }
+    if (command === "compile-model") {
+        const model = await readJson(resolve(requiredOption(options, "model")));
+        const errors = [...validateReportModelValue(model), ...calculationPlanErrors(model)];
+        if (errors.length)
+            throw new Error(`报表模型无法编译：${errors.join("；")}`);
+        const compiled = compileCalculationPlan(model);
+        const outPlan = resolve(requiredOption(options, "out-plan"));
+        await writeJson(outPlan, compiled);
+        await writeJson(resolve(requiredOption(options, "out-output-map")), {
+            format_version: "1",
+            output_map: compiled.output_map ?? [],
+        });
+        console.log(JSON.stringify({ ok: true, steps: compiled.steps?.length ?? 0, outputs: compiled.output_map?.length ?? 0, plan: outPlan }, null, 2));
         return;
     }
     if (command === "approve-staged-model") {

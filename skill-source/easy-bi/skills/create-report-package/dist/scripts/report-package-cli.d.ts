@@ -17,6 +17,15 @@ export declare function buildKnowledgeContext(options: {
     maxFields?: number;
     maxBytes?: number;
 }): Promise<JsonRecord>;
+/**
+ * Compile the calculation DAG into an execution-neutral contract.
+ *
+ * This is intentionally not SQL text: SQL is compiled later against one query
+ * contract and its selected sources.  Keeping this intermediate representation
+ * separate prevents an agent from silently moving a business calculation between
+ * SQL and a script while it is generating code.
+ */
+export declare function compileCalculationPlan(model: JsonRecord): JsonRecord;
 export declare function initializeReportModel(options: {
     plan: string;
     out: string;

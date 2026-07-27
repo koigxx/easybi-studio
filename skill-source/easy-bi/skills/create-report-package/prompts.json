@@ -14,7 +14,7 @@
       "label": "生成报表",
       "hint": "只使用已确认的当前模型生成唯一当前报表包，不再分析或确认业务口径",
       "write": true,
-      "prompt": "阅读 skills/create-report-package/SKILL.md，只从该报表已确认且未过期的唯一当前模型生成报表包。不得重新分析知识库、改变字段或关联关系、再次询问业务口径；声明式策略确定性生成 v2，script 策略按 Studio 提供的逐查询 Context Pack 和脚本 Context Pack 编译，最终由 finalize-staged 原子组包。模型资源不足时写结构化 failure 并返回模型修订，不得临时扩展知识范围。"
+      "prompt": "阅读 skills/create-report-package/SKILL.md，只从该报表已确认且未过期的唯一当前模型生成报表包。不得重新分析知识库、改变字段或关联关系、再次询问业务口径；必须把 Context Pack 中 calculation_plan 的每一个 target=query 节点编译到对应查询，把 target=script 节点仅编译到脚本，且不得改变 output_map 指定的输出路径。声明式策略确定性生成 v2，script 策略按 Studio 提供的逐查询 Context Pack 和脚本 Context Pack 编译，最终由 finalize-staged 原子组包。模型资源不足时写结构化 failure 并返回模型修订，不得临时扩展知识范围。"
     },
     {
       "action": "modify-report-model",

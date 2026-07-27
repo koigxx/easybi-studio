@@ -8,6 +8,7 @@ import {
   approvePlan,
   buildKnowledgeContext,
   buildPhaseContext,
+  compileCalculationPlan,
   createModelConfirmation,
   initializeReportModel,
   approveReportModel,
@@ -2236,6 +2237,15 @@ test("staged report model builds query/script context packs without leaking phys
   await writeFile(modelPath, JSON.stringify(model, null, 2));
   const approved = await approveReportModel(modelPath, "model-reviewer", fixture.plan);
   assert.equal(validateReportModelValue(approved, true).length, 0);
+  const compiled = compileCalculationPlan(approved);
+  assert.equal(compiled.version, "2");
+  assert.deepEqual(compiled.steps.map((step: any) => step.id), ["driver_count", "driver_count_double"]);
+  assert.equal(compiled.steps[0].target, "query");
+  assert.equal(compiled.steps[1].target, "script");
+  assert.equal(
+    compiled.output_map.find((field: any) => field.output_id === "driver_count_double")?.calculation_node,
+    "driver_count_double",
+  );
   const attachedPlan = JSON.parse(await readFile(fixture.plan, "utf8"));
   assert.equal(attachedPlan.report_model.model_hash, approved.approval.model_hash);
 
@@ -2701,6 +2711,8 @@ test("a staged model is promoted as one minimal current model package", async ()
     (await files).sort(),
     [
       "checksums.sha256",
+      "compiled-calculation-plan.json",
+      "compiled-output-map.json",
       "execution-plan.json",
       "input.lock.json",
       "model.manifest.json",
@@ -2710,6 +2722,8 @@ test("a staged model is promoted as one minimal current model package", async ()
     ],
   );
   const sourceLock = JSON.parse(await readFile(join(out, "source.lock.json"), "utf8"));
+  const compiledPlan = JSON.parse(await readFile(join(out, "compiled-calculation-plan.json"), "utf8"));
+  assert.equal(compiledPlan.version, "2");
   assert.equal(sourceLock.tables.length, 1);
   assert.ok(sourceLock.tables[0].fields.length > 0);
   assert.equal(sourceLock.tables[0].physical_fields, undefined);

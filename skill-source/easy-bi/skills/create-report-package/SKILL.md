@@ -181,8 +181,11 @@ knowledge snapshot and report requirement revision used for this model; it is im
 modeling. `output_fields` is the business-facing field registry: every requested result field has
 one stable `id`, `label`, `kind` (`data|metric|calculation`) and route
 (`query|metric|calculation_graph`); a calculation route must reference its graph node. The CLI
-derives `calculation_plan` from the graph in dependency order and decides SQL versus script for
-`auto` nodes. Do not introduce a separate user-maintained calculation-requirement document: any
+derives `calculation_plan` v2 from the graph in dependency order and decides SQL versus script for
+`auto` nodes. The compiler writes `compiled-calculation-plan.json` and `compiled-output-map.json`:
+each output has one explicit query or script target, and the later query/script Agents must consume
+only their assigned steps. `compile-model` exposes the same deterministic compilation for CI or
+manual diagnosis. Do not introduce a separate user-maintained calculation-requirement document: any
 temporary clarification belongs in the Context Pack and the single confirmation artifact.
 
 When `recommended_strategy` is `sql`, `enrichment`, or `group_queries`, also write

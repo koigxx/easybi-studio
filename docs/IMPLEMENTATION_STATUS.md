@@ -29,7 +29,7 @@
 
 ### 当前版本
 
-- Bundle `1.34.0`、知识库 Skill `0.16.0`、报表 Skill `2.31.0`（开发版）。
+- Bundle `1.35.1`、知识库 Skill `0.16.0`、报表 Skill `2.32.0`（开发版）。
 - 数据库支持：MySQL（默认）与 PostgreSQL，经方言层分派；连接类型在配置页可选。
 - 每个 Skill 含面向开发者/管理员的 `使用说明.md`；报表计划为 v2，报表包支持 v2 声明式和 v3 隔离脚本（v1 不读取、不迁移、不执行）；Runtime HTTP API 仍为 v1。
 - 每次同步生成新的不可变版本缓存与 `vendor/easybi-bundle` 快照，不覆盖旧缓存。
@@ -45,6 +45,13 @@
 ---
 
 ## ② 变更历史（倒序）
+
+### 计算图确定性编译契约（bundle 1.35.1）（2026-07-27）
+
+- **独立编译 IR**：报表 CLI 将 `calculation_graph` 拓扑编译为 v2 `calculation_plan`，逐节点固定 SQL 或脚本目标，并生成稳定的 `output_map`；`merge`、周期对比及脚本策略自动落到脚本，聚合、公式和窗口计算默认由查询编译器处理，显式偏好仍受模型校验约束。
+- **可追溯制品**：建模阶段写入 `compiled-calculation-plan.json` 与 `compiled-output-map.json`；当前模型包封存这两个文件，manifest 记录计算步骤和计算输出数量。后续生成上下文/声明式配置消费同一份计划，不再由各 Agent 自行决定计算放在 SQL 还是脚本。
+- **CLI 与门禁**：新增 `compile-model --model --out-plan --out-output-map`，可在不生成报表包时诊断图的执行分流；阶段校验同时检查每个声明为 calculation_graph 的输出都有可解析节点与执行目标。
+- **验证**：报表 Skill 测试 90/90、TypeScript 编译与 `git diff --check` 通过。尚未把动态透视、漏斗、留存提升为专属图节点；它们仍通过明确的 script 计划实现。
 
 ### 报表配置可回导导入导出（2026-07-27）
 
