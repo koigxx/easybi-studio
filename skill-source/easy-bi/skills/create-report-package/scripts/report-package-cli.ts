@@ -3727,9 +3727,12 @@ function buildScriptReportFromTimeShiftedPlan(
 
   // Assemble SQL
   const sqlLines = [`SELECT`, selectList, `FROM ${fromTable} AS ${quoteIdentifier(alias, dialect)}`];
-  if (whereParts.length) {
-    sqlLines.push(`WHERE ${whereParts.join("\n  AND ")}`);
-  }
+  // Script query bindings are compiled by the shared Runtime in exactly the
+  // same way as declarative bindings.  Keep one marker even when all fixed
+  // conditions are already embedded, otherwise required create-time and visible
+  // dimension filters cannot be bound at runtime.
+  sqlLines.push(`WHERE ${whereParts.length ? whereParts.join("\n  AND ") : "1 = 1"}`);
+  sqlLines.push("/* EASYBI_FILTERS */");
   sqlLines.push(`GROUP BY ${groupByIdents.join(", ")}`);
 
   // ORDER BY
@@ -6216,6 +6219,116 @@ export async function finalizeStagedPackage(options: {
         semantic_plan: await readJson(paths.semanticPlan),
         execution_plan: executionPlan,
       };
+  // Modeling v1 writes one `query_configurations[]` entry while the mature
+  // declarative compiler expects a normalized query-group description.  Lower
+  // structured metric lineage and comparison DAG nodes into the existing
+  // time_shifted compiler instead of silently falling back to the two physical
+  // dimension fields from inspect.  The lowerer intentionally selects a script
+  // package for cross-period comparisons: it runs the same safe aggregate query
+  // for current/previous/year-ago ranges and merges them by the confirmed grain.
+  if (
+    strategy !== "script" &&
+    Array.isArray(declarative?.query_configurations) &&
+    !Array.isArray(configuration.query_groups)
+  ) {
+    const primary = ((model.sources ?? [])[0] ?? {}) as JsonRecord;
+    const alias = String(primary.alias ?? "t0");
+    const sourceMetrics = ((model.metrics ?? []) as JsonRecord[]).filter(
+      (metric) => metric.source && metric.aggregation,
+    );
+    const graphNodes = (model.calculation_graph?.nodes ?? []) as JsonRecord[];
+    const outputOrder = new Map(
+      ((model.output_fields ?? []) as JsonRecord[]).map((field, index) => [String(field.id), index + 1]),
+    );
+    const outputByNode = new Map(
+      ((model.output_fields ?? []) as JsonRecord[])
+        .filter((field) => field.calculation_node)
+        .map((field) => [String(field.calculation_node), field]),
+    );
+    const metricFields = sourceMetrics.map((metric) => ({
+      id: String(metric.id),
+      label: String(metric.label ?? metric.id),
+      output_type: "number",
+      order: outputOrder.get(String(metric.id)),
+      source: {
+        kind: "column",
+        alias: String((metric.source as JsonRecord).table_alias ?? alias),
+        field: String((metric.source as JsonRecord).field ?? ""),
+      },
+      roles: ["output", "metric"],
+    }));
+    const shiftedFields = graphNodes.flatMap((node) => {
+      if (String(node.kind) !== "comparison" || node.output !== true) return [];
+      const comparison = (node.comparison ?? {}) as JsonRecord;
+      const mode = String(comparison.mode ?? "");
+      if (mode !== "chain" && mode !== "yoy") return [];
+      const output = outputByNode.get(String(node.id));
+      const id = String(output?.id ?? node.id);
+      const dependency = String(comparison.base_metric_id ?? (node.depends_on ?? [])[0] ?? "");
+      if (!dependency) return [];
+      return [{
+        id,
+        label: String(output?.label ?? node.label ?? id),
+        output_type: String(node.output_type ?? "number"),
+        order: outputOrder.get(id),
+        source: {
+          kind: "time_shifted",
+          base_metric: dependency,
+          shift: mode,
+          lookback: mode === "yoy" ? 12 : Number(comparison.offset ?? 1),
+          operation: String(comparison.operation ?? "subtract"),
+        },
+        roles: ["output", "metric"],
+      }];
+    });
+    const allConditions = sourceMetrics.flatMap((metric) => (metric.conditions ?? []) as JsonRecord[]);
+    const uniqueConditions = [...new Map(allConditions.map((condition) => [
+      `${condition.field}|${condition.operator}|${JSON.stringify(condition.value)}|${condition.type ?? ""}`,
+      condition,
+    ])).values()];
+    const logicalDelete = uniqueConditions.filter((condition) =>
+      String(condition.field) === "is_delete" || String(condition.type) === "system_condition",
+    );
+    const businessExclusions = uniqueConditions
+      .filter((condition) => !logicalDelete.includes(condition))
+      .map((condition) => ({
+        field: `${alias}.${String(condition.field ?? "")}`,
+        operator: String(condition.operator ?? "eq").replaceAll("_", " ").toUpperCase(),
+        values: Array.isArray(condition.value) ? condition.value : [condition.value],
+        placement: "WHERE",
+      }));
+    const existingFields = Array.isArray(configuration.fields) ? configuration.fields as JsonRecord[] : [];
+    const existingIds = new Set(existingFields.map((field) => String(field.id)));
+    configuration.fields = [
+      ...existingFields,
+      ...metricFields.filter((field) => !existingIds.has(field.id)),
+      ...shiftedFields.filter((field) => !existingIds.has(field.id)),
+    ];
+    configuration.query_groups = [{
+      id: "main",
+      primary_alias: alias,
+      primary_table: String(primary.table ?? ""),
+      profile_id: String(primary.profile_id ?? ""),
+      database: String(primary.database ?? ""),
+      group_by: ((model.result_grain?.keys ?? []) as unknown[]).map((key) =>
+        String(key).includes(".") ? String(key) : `${alias}.${String(key)}`,
+      ),
+      metrics: sourceMetrics.map((metric) => ({
+        id: String(metric.id),
+        label: String(metric.label ?? metric.id),
+        field: `${String((metric.source as JsonRecord).table_alias ?? alias)}.${String((metric.source as JsonRecord).field ?? "")}`,
+        output_column: String(metric.id),
+        aggregation: String(metric.aggregation),
+      })),
+      time_filter: { field: "create_time" },
+      system_conditions: logicalDelete.length ? { logical_delete: logicalDelete.map((condition) => ({
+        field: `${alias}.${String(condition.field)}`,
+        operator: String(condition.operator ?? "eq"),
+        value: condition.value,
+      })) } : {},
+      business_exclusions: businessExclusions,
+    }];
+  }
   // The AI's declarative output for group_queries uses a nested per-group format
   // (query_groups[]) that differs from what configurePlan expects (group_queries.queries[]).
   // Normalize it here so applyGroupQueries can consume it.
@@ -6418,6 +6531,10 @@ export async function finalizeStagedPackage(options: {
   await writeJson(paths.configuration, configuration);
   const workspace = resolve(options.workspace);
   const planPath = resolve(options.plan);
+  // Keep the genuine pre-finalize plan.  The normalization below is intentionally
+  // allowed to enrich a transient plan, but a later package failure must not leave
+  // behind removed blockers, injected fields, or an unapproved plan revision.
+  const originalPlan = await readFile(planPath, "utf8");
   const plan = await readJson(planPath);
   // When plan.source.tables is empty or lacks available_fields, fill from the
   // report model so configurePlan can resolve column references. Preserve any
@@ -6529,11 +6646,15 @@ export async function finalizeStagedPackage(options: {
       }
     }
   }
-  // If the plan has no time-range parameter yet, add a create_time filter from the
-  // primary table. Business-metric reports (all required_fields are calculated
-  // expressions) skip the inspect phase's time-column detection; this fallback
-  // ensures every report has at least a basic time filter.
-  if (!(plan.parameters ?? []).some((p: JsonRecord) => p.value_type === "datetime_range")) {
+  // A report gets the default create-time filter only when the selected sources
+  // actually expose a supported create-time column.  Whether inspect already
+  // created the parameter is independent from whether the filter-only field was
+  // registered: business-metric reports commonly have the former but not the
+  // latter.  Keep both contracts in sync for static package validation.
+  const existingTimeParameter = (plan.parameters ?? []).find(
+    (p: JsonRecord) => ["datetime_range", "date_range"].includes(String(p.value_type)),
+  );
+  {
     const candidate =
       (plan.default_time_filter as JsonRecord | undefined) ??
       (plan.default_period_candidates ?? [])[0] ??
@@ -6542,7 +6663,7 @@ export async function finalizeStagedPackage(options: {
       );
     if (candidate) {
       const alias = candidate.alias ?? "t0";
-      const fieldId = String(candidate.field ?? "create_time");
+      const fieldId = String(existingTimeParameter?.id ?? candidate.field ?? "create_time");
       // Also register create_time as a filter-only field so the package validator
       // doesn't reject it ("参数没有对应报表字段").
       const existingFieldIds = new Set((plan.fields ?? []).map((f: JsonRecord) => String(f.id)));
@@ -6571,25 +6692,27 @@ export async function finalizeStagedPackage(options: {
           },
         ];
       }
-      plan.parameters = [
-        ...(plan.parameters ?? []),
-        {
-          id: fieldId,
-          label: "创建时间",
-          value_type: "datetime_range",
-          component: "datetime-range",
-          operators: ["between", "gte", "lte"],
-          default_operator: "between",
-          required: true,
-          system_role: "default_time_filter",
-          output: false,
-          sql_binding: {
-            expression: `${alias}.\`${fieldId}\``,
-            clause: "where",
-            value_adapter: "direct",
+      if (!existingTimeParameter) {
+        plan.parameters = [
+          ...(plan.parameters ?? []),
+          {
+            id: fieldId,
+            label: "创建时间",
+            value_type: "datetime_range",
+            component: "datetime-range",
+            operators: ["between", "gte", "lte"],
+            default_operator: "between",
+            required: true,
+            system_role: "default_time_filter",
+            output: false,
+            sql_binding: {
+              expression: `${alias}.\`${fieldId}\``,
+              clause: "where",
+              value_adapter: "direct",
+            },
           },
-        },
-      ];
+        ];
+      }
     }
   }
   // METRIC_REQUIRES_MODELING blockers are set during inspect for every business-
@@ -6600,7 +6723,6 @@ export async function finalizeStagedPackage(options: {
     (b: JsonRecord) => b.code !== "METRIC_REQUIRES_MODELING",
   );
   await writeJson(planPath, plan);
-  const originalPlan = await readFile(planPath, "utf8");
   const indexPath = join(workspace, "reports", "index.json");
   let originalIndex: string | null = null;
   try { originalIndex = await readFile(indexPath, "utf8"); } catch { /* index may not exist */ }
@@ -6885,6 +7007,19 @@ export async function configurePlan(
   }
 
   const existingFieldIds = new Set((plan.fields ?? []).map((f: JsonRecord) => f.id));
+  // A time-shifted declaration may have injected a base-metric stub before the
+  // normal append pass.  Re-apply the canonical model metadata so its Chinese
+  // label, output type and display order survive that deterministic injection.
+  const configuredFieldById = new Map<string, JsonRecord>(
+    (configuration.fields ?? []).map((field: JsonRecord) => [String(field.id), field]),
+  );
+  for (const field of plan.fields ?? []) {
+    const configured = configuredFieldById.get(String(field.id));
+    if (!configured) continue;
+    if (configured.label) field.label = configured.label;
+    if (configured.output_type) field.output_type = configured.output_type;
+    if (configured.order !== undefined) field.order = configured.order;
+  }
   const queryGroupMetricIds = new Set<string>(
     (configuration.query_groups ?? []).flatMap((group: JsonRecord) =>
       (group.metrics ?? []).map((metric: JsonRecord) => String(metric.id ?? "")),
@@ -6903,8 +7038,9 @@ export async function configurePlan(
     // sql_expression resolution happens via applyGroupQueries. Any other new
     // physical column must still be rejected so knowledge lineage cannot be bypassed.
     if (kind === "time_shifted") continue;
-    if (kind === "column" && queryGroupMetricIds.has(String(candidate.id))) continue;
+    const isDeclaredGroupMetric = kind === "column" && queryGroupMetricIds.has(String(candidate.id));
     if (
+      !isDeclaredGroupMetric &&
       kind !== "computed" &&
       kind !== "sql_expression" &&
       !(kind === "script" && plan.script_report)
@@ -7944,10 +8080,17 @@ async function generateScriptPackage(
   await mkdir(join(packageRoot, "tests"), { recursive: true });
   const enumsByField = await buildPackageEnums(workspace, plan);
   const hasEnums = Object.keys(enumsByField).length > 0;
+  // Filter-only fields (notably the default create-time condition) participate
+  // in query bindings and source locks, but are not report columns.  Keeping
+  // them out of fields.json prevents a blank Excel/preview column from being
+  // rendered for every report that has a default time filter.
+  const outputFields = (plan.fields ?? [])
+    .filter((field: JsonRecord) => field.output !== false)
+    .sort((left: JsonRecord, right: JsonRecord) => Number(left.order ?? Number.MAX_SAFE_INTEGER) - Number(right.order ?? Number.MAX_SAFE_INTEGER));
   const fields = {
     schema_version: "2",
     report_id: plan.report.id,
-    fields: (plan.fields ?? []).map((field: JsonRecord, index: number) => ({
+    fields: outputFields.map((field: JsonRecord, index: number) => ({
       id: field.id,
       label: field.label,
       order: field.order ?? index + 1,
@@ -8010,7 +8153,7 @@ async function generateScriptPackage(
     report_requirement: {
       id: plan.report.id,
       name: plan.report.name,
-      fields: (plan.fields ?? []).map((field: JsonRecord) => ({
+      fields: outputFields.map((field: JsonRecord) => ({
         id: field.id,
         label: field.label,
         source: "script",
