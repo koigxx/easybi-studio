@@ -1086,9 +1086,14 @@ export async function inspectReport(options: {
       continue;
     }
     if (matches.length > 1) {
+      const fieldId = stableId(reference.field).replaceAll("-", "_");
       blockers.push({
         code: "FIELD_AMBIGUOUS",
         field: raw,
+        field_id: fieldId,
+        label: label ?? raw,
+        description: fieldDescription,
+        roles: roles.length ? roles : ["output"],
         candidates: matches.map(fieldCandidate),
         message: `报表字段 ${raw} 对应多个知识库字段，请从候选 table.field 中确认`,
       });
@@ -3908,6 +3913,16 @@ export async function buildKnowledgeContext(options: {
       const value = String(suggestion);
       requested.add(value.split(".").slice(0, -1).join("."));
       explicitFields.add(value);
+      explicitFields.add(value.split(".").slice(-2).join("."));
+    }
+    // An ambiguous requirement is not a reason to drop it from discovery.  Its
+    // locked candidate columns must be visible to the Agent so it can either
+    // select the confirmed mapping or raise one business question.
+    for (const candidate of blocker.candidates ?? []) {
+      const value = String(candidate);
+      requested.add(value.split(".").slice(0, -1).join("."));
+      explicitFields.add(value);
+      explicitFields.add(value.split(".").slice(-2).join("."));
     }
   }
 
@@ -3960,6 +3975,35 @@ export async function buildKnowledgeContext(options: {
       };
     },
   );
+  // Metrics alone are insufficient modeling input.  Dimensions, filters and
+  // unresolved output fields define the report grain and must survive into the
+  // context pack as first-class intents.
+  const intentIds = new Set(requirementIntents.map((intent: JsonRecord) => String(intent.id)));
+  const addFieldIntent = (value: JsonRecord, index: number): void => {
+    const id = String(value.id ?? value.field_id ?? stableId(String(value.label ?? value.field ?? `field-${index + 1}`)).replaceAll("-", "_"));
+    if (intentIds.has(id)) return;
+    const roles = Array.isArray(value.roles) ? value.roles.map(String) : ["output"];
+    if (!roles.some((role) => ["output", "group", "filter"].includes(role))) return;
+    intentIds.add(id);
+    requirementIntents.push({
+      id,
+      label: String(value.label ?? value.field ?? id),
+      description: String(value.description ?? ""),
+      kind: roles.includes("group") ? "dimension" : roles.includes("filter") ? "filter" : "value",
+      roles,
+      aggregation: "value",
+      entity: "",
+      status_semantic: null,
+      source_field: value.source?.field ?? null,
+      distinct_field: null,
+      conditions: [],
+      comparison: null,
+      confidence: value.code === "FIELD_AMBIGUOUS" ? "unresolved" : null,
+      candidates: value.candidates ?? [],
+    });
+  };
+  (plan.fields ?? []).forEach((field: JsonRecord, index: number) => addFieldIntent(field, index));
+  (plan.blockers ?? []).forEach((blocker: JsonRecord, index: number) => addFieldIntent(blocker, index + (plan.fields ?? []).length));
 
   let enumCatalog: JsonRecord = { dictionaries: [], bindings: [] };
   try {
@@ -4053,7 +4097,7 @@ export async function buildKnowledgeContext(options: {
         const physicalName = String(field.physical?.name ?? "");
         let score = selectedExplicitly ? 15 : 0;
         const reasons: string[] = [];
-        if (explicitFields.has(fieldIdentity(table, field))) {
+        if (explicitFields.has(fieldIdentity(table, field)) || explicitFields.has(`${physical.database}.${fieldIdentity(table, field)}`)) {
           score += 100;
           reasons.push("inspect 候选");
         }
@@ -4666,7 +4710,7 @@ export async function initializeReportModel(options: { plan: string; out: string
     recommended_strategy: plan.execution_plan?.strategy ?? "sql",
     query_contracts: initialQueryContracts(plan),
     output_fields: (plan.fields ?? []).map((field: JsonRecord) => ({
-      id: field.id, label: field.label, kind: "data", route: "query", query_id: "main",
+      id: field.id, label: field.label, kind: "data", route: "query", query_id: "main", query_column: field.id,
     })),
     open_questions: (() => {
       const seen = new Map<string, JsonRecord>();
@@ -5068,6 +5112,14 @@ function validateOutputFieldsValue(model: JsonRecord): string[] {
   const graphIds = new Set((model.calculation_graph?.nodes ?? []).map((node: JsonRecord) => String(node.id)));
   const metricIds = new Set((model.metrics ?? []).map((metric: JsonRecord) => String(metric.id)));
   const queryIds = new Set((model.query_contracts ?? []).map((query: JsonRecord) => String(query.id)));
+  const queryColumns = new Map<string, Set<string>>(
+    (model.query_contracts ?? []).map((query: JsonRecord) => [
+      String(query.id ?? ''),
+      new Set((query.output ?? query.output_contract ?? []).map((column: JsonRecord | string) =>
+        String(typeof column === 'string' ? column : column.name ?? column.id ?? ''),
+      )),
+    ]),
+  );
   for (const field of model.output_fields) {
     const id = String(field?.id ?? "").trim();
     const label = String(field?.label ?? "").trim();
@@ -5075,8 +5127,24 @@ function validateOutputFieldsValue(model: JsonRecord): string[] {
     seen.add(id);
     if (!label) errors.push(`输出字段 ${id || "?"} 缺少名称`);
     if (!["data", "metric", "calculation"].includes(String(field?.kind ?? ""))) errors.push(`输出字段 ${id || "?"} 类型不支持`);
-    if (!["query", "metric", "calculation_graph"].includes(String(field?.route ?? ""))) errors.push(`输出字段 ${id || "?"} 缺少生成路径`);
-    if (field?.query_id && !queryIds.has(String(field.query_id))) errors.push(`输出字段 ${id || "?"} 引用了未知查询契约：${field.query_id}`);
+    const route = String(field?.route ?? '');
+    if (!["query", "metric", "calculation_graph"].includes(route)) errors.push(`输出字段 ${id || "?"} 缺少生成路径`);
+    if (field?.source_query != null || field?.contract_column != null) {
+      errors.push(`输出字段 ${id || "?"} 使用了废弃血缘字段；只允许 query_id/query_column`);
+    }
+    if (route === 'query') {
+      const queryId = String(field?.query_id ?? '').trim();
+      const queryColumn = String(field?.query_column ?? '').trim();
+      if (!queryId) errors.push(`输出字段 ${id || "?"} 缺少 query_id`);
+      else if (!queryIds.has(queryId)) errors.push(`输出字段 ${id || "?"} 引用了未知查询契约：${queryId}`);
+      if (!queryColumn) errors.push(`输出字段 ${id || "?"} 缺少 query_column`);
+      else if (queryId && !queryColumns.get(queryId)?.has(queryColumn)) {
+        errors.push(`输出字段 ${id || "?"} 的 query_column 不在查询契约 ${queryId} 中：${queryColumn}`);
+      }
+    }
+    if (route === 'metric' && !field?.metric_id) {
+      errors.push(`输出字段 ${id || "?"} 缺少 metric_id`);
+    }
     if (field?.calculation_node && !graphIds.has(String(field.calculation_node))) errors.push(`输出字段 ${id || "?"} 引用了未知计算节点：${field.calculation_node}`);
     if (field?.metric_id && !metricIds.has(String(field.metric_id))) errors.push(`输出字段 ${id || "?"} 引用了未知指标：${field.metric_id}`);
     if (field?.route === "calculation_graph" && !field?.calculation_node) errors.push(`输出字段 ${id || "?"} 缺少 calculation_node`);
@@ -5219,6 +5287,35 @@ export function validateReportModelValue(model: JsonRecord, requireApproved = fa
   return errors;
 }
 
+/** Verify that a structurally-valid model did not drop report-owned output/group fields. */
+function validateModelRequirementCoverage(model: JsonRecord, plan: JsonRecord): string[] {
+  const errors: string[] = [];
+  const outputs = (model.output_fields ?? []) as JsonRecord[];
+  const normalized = (value: unknown): string => String(value ?? "").trim().toLocaleLowerCase();
+  const hasOutput = (requirement: JsonRecord): boolean => {
+    const ids = new Set([String(requirement.id ?? ""), String(requirement.field_id ?? "")].filter(Boolean));
+    const labels = new Set([normalized(requirement.label), normalized(requirement.field)].filter(Boolean));
+    return outputs.some((output) => ids.has(String(output.id ?? "")) || labels.has(normalized(output.label)));
+  };
+  const requirements: JsonRecord[] = [
+    ...(plan.fields ?? []),
+    ...(plan.blockers ?? []).filter((blocker: JsonRecord) => String(blocker.code) !== "METRIC_REQUIRES_MODELING"),
+  ];
+  let requiresGroup = false;
+  for (const requirement of requirements) {
+    const roles = Array.isArray(requirement.roles) ? requirement.roles.map(String) : ["output"];
+    if (!roles.includes("output") && !roles.includes("group")) continue;
+    if (!hasOutput(requirement)) {
+      errors.push(`模型遗漏报表需求字段：${String(requirement.label ?? requirement.field ?? requirement.id ?? "?")}`);
+    }
+    if (roles.includes("group")) requiresGroup = true;
+  }
+  if (requiresGroup && !(model.result_grain?.keys ?? []).length) {
+    errors.push("报表声明了分组字段，但模型结果粒度没有稳定分组键");
+  }
+  return errors;
+}
+
 export async function approveReportModel(
   modelPath: string,
   reviewedBy: string,
@@ -5309,6 +5406,17 @@ function compactModelTable(table: JsonRecord, allowedFields: Set<string>): JsonR
 }
 
 function compactDiscoveryPlan(plan: JsonRecord): JsonRecord {
+  const compactSourceTable = (table: JsonRecord | null | undefined): JsonRecord | null => {
+    if (!table) return null;
+    return {
+      profile_id: table.profile_id,
+      database: table.database,
+      table: table.table,
+      alias: table.alias,
+      table_id: table.table_id,
+      schema_fingerprint: table.schema_fingerprint,
+    };
+  };
   return {
     plan_format_version: plan.plan_format_version,
     report: plan.report,
@@ -5326,7 +5434,14 @@ function compactDiscoveryPlan(plan: JsonRecord): JsonRecord {
       time_semantics: plan.semantic_plan?.time_semantics ?? [],
       exclusions: plan.semantic_plan?.exclusions ?? [],
     },
-    source: plan.source,
+    // The knowledge slice below is the sole owner of physical field metadata.
+    // Repeating every source table's available_fields here can exceed the phase
+    // context cap before the Agent sees any useful modeling information.
+    source: {
+      primary_table: compactSourceTable(plan.source?.primary_table),
+      tables: (plan.source?.tables ?? []).map((table: JsonRecord) => compactSourceTable(table)),
+      joins: plan.source?.joins ?? [],
+    },
     fields: (plan.fields ?? []).map((field: JsonRecord) => ({
       id: field.id,
       label: field.label,
@@ -5334,6 +5449,16 @@ function compactDiscoveryPlan(plan: JsonRecord): JsonRecord {
       source: field.source,
       roles: field.roles ?? [],
       description: field.description ?? "",
+    })),
+    blockers: (plan.blockers ?? []).map((blocker: JsonRecord) => ({
+      code: blocker.code,
+      field_id: blocker.field_id,
+      field: blocker.field,
+      label: blocker.label ?? blocker.field,
+      description: blocker.description ?? "",
+      roles: blocker.roles ?? ["output"],
+      candidates: blocker.candidates ?? [],
+      metric_intent: blocker.metric_intent ?? null,
     })),
     parameters: plan.parameters ?? [],
     system_conditions: plan.system_conditions ?? [],
@@ -5888,6 +6013,9 @@ export async function validateStagedArtifacts(options: {
       await writeCompiledCalculationArtifacts(model, paths);
     }
     errors.push(...validateReportModelValue(model, options.requireApprovedModel ?? ["query", "script"].includes(options.phase)));
+    // A report model is an implementation of this exact plan, not a generic
+    // query graph.  Reject a model that silently drops a requested dimension.
+    errors.push(...validateModelRequirementCoverage(model, plan));
     errors.push(...calculationPlanErrors(model));
     const semanticPlan = await readRequiredJson(paths.semanticPlan, "语义计划");
     let executionPlan = await readRequiredJson(paths.executionPlan, "执行计划");

@@ -1947,6 +1947,27 @@ test("staged report model builds query/script context packs without leaking phys
         out: join(fixture.workspace, "work", "invalid-context.json"),
     }), /未知阶段/);
 });
+test("report model rejects deprecated output lineage aliases", async () => {
+    const fixture = await createFixture();
+    await inspectReport({
+        workspace: fixture.workspace,
+        knowledge: fixture.knowledge,
+        reportId: "driver-detail",
+        out: fixture.plan,
+    });
+    const model = await initializeReportModel({
+        plan: fixture.plan,
+        out: join(fixture.workspace, "work", "output-lineage-model.json"),
+    });
+    model.result_grain.keys = ["code"];
+    model.open_questions = [];
+    const output = model.output_fields[0];
+    output.source_query = output.query_id;
+    output.contract_column = output.query_column;
+    delete output.query_id;
+    delete output.query_column;
+    assert.match(validateReportModelValue(model).join("\n"), /废弃血缘字段/);
+});
 test("discovery context infers metric intent, resolves enums, and enforces the field/byte budget", async () => {
     const fixture = await createFixture();
     await addStatusEnumField(fixture);

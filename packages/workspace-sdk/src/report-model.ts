@@ -874,7 +874,9 @@ export async function readReportModel(
           if (!name || seen.has(name)) return [];
           seen.add(name);
           const outputField = configuredOutputFields.find(
-            (field) => String(field.query_id ?? '') === queryId && String(field.query_column ?? field.id ?? '') === name,
+            (field) =>
+              String(field.query_id ?? '') === queryId &&
+              String(field.query_column ?? field.id ?? '') === name,
           );
           const isDirectData = String(outputField?.kind ?? '') === 'data' || (model.result_grain?.keys ?? []).map(String).includes(name);
           return [{

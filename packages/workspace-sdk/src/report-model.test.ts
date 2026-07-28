@@ -188,6 +188,28 @@ describe('current report model', () => {
     ]));
   });
 
+  it('exposes output lineage from the canonical query_id and query_column fields', async () => {
+    const modelPath = join(ws, 'reports', 'models', 'r1', 'report-model.json');
+    const model = JSON.parse(await readFile(modelPath, 'utf8')) as TestModel & {
+      query_contracts: Array<Record<string, unknown>>;
+      output_fields?: unknown[];
+    };
+    model.query_contracts[0]!.output = [
+      { name: 'shipper_name', label: '客户名称', type: 'varchar', source: 't0.customer_id' },
+    ];
+    model.output_fields = [{
+      id: 'shipper_name', label: '客户名称', kind: 'data', route: 'query',
+      query_id: 'main', query_column: 'shipper_name',
+    }];
+    model.approval = { status: 'approved', model_hash: hashModel(model) };
+    await json(modelPath, model);
+
+    const detail = await readReportModel(ws, 'r1');
+    expect(detail.outputFields).toEqual([expect.objectContaining({
+      id: 'shipper_name', queryId: 'main', queryColumn: 'shipper_name', source: 't0.customer_id',
+    })]);
+  });
+
   it('reseals only live calculation outputs and removes retired flat model lineage', async () => {
     const modelPath = join(ws, 'reports', 'models', 'r1', 'report-model.json');
     const model = JSON.parse(await readFile(modelPath, 'utf8')) as TestModel & {

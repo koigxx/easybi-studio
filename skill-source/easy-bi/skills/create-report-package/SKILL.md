@@ -180,7 +180,10 @@ The final model also carries three deterministic contracts. `input_lock` records
 knowledge snapshot and report requirement revision used for this model; it is immutable during
 modeling. `output_fields` is the business-facing field registry: every requested result field has
 one stable `id`, `label`, `kind` (`data|metric|calculation`) and route
-(`query|metric|calculation_graph`); a calculation route must reference its graph node. The CLI
+(`query|metric|calculation_graph`). Every `query` route MUST use the exact `query_id` and
+`query_column` from one query contract; every `metric` route MUST use its exact `metric_id`.
+`source_query` and `contract_column` are invalid. A calculation route must reference its graph
+node. The CLI
 derives `calculation_plan` v2 from the graph in dependency order and decides SQL versus script for
 `auto` nodes. The compiler writes `compiled-calculation-plan.json` and `compiled-output-map.json`:
 each output has one explicit query or script target, and the later query/script Agents must consume

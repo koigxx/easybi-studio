@@ -102,6 +102,9 @@ export function buildReportPhasePrompt(
       '必须保留初始化文件的顶层契约：model_format_version 固定为字符串 "1"，report.id/name 不得改名，' +
       'recommended_strategy 只能是 sql、enrichment、group_queries、script 之一；group_transform 是执行步骤而不是策略值。' +
       '按 requirement_intents 和 candidate_sets 为每个指标生成 metric_hypotheses（来源、聚合、条件、去重键、证据、置信度），并生成必要的 relationship_hypotheses。' +
+      '所有 roles 含 group 的 requirement_intents 都是不可遗漏的结果维度：必须选择其物理字段，写入结果粒度和 selected_tables 字段白名单；不得将该报表降级为单行汇总。' +
+      '当指标来自订单、运单、派车单等多个事实实体且要求按同一维度汇总时，必须推荐 group_queries：每个事实实体独立聚合、经最短关联路径输出相同稳定维度键，再合并；不得把多个事实表直接 JOIN 后计数，也不得使用 _constant 作为分组合并键。' +
+      '若一个事实记录可通过其下属记录归属多个分组（例如一张派车单下有多个客户的运单），不要以 SQL JOIN 伪造单一归属；应推荐 script 策略，分别查询事实记录和归属映射，在脚本中将该事实计入每个唯一归属键，并明确记录多归属计数规则。' +
       'selected_tables 只能包含实际采用的来源表，每张表必须至少选择一个 Context Pack 中真实存在的字段；不得加入 excluded/无关表，不得虚构候选字段或关联字段。' +
       '只有未明确的业务口径才写成结构化 open_questions。每个问题必须是 JSON 对象 {id, question, options, recommended, required, affected_metrics, impact}，禁止写成纯字符串。' +
       'id 必须唯一且有语义（如 q_order_semantics），不能为空或重复；options 至少 2 项且每项含 value/label；question 是完整自然语言问题。' +
@@ -114,7 +117,8 @@ export function buildReportPhasePrompt(
     return `${common} 只读取 ${root}/modeling/context.json，其中包含已生成的 discovery model、带 revision/hash 的 confirmation.json 和最小知识切片，运行确定建模阶段命令，` +
       `生成并校验 ${root}/report-model.json、semantic-plan.json、execution-plan.json 和模型内逐查询 query contracts。` +
       '必须严格沿用 Context Pack 的 model_format_version="1"、report.id/name、input_lock、sources/relationships/query_contracts/output_fields 字段名和四种合法 recommended_strategy；不得自创格式版本或字段名。' +
-      'input_lock 必须原样保留。output_fields 必须覆盖每个业务输出字段，并为公式、对比、窗口或跨查询结果关联 calculation_graph 节点；CLI 会据此确定生成路径。' +
+      'input_lock 必须原样保留。output_fields 必须覆盖每个业务输出字段：route=query 时必须使用标准 query_id 与 query_column；route=metric 时必须使用 metric_id；不得使用 source_query、contract_column 等别名。为公式、对比、窗口或跨查询结果关联 calculation_graph 节点；CLI 会据此确定生成路径。' +
+      '若 discovery 含 group 维度或 group_queries 策略，result_grain 必须包含稳定键；每个 query_contract 必须输出该键及展示维度，且跨事实查询必须按该键合并，不能使用常量键。' +
       'report-model.json 必须写入 confirmation.discovery_revision 和 confirmation.confirmation_hash，且与 Context Pack 中的统一确认产物完全一致。' +
       `若 recommended_strategy 不是 script，同时生成 ${root}/declarative-configuration.json；不得再提第二轮业务问题，只输出模型摘要，不生成 SQL、report.ts 或报表包。` +
       (userConfirmation ? ' 用户补充说明已经固化在 confirmation.json，不得只依赖本提示文本。' : '');
