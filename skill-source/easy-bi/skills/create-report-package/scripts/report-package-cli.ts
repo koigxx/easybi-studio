@@ -3152,6 +3152,15 @@ function validateScriptSource(source: string): void {
   if (SCRIPT_FORBIDDEN_SOURCE.test(source)) {
     throw new Error("v3 脚本只能使用 ctx API，禁止 import/require/eval/process/fs/net/fetch 等能力");
   }
+  // A syntactically valid `run() { return []; }` is not an executable report.
+  // Every isolated report script must consume at least one declared query and
+  // emit result rows through the controlled runtime API.
+  if (!/\bctx\.(?:queryStream|queryStreamWithFilters|loadIndex|batchLookup)\s*\(/.test(source)) {
+    throw new Error("v3 脚本必须调用至少一个 ctx 查询 API，不能使用空占位 run 函数");
+  }
+  if (!/\b(?:await\s+)?ctx\.emit\s*\(/.test(source)) {
+    throw new Error("v3 脚本必须通过 ctx.emit 输出结果行");
+  }
 }
 
 function safeScriptSql(sql: string, mode: string): void {
@@ -3741,6 +3750,91 @@ function buildTimeShiftedScriptSource(
   lines.push("}");
 
   return lines.join("\n") + "\n";
+}
+
+/**
+ * Comparison nodes have a fixed, safe execution shape: stream the current
+ * aggregate query, stream the shifted ranges, merge by the approved grain, and
+ * emit the calculation outputs. Build that source from the approved model
+ * before staged validation so a placeholder Agent script can never become the
+ * executable report implementation.
+ */
+function buildTimeShiftedScriptSourceFromModel(model: JsonRecord): string | null {
+  const nodes = ((model.calculation_graph as JsonRecord | undefined)?.nodes ?? []) as JsonRecord[];
+  const comparisonNodes = nodes.filter((node) => String(node.kind) === "comparison" && node.output === true);
+  if (!comparisonNodes.length) return null;
+
+  const outputByNode = new Map(
+    ((model.output_fields ?? []) as JsonRecord[])
+      .filter((field) => field.calculation_node)
+      .map((field) => [String(field.calculation_node), field]),
+  );
+  const outputById = new Map(
+    ((model.output_fields ?? []) as JsonRecord[]).map((field) => [String(field.id), field]),
+  );
+  const metricsById = new Map(
+    ((model.metrics ?? []) as JsonRecord[]).map((metric) => [String(metric.id), metric]),
+  );
+  const groupsByShift = new Map<string, TimeShiftGroup>();
+  for (const node of comparisonNodes) {
+    const comparison = (node.comparison ?? {}) as JsonRecord;
+    const shift = String(comparison.mode ?? "");
+    if (shift !== "chain" && shift !== "yoy") continue;
+    const baseMetric = String(comparison.base_metric_id ?? (node.depends_on ?? [])[0] ?? "");
+    const output = outputByNode.get(String(node.id));
+    const baseOutput = outputById.get(baseMetric);
+    const metric = metricsById.get(baseMetric);
+    const baseColumn = String(
+      baseOutput?.query_column ?? metric?.query_column ?? baseMetric,
+    );
+    if (!baseMetric || !output || !baseColumn) continue;
+    const requestedLookback = Number(comparison.offset ?? (shift === "yoy" ? 12 : 1));
+    const effectiveLookback = shift === "yoy" ? 12 : Math.max(1, requestedLookback || 1);
+    const group = groupsByShift.get(shift) ?? {
+      shift,
+      lookback: effectiveLookback,
+      effectiveLookback,
+      fields: [],
+    };
+    group.fields.push({
+      id: String(output.id),
+      label: String(output.label ?? node.label ?? output.id),
+      base_metric: baseMetric,
+      base_column: baseColumn,
+      shift,
+      lookback: effectiveLookback,
+      operation: String(comparison.operation ?? "subtract"),
+    });
+    groupsByShift.set(shift, group);
+  }
+  if (!groupsByShift.size) return null;
+
+  const timeSemantics = model.time_semantics as JsonRecord | JsonRecord[] | undefined;
+  const defaultTime = Array.isArray(timeSemantics)
+    ? timeSemantics.find((item) => String(item.role) === "default_filter")
+    : (timeSemantics?.default_filter as JsonRecord | undefined);
+  const periodParam = String(
+    defaultTime?.parameter_id ??
+    ((model.filters ?? []) as JsonRecord[]).find((filter) =>
+      ["datetime_range", "date_range"].includes(String(filter.value_type ?? "")),
+    )?.id ??
+    "create_time",
+  );
+  const baseFields = [...outputById.values()].map((field) => ({
+    id: String(field.id),
+    label: String(field.label ?? field.id),
+    output_column: String(field.query_column ?? field.id),
+  }));
+  return buildTimeShiftedScriptSource(
+    {
+      fields: baseFields,
+      result_grain: model.result_grain ?? {},
+    },
+    [...groupsByShift.values()],
+    periodParam,
+    (((model.result_grain as JsonRecord | undefined)?.keys ?? []) as unknown[])
+      .map((key: unknown) => String(key).split(".").pop() ?? String(key)),
+  );
 }
 
 /**
@@ -5494,7 +5588,10 @@ function validateModelRequirementCoverage(model: JsonRecord, plan: JsonRecord): 
   };
   const requirements: JsonRecord[] = [
     ...(plan.fields ?? []),
-    ...(plan.blockers ?? []).filter((blocker: JsonRecord) => String(blocker.code) !== "METRIC_REQUIRES_MODELING"),
+    // A modeling blocker is still a report-owned requirement. Excluding
+    // METRIC_REQUIRES_MODELING here allowed a draft containing only dimensions
+    // to pass approval even when every requested metric was absent.
+    ...(plan.blockers ?? []),
   ];
   let requiresGroup = false;
   for (const requirement of requirements) {
@@ -5521,6 +5618,17 @@ export async function approveReportModel(
   const preErrors = validateReportModelValue(model, false);
   if (preErrors.length) throw new Error(preErrors.join("；"));
   if ((model.open_questions ?? []).length) throw new Error("仍有待确认问题，不能批准模型");
+  // Approval is the public boundary between an editable modeling draft and an
+  // executable report. Do the same requirement-coverage check that staged
+  // validation performs here as well; otherwise a structurally valid draft
+  // that only keeps dimensions can be approved while silently dropping every
+  // metric that inspect marked for modeling.
+  let attachedPlan: JsonRecord | null = null;
+  if (planPathValue) {
+    attachedPlan = await readJson(resolve(planPathValue));
+    const coverageErrors = validateModelRequirementCoverage(model, attachedPlan);
+    if (coverageErrors.length) throw new Error(coverageErrors.join("；"));
+  }
   model.approval = {
     status: "approved",
     reviewed_by: reviewedBy,
@@ -5530,7 +5638,7 @@ export async function approveReportModel(
   await writeJson(path, model);
   if (planPathValue) {
     const planPath = resolve(planPathValue);
-    const plan = await readJson(planPath);
+    const plan = attachedPlan!;
     plan.report_model = {
       model_format_version: REPORT_MODEL_FORMAT_VERSION,
       status: "approved",
@@ -6510,6 +6618,11 @@ export async function finalizeStagedPackage(options: {
   const model = await readJson(paths.reportModel);
   const executionPlan = await readJson(paths.executionPlan);
   const strategy = String(model.recommended_strategy ?? executionPlan.strategy ?? "script");
+  const deterministicComparisonScript = buildTimeShiftedScriptSourceFromModel(model);
+  if (deterministicComparisonScript) {
+    await mkdir(dirname(paths.script), { recursive: true });
+    await writeFile(paths.script, deterministicComparisonScript, "utf8");
+  }
   const validation = await validateStagedArtifacts({
     phase: strategy === "script" ? "script" : "query",
     plan: options.plan,
@@ -6586,8 +6699,7 @@ export async function finalizeStagedPackage(options: {
   // package for cross-period comparisons: it runs the same safe aggregate query
   // for current/previous/year-ago ranges and merges them by the confirmed grain.
   if (
-    strategy !== "script" &&
-    Array.isArray(declarative?.query_configurations) &&
+    (strategy === "script" || Array.isArray(declarative?.query_configurations)) &&
     !Array.isArray(configuration.query_groups)
   ) {
     const primary = ((model.sources ?? [])[0] ?? {}) as JsonRecord;
@@ -6875,8 +6987,10 @@ export async function finalizeStagedPackage(options: {
     }
     configuration.fields = [...(configuration.fields ?? []), ...qgFields];
   }
+  const hasDeterministicTimeShiftedCalculation = ((model.calculation_graph?.nodes ?? []) as JsonRecord[])
+    .some((node) => String(node.kind) === "comparison" && node.output === true);
   if (strategy !== "script") delete configuration.script_report;
-  if (strategy === "script") configuration.script_report = {
+  if (strategy === "script" && !hasDeterministicTimeShiftedCalculation) configuration.script_report = {
     queries: await Promise.all((model.query_contracts ?? []).map(async (contract: JsonRecord) => ({
       id: contract.id,
       mode: contract.mode ?? "stream",
@@ -6895,6 +7009,13 @@ export async function finalizeStagedPackage(options: {
   // behind removed blockers, injected fields, or an unapproved plan revision.
   const originalPlan = await readFile(planPath, "utf8");
   const plan = await readJson(planPath);
+  // A previous failed/direct run may have persisted an Agent-provided script.
+  // Comparison models must be lowered through the deterministic time-shifted
+  // compiler below, so clear that stale source before configurePlan decides
+  // whether deferred compilation is needed.
+  if (hasDeterministicTimeShiftedCalculation) {
+    delete (plan as JsonRecord).script_report;
+  }
   // When plan.source.tables is empty or lacks available_fields, fill from the
   // report model so configurePlan can resolve column references. Preserve any
   // extra metadata (table_id, schema_fingerprint, system_conditions) already set

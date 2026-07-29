@@ -2232,6 +2232,18 @@ test("staged report model builds query/script context packs without leaking phys
   const model = await initializeReportModel({ plan: fixture.plan, out: modelPath });
   assert.equal(model.input_lock.knowledge.snapshot_hash, JSON.parse(await readFile(fixture.plan, "utf8")).knowledge.snapshot_hash);
   assert.ok(Array.isArray(model.output_fields));
+  const incompletePath = join(fixture.workspace, "work", "incomplete-model.json");
+  const incomplete = structuredClone(model);
+  incomplete.result_grain.keys = ["code"];
+  const coveragePlanPath = join(fixture.workspace, "work", "coverage-plan.json");
+  const coveragePlan = JSON.parse(await readFile(fixture.plan, "utf8"));
+  coveragePlan.fields.push({ id: "required_but_missing", label: "必须输出字段", roles: ["output"] });
+  await writeFile(coveragePlanPath, JSON.stringify(coveragePlan, null, 2));
+  await writeFile(incompletePath, JSON.stringify(incomplete, null, 2));
+  await assert.rejects(
+    () => approveReportModel(incompletePath, "model-reviewer", coveragePlanPath),
+    /模型遗漏报表需求字段/,
+  );
   model.result_grain.keys = ["code"];
   model.open_questions = [];
   // The model author may select SQL for base aggregates, but comparison nodes
