@@ -155,6 +155,143 @@ async function writePackageChecksums(root: string): Promise<void> {
   );
 }
 
+function markdownCell(value: unknown): string {
+  return String(value ?? "").replaceAll("|", "\\|").replaceAll("\n", "<br>");
+}
+
+function usableLineageText(value: unknown): string | null {
+  const normalized = String(value ?? "").trim();
+  return normalized && normalized !== "unknown" && normalized !== "undefined"
+    ? normalized
+    : null;
+}
+
+function describeFieldSource(
+  source: unknown,
+  sourceByAlias: Map<string, JsonRecord>,
+  fieldLabels: Map<string, string>,
+): string {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return String(source ?? "—");
+  const item = source as JsonRecord;
+  if (item.kind === "column") {
+    const alias = usableLineageText(item.alias);
+    const locked = alias ? sourceByAlias.get(alias) : undefined;
+    const database = usableLineageText(item.database) ?? usableLineageText(locked?.database);
+    const table = usableLineageText(item.table) ?? usableLineageText(locked?.table);
+    const field = usableLineageText(item.field);
+    const physical = [database, table, field].filter(Boolean).join(".");
+    return physical || [alias, field].filter(Boolean).join(".") || "—";
+  }
+  if (item.kind === "sql_expression") return `SQL 表达式：${String(item.expression ?? "—")}`;
+  if (item.kind === "computed") {
+    const dependencies = Array.isArray(item.dependencies) ? item.dependencies.map(String).join("、") : "";
+    return `计算字段${dependencies ? `（依赖：${dependencies}）` : ""}`;
+  }
+  if (item.kind === "time_shifted") {
+    const baseMetric = String(item.base_metric ?? "—");
+    const baseLabel = fieldLabels.get(baseMetric) ?? baseMetric;
+    const shift = item.shift === "yoy" ? "同比" : "环比";
+    const lookback = Number(item.lookback ?? (item.shift === "yoy" ? 12 : 1));
+    const operation = item.operation === "ratio" ? "比率" : item.operation === "percent" ? "百分比变化" : "差值";
+    return `${shift}计算（基于：${baseLabel}；向前 ${lookback} 期；${operation}）`;
+  }
+  if (item.kind === "script") {
+    const lineage = item.lineage;
+    const resolved = describeFieldSource(lineage, sourceByAlias, fieldLabels);
+    return resolved === "—" ? "脚本计算输出" : `脚本聚合 / 计算（来源：${resolved}）`;
+  }
+  return String(item.kind ?? "—");
+}
+
+/** Human-readable package companion; it contains lineage and rules, never credentials or values. */
+async function writeReportLogicMarkdown(packageRoot: string): Promise<void> {
+  const manifest = await readJson(join(packageRoot, "report.manifest.json"));
+  const fields = await readJson(join(packageRoot, "fields.json"));
+  const parameters = await readJson(join(packageRoot, "parameters.schema.json"));
+  const lock = await readJson(join(packageRoot, "knowledge.lock.json"));
+  const execution = await readJson(join(packageRoot, "execution-plan.json")).catch(() => null);
+  const sourceByAlias = new Map<string, JsonRecord>();
+  const addSourcesToMap = (sources: unknown): void => {
+    for (const source of Array.isArray(sources) ? sources : []) {
+      const alias = usableLineageText((source as JsonRecord).alias);
+      if (alias) sourceByAlias.set(alias, source as JsonRecord);
+    }
+  };
+  addSourcesToMap(lock.sources);
+  for (const query of lock.script_query_sources ?? []) addSourcesToMap(query.sources);
+  for (const query of lock.group_query_sources ?? []) addSourcesToMap(query.sources);
+  const fieldLabels = new Map<string, string>(
+    (fields.fields ?? []).map((field: JsonRecord) => [
+      String(field.id),
+      String(field.label ?? field.id),
+    ]),
+  );
+  const lines: string[] = [
+    `# ${String(manifest.name ?? manifest.id ?? "报表")}：报表逻辑说明`,
+    "",
+    "> 本文件由报表包生成流程自动产出，用于查看字段血缘、筛选口径、查询步骤和计算逻辑；不包含数据库连接信息或用户输入值。",
+    "",
+    "## 报表概览",
+    "",
+    "| 项目 | 内容 |",
+    "| --- | --- |",
+    `| 报表 ID | \`${markdownCell(manifest.id)}\` |`,
+    `| 版本 | \`${markdownCell(manifest.version)}\` |`,
+    `| 执行方式 | ${markdownCell(manifest.execution_model ?? manifest.execution_policy?.strategy ?? "SQL / 声明式")} |`,
+    `| SQL 方言 | ${markdownCell(manifest.sql_dialect ?? "mysql")} |`,
+    `| 知识库版本 | ${markdownCell(lock.catalog_version ?? "—")} |`,
+    "",
+    "## 输出字段与实际指向",
+    "",
+    "| 字段 ID | 展示名称 | 类型 | 实际来源 / 计算指向 | 说明 |",
+    "| --- | --- | --- | --- | --- |",
+  ];
+  for (const field of fields.fields ?? []) {
+    lines.push(`| \`${markdownCell(field.id)}\` | ${markdownCell(field.label)} | ${markdownCell(field.value_type)} | ${markdownCell(describeFieldSource(field.source, sourceByAlias, fieldLabels))} | ${markdownCell(field.description ?? "")} |`);
+  }
+  const visible = parameters.parameters ?? parameters.fields ?? [];
+  lines.push("", "## 查询条件", "", "| 参数 | 名称 | 类型 | 必填 | 默认操作符 | 绑定 / 作用位置 |", "| --- | --- | --- | --- | --- | --- |");
+  for (const parameter of visible) {
+    const binding = parameter.sql_binding ?? parameter.binding ?? {};
+    lines.push(`| \`${markdownCell(parameter.id ?? parameter.name)}\` | ${markdownCell(parameter.label)} | ${markdownCell(parameter.value_type ?? parameter.type)} | ${parameter.required ? "是" : "否"} | ${markdownCell(parameter.default_operator ?? "")} | ${markdownCell(binding.expression ?? binding.field ?? "运行时参数化绑定")} |`);
+  }
+  if (!visible.length) lines.push("| — | 本报表没有可见筛选项 | — | — | — | 固定系统条件仍会生效 | ");
+  lines.push("", "## 数据来源", "");
+  const addSources = (title: string, sources: JsonRecord[] = []) => {
+    if (!sources.length) return;
+    lines.push(`### ${title}`, "", "| 别名 | 数据库.表 | 使用字段 |", "| --- | --- | --- |");
+    for (const source of sources) lines.push(`| \`${markdownCell(source.alias)}\` | \`${markdownCell([source.database, source.table].filter(Boolean).join("."))}\` | ${markdownCell((source.fields ?? []).join("、"))} |`);
+    lines.push("");
+  };
+  addSources("主查询", lock.sources);
+  for (const query of lock.script_query_sources ?? []) addSources(`脚本查询：${String(query.id ?? "—")}`, query.sources);
+  for (const query of lock.group_query_sources ?? []) addSources(`独立聚合查询：${String(query.id ?? "—")}`, query.sources);
+  lines.push("## 查询与执行步骤", "");
+  const queryEntries: Array<{ id: string; sql: string; bindings: string }> = [];
+  if (Array.isArray(manifest.queries)) {
+    for (const query of manifest.queries) queryEntries.push({ id: String(query.id), sql: String(query.sql), bindings: String(query.bindings ?? "") });
+  } else {
+    queryEntries.push({ id: "main", sql: "queries/main.sql", bindings: "queries/bindings.json" });
+    for (const query of manifest.group_queries?.queries ?? []) queryEntries.push({ id: String(query.id), sql: String(query.sql), bindings: String(query.bindings) });
+  }
+  for (const query of queryEntries) {
+    lines.push(`### ${query.id}`, "");
+    lines.push(`- 查询文件：\`${query.sql}\``);
+    if (query.bindings) lines.push(`- 参数绑定：\`${query.bindings}\`（运行时使用参数化值，不拼接用户输入）`);
+    try {
+      const sql = await readFile(join(packageRoot, query.sql), "utf8");
+      lines.push("", "```sql", sql.trim(), "```", "");
+    } catch { lines.push("- 查询文件尚未生成。", ""); }
+  }
+  if (Array.isArray(execution?.steps) && execution.steps.length) {
+    lines.push("## 执行流程", "");
+    for (const [index, step] of execution.steps.entries()) lines.push(`${index + 1}. **${markdownCell(step.id ?? step.type ?? "步骤")}**：${markdownCell(step.description ?? step.purpose ?? "执行已批准步骤")}`);
+    lines.push("");
+  }
+  lines.push("## 口径与安全约束", "", "- SQL 仅允许参数化只读查询；用户筛选值不会直接拼入 SQL。", "- 逻辑删除、租户隔离和固定业务条件以查询绑定/SQL 固定条件执行。", "- 脚本报表的跨查询合并、去重和多归属计数规则以 `execution-plan.json` 为准。", "");
+  await writeFile(join(packageRoot, "report-logic.md"), `${lines.join("\n")}\n`, "utf8");
+}
+
 function stableId(value: string): string {
   const normalized = value
     .trim()
@@ -3756,18 +3893,34 @@ function buildScriptReportFromTimeShiftedPlan(
 
   const dialectId = String(plan.knowledge?.profile_engines?.[profileId] ?? plan.sql_dialect ?? "mysql");
 
-  // Lock sources from the plan
-  const availableCols = availableColumnsForPlan(plan);
-  const availableFields = new Set<string>();
-  for (const cols of availableCols.values()) {
-    for (const c of cols) availableFields.add(c);
+  // Lock only physical columns that this query or its runtime bindings actually
+  // reference.  `availableColumnsForPlan` describes the whole knowledge-backed
+  // table and is deliberately broader than an executable query; using it here
+  // made `knowledge.lock.json` (and report-logic.md) claim that every column in
+  // a large table was used.  The source lock is both an audit artifact and the
+  // script query's authorization boundary, so it must stay exact.
+  const usedFields = new Set<string>();
+  const collectReferencedColumns = (value: unknown): void => {
+    for (const match of String(value ?? "").matchAll(dialect.referenceRegex())) {
+      if (String(match[1]) === alias) usedFields.add(String(match[2]));
+    }
+  };
+  collectReferencedColumns(mainSql);
+  for (const parameter of plan.parameters ?? []) {
+    collectReferencedColumns((parameter as JsonRecord).sql_binding?.expression);
+  }
+  for (const binding of plan.context_bindings ?? []) {
+    collectReferencedColumns((binding as JsonRecord).expression);
+  }
+  for (const condition of plan.system_conditions ?? []) {
+    collectReferencedColumns((condition as JsonRecord).expression);
   }
   const sources: JsonRecord[] = [{
     profile_id: profileId,
     database: db,
     table,
     alias,
-    fields: [...availableFields].sort(),
+    fields: [...usedFields].sort(),
   }];
 
   // Generate the script source
@@ -5115,7 +5268,11 @@ function validateOutputFieldsValue(model: JsonRecord): string[] {
   const queryColumns = new Map<string, Set<string>>(
     (model.query_contracts ?? []).map((query: JsonRecord) => [
       String(query.id ?? ''),
-      new Set((query.output ?? query.output_contract ?? []).map((column: JsonRecord | string) =>
+      new Set([
+        ...(query.output ?? query.output_contract ?? []),
+        ...(query.aggregations ?? []),
+        ...(query.comparison_outputs ?? []),
+      ].map((column: JsonRecord | string) =>
         String(typeof column === 'string' ? column : column.name ?? column.id ?? ''),
       )),
     ]),
@@ -5358,6 +5515,42 @@ async function validateAttachedReportModel(plan: JsonRecord, planPath: string): 
   }
   const errors = validateReportModelValue(model, true);
   if (model.approval?.model_hash !== plan.report_model.model_hash) errors.push("计划引用的模型 hash 已变化");
+  // A plan is an executable compilation of the approved model, not an
+  // independent (and potentially weaker) field list.  In particular, a metric
+  // declared as SUM/COUNT in the model must never silently become a bare detail
+  // column, and comparison graph outputs must have an executable script route.
+  // Without this gate an old/stale plan could pass structural package validation
+  // yet export detail rows while claiming to be an aggregate comparison report.
+  const planFields = new Map(
+    (plan.fields ?? []).map((field: JsonRecord) => [String(field.id), field]),
+  );
+  // During staged finalization, time_shifted is deliberately deferred until the
+  // package generator has the final source lock and can materialize its isolated
+  // script.  It is still a valid executable route at approve-plan time; once the
+  // plan reaches generatePackage this marker is consumed and the script is built.
+  const hasDeferredTimeShiftedCompiler = Boolean((plan as JsonRecord)._time_shifted);
+  const modelMetrics = new Map<string, JsonRecord>(
+    (model.metrics ?? []).map((metric: JsonRecord) => [String(metric.id), metric]),
+  );
+  for (const output of model.output_fields ?? []) {
+    const id = String((output as JsonRecord).id ?? "");
+    const metric = modelMetrics.get(id);
+    const compiled = planFields.get(id) as JsonRecord | undefined;
+    if (metric?.aggregation && !plan.script_report && !hasDeferredTimeShiftedCompiler && compiled?.source?.kind === "column") {
+      errors.push(
+        `计划没有编译聚合指标「${String(metric.label ?? id)}」：模型要求 ${String(metric.aggregation)}，但计划仍是明细列；请重新执行报表包编译。`,
+      );
+    }
+    if (
+      String((output as JsonRecord).route ?? "") === "calculation_graph" &&
+      !plan.script_report &&
+      !hasDeferredTimeShiftedCompiler
+    ) {
+      errors.push(
+        `计划没有编译计算字段「${String((output as JsonRecord).label ?? id)}」：计算图输出必须进入脚本执行；请重新执行报表包编译。`,
+      );
+    }
+  }
   if (plan.script_report?.queries?.length) {
     const contracts = new Map((model.query_contracts ?? []).map((query: JsonRecord) => [String(query.id), query]));
     for (const query of plan.script_report.queries) {
@@ -8254,6 +8447,7 @@ async function generateScriptPackage(
       knowledge_lock: "knowledge.lock.json",
       semantic_plan: "semantic-plan.json",
       execution_plan: "execution-plan.json",
+      logic: "report-logic.md",
       ...(hasEnums ? { enums: "enums.json" } : {}),
     },
     queries: (plan.script_report.queries ?? []).map((query: JsonRecord) => ({
@@ -8335,6 +8529,7 @@ async function generateScriptPackage(
       byField: enumsByField,
     });
   }
+  await writeReportLogicMarkdown(packageRoot);
   await writePackageChecksums(packageRoot);
   if (register) await updateReportIndex(workspace, manifest, packageRoot);
   return packageRoot;
@@ -8470,6 +8665,7 @@ export async function generatePackage(options: {
       fields: "fields.json",
       parameters: "parameters.schema.json",
       knowledge_lock: "knowledge.lock.json",
+      logic: "report-logic.md",
       ...(hasEnums ? { enums: "enums.json" } : {}),
     },
     context_bindings: plan.context_bindings,
@@ -8620,6 +8816,7 @@ export async function generatePackage(options: {
     });
   }
 
+  await writeReportLogicMarkdown(packageRoot);
   await writePackageChecksums(packageRoot);
   if (options.register !== false) await updateReportIndex(workspace, manifest, packageRoot);
   return packageRoot;
@@ -8640,6 +8837,7 @@ async function validateScriptPackage(packageRoot: string): Promise<{
     "semantic-plan.json",
     "execution-plan.json",
     "plan-review.md",
+    "report-logic.md",
     "scripts/report.ts",
     "scripts/report.mjs",
     "tests/cases.json",
@@ -8787,6 +8985,7 @@ export async function validatePackage(packageRootValue: string): Promise<{
     "transforms/index.mjs",
     "tests/cases.json",
     "knowledge.lock.json",
+    "report-logic.md",
     "checksums.sha256",
   ];
   for (const file of requiredFiles) {

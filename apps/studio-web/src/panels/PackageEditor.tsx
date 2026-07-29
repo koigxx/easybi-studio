@@ -9,11 +9,13 @@ import {
   CheckCircle2,
   Info,
   Lock,
+  Eye,
   Wand2,
   FlaskConical,
 } from 'lucide-react';
 import { workspaceApi, type ReportPackageDetail } from '../api.js';
 import { useNavigate } from '../nav.js';
+import { ChatMarkdown } from './ChatMarkdown.js';
 
 /**
  * Per-file guidance shown in the editor so a human knows what each package file
@@ -30,9 +32,15 @@ interface FileGuide {
   readonlyReason?: string;
 }
 
-const GROUP_ORDER = ['查询', '字段与表头', '筛选参数', '计算脚本', '测试', '元数据'] as const;
+const GROUP_ORDER = ['说明', '查询', '字段与表头', '筛选参数', '计算脚本', '测试', '元数据'] as const;
 
 const FILE_GUIDE: Record<string, FileGuide> = {
+  'report-logic.md': {
+    group: '说明',
+    title: '报表逻辑说明',
+    purpose: '自动汇总报表字段的实际来源、筛选条件、数据表、查询 SQL 与执行步骤，便于业务和开发共同审阅。',
+    readonlyReason: '由生成流程维护；重新生成报表包会同步更新。',
+  },
   'queries/main.sql': {
     group: '查询',
     title: '主查询 SQL',
@@ -149,6 +157,7 @@ export function PackageEditor({
   const [busy, setBusy] = useState(false);
   const [savedAny, setSavedAny] = useState(false);
   const [phase, setPhase] = useState<Phase>('clean');
+  const [markdownPreview, setMarkdownPreview] = useState(false);
   // Dependency (raw_*) columns available to the transform, read from fields.json.
   const [depColumns, setDepColumns] = useState<string[]>([]);
   const [showDeps, setShowDeps] = useState(false);
@@ -166,6 +175,7 @@ export function PackageEditor({
         setActive(path);
         setContent(f.content);
         setEditable(f.editable);
+        setMarkdownPreview(path.endsWith('.md'));
         setDirty(false);
         setPhase('clean');
       } catch (e) {
@@ -193,6 +203,7 @@ export function PackageEditor({
         setActive(f.path);
         setContent(f.content);
         setEditable(f.editable);
+        setMarkdownPreview(first.path.endsWith('.md'));
         setDirty(false);
         setPhase('clean');
       } catch (e) {
@@ -305,6 +316,7 @@ export function PackageEditor({
   }
 
   const activeGuide = active ? guideFor(active) : null;
+  const isMarkdown = active.endsWith('.md');
   const lineCount = useMemo(() => content.split('\n').length, [content]);
 
   // Group files by purpose for the tree, preserving GROUP_ORDER.
@@ -439,6 +451,17 @@ export function PackageEditor({
                     {active}
                   </span>
                   {!editable && <span className="pkg-editor-tag">只读</span>}
+                  {isMarkdown && (
+                    <button
+                      className="ide-btn ide-btn-sm ide-btn-ghost"
+                      onClick={() => setMarkdownPreview((current) => !current)}
+                      title={markdownPreview ? '查看 Markdown 源码' : '预览 Markdown'}
+                      style={{ marginLeft: 'auto' }}
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                      {markdownPreview ? '源码' : '预览'}
+                    </button>
+                  )}
                 </div>
                 <div className="pkg-editor-desc-body">{activeGuide.purpose}</div>
                 {editable && activeGuide.editHint && (
@@ -473,20 +496,26 @@ export function PackageEditor({
               </div>
             )}
 
-            <textarea
-              ref={textRef}
-              className="ide-input pkg-editor-text ide-text-mono"
-              value={content}
-              readOnly={!editable}
-              spellCheck={false}
-              onKeyDown={onKeyDown}
-              onChange={(e) => {
-                setContent(e.target.value);
-                setDirty(true);
-                setPhase('dirty');
-              }}
-              placeholder={active ? '' : '选择左侧文件开始编辑'}
-            />
+            {isMarkdown && markdownPreview ? (
+              <div className="pkg-editor-text pkg-editor-markdown ide-scroll">
+                <ChatMarkdown text={content} />
+              </div>
+            ) : (
+              <textarea
+                ref={textRef}
+                className="ide-input pkg-editor-text ide-text-mono"
+                value={content}
+                readOnly={!editable}
+                spellCheck={false}
+                onKeyDown={onKeyDown}
+                onChange={(e) => {
+                  setContent(e.target.value);
+                  setDirty(true);
+                  setPhase('dirty');
+                }}
+                placeholder={active ? '' : '选择左侧文件开始编辑'}
+              />
+            )}
             <div className="pkg-editor-foot">
               <span style={{ fontSize: 11.5, color: 'var(--ide-text-tertiary)' }}>
                 {active || '未选择文件'} · {lineCount} 行

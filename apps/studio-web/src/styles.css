@@ -1174,6 +1174,13 @@ body {
   overflow: auto;
   tab-size: 2;
 }
+.pkg-editor-markdown {
+  padding: var(--ide-sp-5);
+  white-space: normal;
+  background: var(--ide-bg-panel);
+  border: 1px solid var(--ide-border);
+  border-radius: var(--ide-radius-md);
+}
 .pkg-editor-foot {
   display: flex;
   align-items: center;

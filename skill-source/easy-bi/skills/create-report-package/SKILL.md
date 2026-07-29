@@ -409,6 +409,12 @@ candidate validates; a published or unregistered target is never overwritten.
 
 Validation must pass plan approval, schema, lineage locks, query safety, dialect quoting, script safety, resource budgets, required files, checksums, filters, ordering, and execution policy. A static pass is not a real export test.
 
+Every generated package also contains `report-logic.md`. It is a read-only business review
+document generated from the packaged fields, parameter schema, knowledge lock, SQL and execution
+plan: output fields map to their actual physical/derived source, visible query conditions and
+bindings are listed, and every packaged query is shown. It must be included in checksums and
+package validation; never put credentials or user-supplied values in it.
+
 For an intentional development edit:
 
 ```bash

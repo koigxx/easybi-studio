@@ -530,10 +530,14 @@ test("generation requires approval and produces a valid package", async () => {
   assert.equal(result.valid, true, result.errors.join("\n"));
   assert.equal(result.warnings.length, 1);
   const sql = await readFile(join(packageRoot, "queries", "main.sql"), "utf8");
+  const logic = await readFile(join(packageRoot, "report-logic.md"), "utf8");
   assert.match(sql, /EASYBI_FILTERS/);
   assert.match(sql, /ORDER BY t0\.`create_time` DESC, t0\.`id` DESC/);
   assert.doesNotMatch(sql, /AND\s+\/\* EASYBI_FILTERS/);
   assert.doesNotMatch(sql, /\$\{/);
+  assert.match(logic, /输出字段与实际指向/);
+  assert.match(logic, /查询条件/);
+  assert.match(logic, /queries\/main\.sql/);
 });
 
 test("falls back to id descending when create time is absent", async () => {
