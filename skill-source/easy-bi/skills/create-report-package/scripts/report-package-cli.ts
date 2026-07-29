@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { stripTypeScriptTypes } from "node:module";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   FLAG_OPERATOR_SYMBOLS,
@@ -22,6 +22,14 @@ import {
 } from "./sql-guard.js";
 
 type JsonRecord = Record<string, any>;
+
+/** Resolve a CLI artifact path relative to its declared workspace, not the
+ * caller's process directory. This keeps `inspect --workspace X --out
+ * reports/plans/a.json` safely contained in X when invoked outside the
+ * workspace (for example from Studio service tests or automation). */
+function resolveWorkspaceArtifactPath(workspace: string, path: string): string {
+  return isAbsolute(path) ? resolve(path) : resolve(workspace, path);
+}
 
 const PACKAGE_FORMAT_VERSION = "2";
 const SCRIPT_PACKAGE_FORMAT_VERSION = "3";
@@ -1638,7 +1646,7 @@ export async function inspectReport(options: {
       reviewed_at: null,
     },
   };
-  await writeJson(resolve(options.out), plan);
+  await writeJson(resolveWorkspaceArtifactPath(workspace, options.out), plan);
   return plan;
 }
 
@@ -2537,7 +2545,10 @@ function buildGroupQueriesScriptSource(
   for (const gid of groupIds) {
     const defs = metricDefsByGroup.get(gid) ?? [];
     lines.push(`  // === Stream ${gid} raw data ===`);
-    lines.push(`  for await (const row of ctx.queryStream("${gid}", ctx.filters)) {`);
+    // queryStream's second argument is reserved for positional SQL values.  The
+    // current filter object must go through the filter-aware API; otherwise the
+    // runtime attempts to spread it as an array (`values is not iterable`).
+    lines.push(`  for await (const row of ctx.queryStreamWithFilters("${gid}", ctx.filters)) {`);
     // Build composite merge key expression
     if (mergeKeyNames.length === 1) {
       lines.push(`    const key = String(row[${JSON.stringify(primaryKey)}] ?? "");`);
@@ -3716,7 +3727,10 @@ function buildTimeShiftedScriptSource(
 
   // Stream main + merge
   lines.push("  // Stream main query and merge time-shifted values");
-  lines.push("  for await (const row of ctx.queryStream('main', ctx.filters)) {");
+  // queryStream accepts positional SQL values, while ctx.filters is a filter
+  // object.  Use the filter-aware API so the current period is compiled into
+  // the main query just like the shifted comparison queries above.
+  lines.push("  for await (const row of ctx.queryStreamWithFilters('main', ctx.filters)) {");
   lines.push(`    const key = ${keyExprQuoted};`);
   lines.push("");
 
@@ -9606,7 +9620,10 @@ async function main(): Promise<void> {
           parameters: plan.parameters.length,
           blockers: plan.blockers,
           warnings: plan.warnings,
-          out: resolve(requiredOption(options, "out")),
+          out: resolveWorkspaceArtifactPath(
+            resolve(requiredOption(options, "workspace")),
+            requiredOption(options, "out"),
+          ),
         },
         null,
         2,

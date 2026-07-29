@@ -29,7 +29,7 @@
 
 ### 当前版本
 
-- Bundle `1.35.21`、知识库 Skill `0.16.0`、报表 Skill `2.34.18`（开发版）。
+- Bundle `1.35.23`、知识库 Skill `0.16.0`、报表 Skill `2.34.20`（开发版）。
 - 数据库支持：MySQL（默认）与 PostgreSQL，经方言层分派；连接类型在配置页可选。
 - 每个 Skill 含面向开发者/管理员的 `使用说明.md`；报表计划为 v2，报表包支持 v2 声明式和 v3 隔离脚本（v1 不读取、不迁移、不执行）；Runtime HTTP API 仍为 v1。
 - 每次同步生成新的不可变版本缓存与 `vendor/easybi-bundle` 快照，不覆盖旧缓存。
@@ -45,6 +45,17 @@
 ---
 
 ## ② 变更历史（倒序）
+
+### CLI 工作区相对路径收敛（bundle 1.35.23）（2026-07-29）
+
+- `inspect --workspace <workspace> --out reports/...` 现在将相对输出路径解析到已声明工作区，而非调用进程的当前目录；自动化或服务从仓库根目录调用时不会再把客户计划误写进产品仓库。
+- **验证**：报表 Skill 全量测试通过；从仓库根目录以相对输出路径执行 inspect，产物落在测试工作区。
+
+### 脚本筛选 API 参数归类修复（bundle 1.35.22）（2026-07-29）
+
+- **根因**：自动生成的多查询与环比/同比脚本曾把 `ctx.filters`（对象）传给 `queryStream` 的位置参数 `values`（数组），运行时展开该对象即报 `values is not iterable`。
+- **整体修复**：所有自动脚本生成分支统一使用 `queryStreamWithFilters(queryId, ctx.filters)`；Runtime 在 IPC 边界校验 `queryStream` 的 `values` 类型，手写脚本误用时返回明确的 `SCRIPT_QUERY_VALUES_INVALID`，不再泄露 JavaScript 原始异常。
+- **验证**：报表 Skill 全量测试通过；重新封包后核验当前、环比、同比三类查询均经筛选 API 调用。
 
 ### comparison 缺失基期的空值语义（bundle 1.35.21）（2026-07-29）
 

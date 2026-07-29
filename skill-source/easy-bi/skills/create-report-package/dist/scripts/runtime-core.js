@@ -1087,6 +1087,14 @@ async function createScriptRows(options) {
     }
     const handlers = {
         async queryStream(queryId, values) {
+            // Keep the two script query APIs unambiguous at the IPC boundary:
+            // queryStream(queryId, values) only accepts positional SQL values, while
+            // filter records must use queryStreamWithFilters(queryId, filters).
+            // This prevents a raw JavaScript spread error from obscuring a malformed
+            // generated or hand-authored script.
+            if (!Array.isArray(values)) {
+                throw new RuntimeError("SCRIPT_QUERY_VALUES_INVALID", `脚本查询 ${queryId} 的 values 必须是数组；筛选条件请使用 queryStreamWithFilters。`);
+            }
             const resolved = await resolveQuery(queryId, "stream");
             const adapter = await executeResolvedQuery(resolved);
             const allValues = [...resolved.values, ...values];
