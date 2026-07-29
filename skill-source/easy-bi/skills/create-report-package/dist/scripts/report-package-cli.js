@@ -3334,6 +3334,14 @@ function buildTimeShiftedScriptSource(plan, shiftGroups, periodParam, groupByKey
                 }
             }
             lines.push("    }");
+            lines.push("    else {");
+            for (const f of g.fields) {
+                // A missing comparison period is not a zero value. Keep the output
+                // column explicit and return null so consumers can distinguish
+                // "no comparable period" from a real zero/unchanged metric.
+                lines.push(`      row[${JSON.stringify(f.id)}] = null;`);
+            }
+            lines.push("    }");
         }
         lines.push("");
     }
