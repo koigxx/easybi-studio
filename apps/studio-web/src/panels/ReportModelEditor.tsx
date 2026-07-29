@@ -765,7 +765,7 @@ function CalculationGraphTab({
     }
     if (node.kind === 'formula') return node.expression || '尚未填写计算公式';
     if (node.kind === 'comparison') {
-      const mode = { difference: '差额', rate: '变化率', chain: '环比', yoy: '同比' }[
+      const mode = { chain: '环比', yoy: '同比' }[
         node.comparisonMode
       ] ?? '时间对比';
       return `${dependencyLabels[0] ?? '未选择基础指标'} · ${mode}`;
@@ -849,7 +849,7 @@ function CalculationGraphTab({
         sourceField: '',
         aggregation: 'sum',
         condition: '',
-        comparisonMode: 'difference',
+        comparisonMode: 'chain',
         comparisonOffset: 1,
         windowFunction: 'running_sum',
         partitionBy: [],
@@ -1368,8 +1368,6 @@ function CalculationGraphTab({
                         value={node.comparisonMode}
                         onChange={(event) => patchNode(index, { comparisonMode: event.target.value })}
                       >
-                        <option value="difference">差额</option>
-                        <option value="rate">变化率</option>
                         <option value="chain">环比</option>
                         <option value="yoy">同比</option>
                       </select>
@@ -1550,7 +1548,7 @@ function FieldDirectoryTab({
           model.metrics.find((item) => item.id === id)?.label ?? id,
         );
         const mode = node?.kind === 'comparison'
-          ? ({ chain: '环比', yoy: '同比', difference: '差额', rate: '变化率' }[node.comparisonMode] ?? '时间对比')
+          ? ({ chain: '环比', yoy: '同比' }[node.comparisonMode] ?? '时间对比')
           : calculationKindLabel(node?.kind ?? 'formula');
         fields.push({
           name: output.id,
@@ -1951,7 +1949,7 @@ function ComparisonSection({ model }: { model: ReportModelDetail }): JSX.Element
           <span style={{ fontSize: 12, color: 'var(--ide-text-tertiary)' }}>当前没有环比、同比或变化率计算。请在「计算模型」中新增对比指标。</span>
         ) : nodes.map((node) => {
           const dependency = node.dependencies.map((id) => model.metrics.find((metric) => metric.id === id)?.label ?? id).join('、');
-          const mode = { chain: '环比', yoy: '同比', difference: '差额', rate: '变化率' }[node.comparisonMode] ?? '时间对比';
+          const mode = { chain: '环比', yoy: '同比' }[node.comparisonMode] ?? '时间对比';
           return (
             <div key={node.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', fontSize: 12 }}>
               <span><strong>{node.label}</strong><span style={{ color: 'var(--ide-text-tertiary)' }}> · 基于 {dependency || '未设置指标'}</span></span>

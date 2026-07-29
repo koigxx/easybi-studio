@@ -43,7 +43,7 @@ const CALCULATION_WINDOWS = new Set([
   'lag',
   'lead',
 ]);
-const CALCULATION_COMPARISONS = new Set(['difference', 'rate', 'chain', 'yoy']);
+const CALCULATION_COMPARISONS = new Set(['chain', 'yoy']);
 const CALCULATION_MERGES = new Set(['add', 'subtract', 'multiply', 'divide', 'coalesce']);
 
 function normalizeCardinality(value: string): string {
@@ -305,6 +305,19 @@ function validateCalculationGraph(model: JsonRecord, sourceFields: Map<string, S
   return errors;
 }
 
+function calculationRequiresScript(model: JsonRecord): boolean {
+  return (model.calculation_graph?.nodes ?? []).some((node: JsonRecord) =>
+    node.output !== false &&
+    (node.kind === 'comparison' || node.kind === 'merge' || node.execution_hint === 'script'),
+  );
+}
+
+function synchronizeModelStrategy(model: JsonRecord): void {
+  if (!calculationRequiresScript(model)) return;
+  model.recommended_strategy = 'script';
+  model.execution_strategy_reason = 'calculation_graph_script_output';
+}
+
 function calculationPlan(model: JsonRecord): JsonRecord {
   const nodes = Array.isArray(model.calculation_graph?.nodes) ? model.calculation_graph.nodes as JsonRecord[] : [];
   const byId = new Map(nodes.map((node) => [String(node.id), node]));
@@ -320,8 +333,10 @@ function calculationPlan(model: JsonRecord): JsonRecord {
   for (const node of nodes) visit(String(node.id));
   return { version: '1', strategy: model.recommended_strategy, steps: ordered.map((node, index) => ({
     order: index + 1, id: node.id, kind: node.kind, dependencies: node.depends_on ?? [],
-    execution: node.execution_hint === 'auto' || !node.execution_hint
-      ? (node.kind === 'merge' || model.recommended_strategy === 'script' ? 'script' : 'sql')
+    execution: node.kind === 'comparison' || node.kind === 'merge'
+      ? 'script'
+      : node.execution_hint === 'auto' || !node.execution_hint
+      ? (model.recommended_strategy === 'script' ? 'script' : 'sql')
       : node.execution_hint,
   })) };
 }
@@ -1285,6 +1300,7 @@ export async function writeReportModel(
         ...(node.description.trim() ? { description: node.description.trim() } : {}),
       })),
     };
+    synchronizeModelStrategy(model);
     model.calculation_plan = calculationPlan(model);
     const existingCalculationOutputs = (model.output_fields ?? []).filter(
       (field: JsonRecord) => String(field.route ?? '') === 'calculation_graph',

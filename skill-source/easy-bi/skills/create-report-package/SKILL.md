@@ -176,6 +176,12 @@ fields must be inside the selected source whitelist. Use this graph for multi-le
 ratios, period comparisons, ranks/running totals/moving averages, and cross-query arithmetic
 instead of hiding business logic only in SQL text or scripts.
 
+Current comparison nodes support only `chain`（环比）and `yoy`（同比）. Both are
+script execution nodes regardless of a manually supplied `execution_hint`: cross-period
+data must be queried and aligned before it can be calculated. Any output comparison or
+cross-query `merge` node therefore makes the final strategy `script`; only a model with
+no such node may retain `sql`/`enrichment`/`group_queries` according to its source grain.
+
 The final model also carries three deterministic contracts. `input_lock` records exactly the
 knowledge snapshot and report requirement revision used for this model; it is immutable during
 modeling. `output_fields` is the business-facing field registry: every requested result field has
@@ -258,6 +264,7 @@ Do not decide only from table count:
 - One fact entity summarized by dimensions: SQL `GROUP BY` or bounded group transform.
 - Independent fact entities or an n:n/multiple-1:n fan-out: `group_queries`, one independently aggregated query per entity, then merge by stable key.
 - Multi-stage lookup, pivot, branching, cross-profile routing, or logic not expressible above: v3 isolated script.
+- Any output `comparison` (chain/yoy) or `merge` calculation node: v3 isolated script.
 
 More than three tables is not automatically wrong; fan-out and unclear grain are. Conversely, an n:n relationship can make even three tables unsafe for one large SQL.
 

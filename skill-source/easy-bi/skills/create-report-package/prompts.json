@@ -7,7 +7,7 @@
       "label": "构建报表建模",
       "hint": "按报表需求检索知识库，统一确认指标、字段和关系，生成唯一当前模型",
       "write": true,
-      "prompt": "阅读 skills/create-report-package/SKILL.md，只执行报表建模。Studio 已根据报表配置生成有字段数和字节预算的 discovery Context Pack；先用候选字段、枚举与关联证据形成 metric_hypotheses 和 relationship_hypotheses，再把来源字段、聚合、去重键、关系基数、筛选分组、时间与排除口径中的所有不清晰事项写成结构化 open_questions。\n\n关键约束：\n1. 每个 open_question 必须是 JSON 对象（{id, question, options, recommended, required, affected_metrics, impact}），绝对不能写成纯字符串；id 必须唯一且有语义（如 q_order_count），不可为空或重复。\n2. 建模产物（report-model.json 等）写入 work/report-model/<id>/<rev>/，禁止写入 work/report-build/（那是生成报表包的目录，本阶段不得触碰）。\n3. 一次统一确认后只使用 confirmation.json 完成模型。\n4. 多级派生、占比、同比环比、窗口累计/排名和跨查询运算必须写入 calculation_graph，显式声明节点 depends_on 和 execution_hint；不得只把业务公式隐藏在 SQL 或脚本描述中。\n\n本动作最终只生成该报表唯一当前模型，禁止生成 SQL、脚本或报表包；不得递归读取整个 knowledge、扫描样本、历史对话或无关报表。"
+      "prompt": "阅读 skills/create-report-package/SKILL.md，只执行报表建模。Studio 已根据报表配置生成有字段数和字节预算的 discovery Context Pack；先用候选字段、枚举与关联证据形成 metric_hypotheses 和 relationship_hypotheses，再把来源字段、聚合、去重键、关系基数、筛选分组、时间与排除口径中的所有不清晰事项写成结构化 open_questions。\n\n关键约束：\n1. 每个 open_question 必须是 JSON 对象（{id, question, options, recommended, required, affected_metrics, impact}），绝对不能写成纯字符串；id 必须唯一且有语义（如 q_order_count），不可为空或重复。\n2. 建模产物（report-model.json 等）写入 work/report-model/<id>/<rev>/，禁止写入 work/report-build/（那是生成报表包的目录，本阶段不得触碰）。\n3. 一次统一确认后只使用 confirmation.json 完成模型。\n4. 多级派生、占比、同比环比、窗口累计/排名和跨查询运算必须写入 calculation_graph，显式声明节点 depends_on 和 execution_hint；不得只把业务公式隐藏在 SQL 或脚本描述中。comparison 仅允许 chain（环比）或 yoy（同比）；任何输出 comparison/merge 节点都必须将 recommended_strategy 设为 script，不能用 execution_hint=sql 绕过。\n\n本动作最终只生成该报表唯一当前模型，禁止生成 SQL、脚本或报表包；不得递归读取整个 knowledge、扫描样本、历史对话或无关报表。"
     },
     {
       "action": "build-report-package",
@@ -21,7 +21,7 @@
       "label": "AI 修改模型",
       "hint": "在现有模型与知识库范围内聊天式修改模型（字段/关系/对比等），不重跑完整建模",
       "write": true,
-      "prompt": "阅读 skills/create-report-package/SKILL.md 中「修改当前模型」部分。当前报表已有一个已确认的模型（reports/models/<report-id>/report-model.json）。你需要：1) 先读懂用户想改什么；2) 只读当前模型的 source.lock.json、semantic-plan.json 和 knowledge 目录中对应表的字段详情，不要重新扫描或跑 discovery；3) 用户可要求增减字段、调整 join 类型/基数、开关环比同比配置、修改筛选、指标口径或 calculation_graph 复杂计算节点；涉及字段歧义或口径变更时简短提问确认，其它直接修改 report-model.json 并调用 finalize-staged-model 重签校验；4) 保持模型 status=approved 不变，禁止修改 result_grain 和 strategy。修改完成后向用户列出变更清单。"
+      "prompt": "阅读 skills/create-report-package/SKILL.md 中「修改当前模型」部分。当前报表已有一个已确认的模型（reports/models/<report-id>/report-model.json）。你需要：1) 先读懂用户想改什么；2) 只读当前模型的 source.lock.json、semantic-plan.json 和 knowledge 目录中对应表的字段详情，不要重新扫描或跑 discovery；3) 用户可要求增减字段、调整 join 类型/基数、开关环比同比配置、修改筛选、指标口径或 calculation_graph 复杂计算节点；涉及字段歧义或口径变更时简短提问确认，其它直接修改 report-model.json 并调用 finalize-staged-model 重签校验；4) 保持模型 status=approved 不变，禁止修改 result_grain；strategy 由模型计算图和来源关系确定性推导，输出 comparison/merge 节点必须是 script。修改完成后向用户列出变更清单。"
     }
   ]
 }

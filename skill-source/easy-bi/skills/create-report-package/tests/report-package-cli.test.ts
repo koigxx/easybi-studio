@@ -1950,6 +1950,13 @@ test("group_queries: generate writes sibling SQL + bindings, merged fields, mani
   const manifest = JSON.parse(await readFile(join(packageRoot, "report.manifest.json"), "utf8"));
   assert.equal(manifest.group_queries.queries.length, 1);
   assert.equal(manifest.group_queries.queries[0].sql, "queries/group-product.sql");
+
+  // The source lock is an authorization list for this query, not a copy of
+  // knowledge metadata. It must retain the time binding and SQL dependencies,
+  // while excluding unrelated available fields such as product_name.
+  const knowledgeLock = JSON.parse(await readFile(join(packageRoot, "knowledge.lock.json"), "utf8"));
+  const productSource = knowledgeLock.group_query_sources[0].sources.find((source: any) => source.alias === "t0");
+  assert.deepEqual(productSource.fields.sort(), ["create_time", "driver_id", "id", "is_delete"]);
   const validation = await validatePackage(packageRoot);
   assert.equal(validation.valid, true, validation.errors.join("\n"));
 });
@@ -2269,6 +2276,25 @@ test("staged report model builds query/script context packs without leaking phys
   const cyclic = structuredClone(model);
   cyclic.calculation_graph.nodes[0].depends_on = ["driver_count_double"];
   assert.match(validateReportModelValue(cyclic).join("\n"), /循环依赖/);
+  // Cross-period comparison is always a script route. A model author must not
+  // be able to force it back to SQL with execution_hint=sql, because the
+  // runtime needs period-shifted queries before it can calculate the result.
+  const comparison = structuredClone(model);
+  comparison.calculation_graph.nodes[1] = {
+    id: "driver_count_double",
+    label: "司机数环比",
+    kind: "comparison",
+    output_type: "number",
+    depends_on: ["driver_count"],
+    comparison: { mode: "chain", offset: 1 },
+    execution_hint: "sql",
+    output: true,
+  };
+  const comparisonPath = join(fixture.workspace, "work", "comparison-model.json");
+  await writeFile(comparisonPath, JSON.stringify(comparison, null, 2));
+  const approvedComparison = await approveReportModel(comparisonPath, "model-reviewer");
+  assert.equal(approvedComparison.recommended_strategy, "script");
+  assert.equal(approvedComparison.calculation_plan.steps[1].execution, "script");
   await writeFile(modelPath, JSON.stringify(model, null, 2));
   const approved = await approveReportModel(modelPath, "model-reviewer", fixture.plan);
   assert.equal(validateReportModelValue(approved, true).length, 0);

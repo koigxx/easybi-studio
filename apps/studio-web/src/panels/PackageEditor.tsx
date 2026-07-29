@@ -41,6 +41,12 @@ const FILE_GUIDE: Record<string, FileGuide> = {
     purpose: '自动汇总报表字段的实际来源、筛选条件、数据表、查询 SQL 与执行步骤，便于业务和开发共同审阅。',
     readonlyReason: '由生成流程维护；重新生成报表包会同步更新。',
   },
+  'execution-plan.json': {
+    group: '说明',
+    title: '已封存执行记录',
+    purpose: '本报表包实际采用的查询与脚本执行步骤。它是本次生成的只读记录，不会影响下一次建模。',
+    readonlyReason: '由封存流程根据已确认模型生成；需要改变策略或口径请编辑当前模型后重新生成报表包。',
+  },
   'queries/main.sql': {
     group: '查询',
     title: '主查询 SQL',

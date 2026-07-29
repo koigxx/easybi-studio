@@ -325,7 +325,7 @@ const MODEL_CALCULATION_KINDS = new Set(["aggregate", "formula", "comparison", "
 const MODEL_CALCULATION_EXECUTION_HINTS = new Set(["auto", "sql", "script"]);
 const MODEL_CALCULATION_AGGREGATIONS = new Set(["sum", "count", "count_distinct", "avg", "min", "max", "first", "last"]);
 const MODEL_CALCULATION_WINDOWS = new Set(["row_number", "rank", "dense_rank", "running_sum", "moving_avg", "lag", "lead"]);
-const MODEL_CALCULATION_COMPARISONS = new Set(["difference", "rate", "chain", "yoy"]);
+const MODEL_CALCULATION_COMPARISONS = new Set(["chain", "yoy"]);
 const MODEL_CALCULATION_MERGES = new Set(["add", "subtract", "multiply", "divide", "coalesce"]);
 function normalizeRelationType(value) {
     const key = value.trim().toLowerCase();
@@ -2378,16 +2378,48 @@ function buildScriptReportFromGroupQueriesPlan(plan, queryGroups) {
             continue;
         const sql = buildGroupQueryRawSql(sibling, plan, defs, mergeKeys);
         const primary = sibling.source?.primary_table;
-        // Collect source table aliases and fields from this sibling
+        const primaryAlias = String(primary?.alias ?? sibling.alias ?? "");
+        // Lock only fields referenced by this sibling's SQL or runtime bindings.
+        // `available_fields` is knowledge metadata, not a query authorization list:
+        // copying it here made group_queries packages falsely claim that every
+        // column of each fact table was used.
+        const usedFieldsByAlias = new Map();
+        const collectReferencedColumns = (value) => {
+            for (const match of String(value ?? "").matchAll(dialect.referenceRegex())) {
+                const field = String(match[2] ?? "");
+                if (!field)
+                    continue;
+                const sourceAlias = String(match[1] ?? "");
+                usedFieldsByAlias.set(sourceAlias, usedFieldsByAlias.get(sourceAlias) ?? new Set());
+                usedFieldsByAlias.get(sourceAlias).add(field);
+            }
+        };
+        collectReferencedColumns(sql);
+        for (const parameter of plan.parameters ?? []) {
+            collectReferencedColumns(parameter.sql_binding?.expression);
+        }
+        for (const binding of plan.context_bindings ?? []) {
+            collectReferencedColumns(binding.expression);
+        }
+        for (const condition of plan.system_conditions ?? []) {
+            collectReferencedColumns(condition.expression);
+        }
+        // Group-query runtime rebinds the shared period parameter to the sibling's
+        // own time column. The raw SQL intentionally contains an EASYBI_FILTERS
+        // marker instead of that predicate, so add this otherwise invisible field
+        // to the source lock explicitly.
+        const periodField = String(sibling.period_field ?? "");
+        if (plan.group_queries?.period_param && periodField) {
+            usedFieldsByAlias.set(primaryAlias, usedFieldsByAlias.get(primaryAlias) ?? new Set());
+            usedFieldsByAlias.get(primaryAlias).add(periodField);
+        }
+        // Collect source table aliases and exact used fields from this sibling.
         const siblingSources = [];
         for (const table of sibling.source?.tables ?? [primary]) {
             if (!table)
                 continue;
             const alias = String(table.alias ?? "");
-            // Use all available fields from the sibling's source tables to cover:
-            // merge keys, JOIN ON columns, system conditions, and metric fields.
-            const tableFields = table.available_fields ?? [];
-            const fields = [...new Set(tableFields.map(String))];
+            const fields = [...(usedFieldsByAlias.get(alias) ?? new Set())].sort();
             // Dedup by alias
             const existing = siblingSources.find((s) => String(s.alias ?? "") === alias);
             if (existing) {
@@ -3341,6 +3373,11 @@ function buildScriptReportFromTimeShiftedPlan(plan, shiftGroups, periodParam, qu
     // 3. Also include plan.fields that are NOT time_shifted and NOT already in group_by
     //    (e.g., extra dimension columns from inspectReport)
     for (const field of plan.fields ?? []) {
+        // Filter-only fields (notably the default create-time range) must remain
+        // available to bindings and source locks, but are not report values and do
+        // not need a meaningless MAX()/SELECT column in the aggregate query.
+        if (field.output === false)
+            continue;
         const kind = String(field.source?.kind ?? "");
         if (kind === "time_shifted")
             continue;
@@ -4223,11 +4260,13 @@ export function compileCalculationPlan(model) {
         // Auto routing is deliberately conservative. Cross-query merge and period
         // comparison need materialised rows; aggregate/formula/window remain in the
         // query compiler unless the model explicitly asks for a script.
-        const execution = hint !== "auto"
-            ? hint
-            : (kind === "merge" || kind === "comparison" || model.recommended_strategy === "script"
-                ? "script"
-                : "sql");
+        const execution = kind === "merge" || kind === "comparison"
+            ? "script"
+            : hint !== "auto"
+                ? hint
+                : (model.recommended_strategy === "script"
+                    ? "script"
+                    : "sql");
         const step = {
             order: index + 1,
             id: node.id,

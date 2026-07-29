@@ -332,7 +332,8 @@ export function ReportsPanel({ project }: { project: Project }): JSX.Element {
                   style={{ color: 'var(--ide-text-tertiary)', marginTop: 2 }}
                 />
                 <div style={{ fontSize: 12.5, color: 'var(--ide-text-secondary)', lineHeight: 1.6 }}>
-                  一个报表需求只对应一个当前模型和一个当前报表包。先构建模型，建模过程中只进行一次统一确认；
+                  一个报表需求只对应一个当前模型和一个当前报表包。当前模型是下一次生成的唯一可维护依据；
+                  报表包中的「已封存执行记录」仅说明该版本实际执行了什么，不会反向覆盖模型。先构建模型，建模过程中只进行一次统一确认；
                   模型生成后可在本页调整表字段与关联关系。只有模型处于「已确认」状态时，才能执行「生成报表」。
                   生成完成后到「测试」页启动 Runtime、填写筛选并导出 Excel。
                 </div>

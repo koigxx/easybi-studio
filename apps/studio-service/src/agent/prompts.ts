@@ -117,7 +117,7 @@ export function buildReportPhasePrompt(
     return `${common} 只读取 ${root}/modeling/context.json，其中包含已生成的 discovery model、带 revision/hash 的 confirmation.json 和最小知识切片，运行确定建模阶段命令，` +
       `生成并校验 ${root}/report-model.json、semantic-plan.json、execution-plan.json 和模型内逐查询 query contracts。` +
       '必须严格沿用 Context Pack 的 model_format_version="1"、report.id/name、input_lock、sources/relationships/query_contracts/output_fields 字段名和四种合法 recommended_strategy；不得自创格式版本或字段名。' +
-      'input_lock 必须原样保留。output_fields 必须覆盖每个业务输出字段：route=query 时必须使用标准 query_id 与 query_column；route=metric 时必须使用 metric_id；不得使用 source_query、contract_column 等别名。为公式、对比、窗口或跨查询结果关联 calculation_graph 节点；CLI 会据此确定生成路径。' +
+      'input_lock 必须原样保留。output_fields 必须覆盖每个业务输出字段：route=query 时必须使用标准 query_id 与 query_column；route=metric 时必须使用 metric_id；不得使用 source_query、contract_column 等别名。为公式、对比、窗口或跨查询结果关联 calculation_graph 节点；CLI 会据此确定生成路径。comparison 仅允许 chain（环比）或 yoy（同比），且 comparison/merge 或 execution_hint=script 的输出节点必须选择 recommended_strategy=script；单查询、无脚本节点的安全聚合才可选择 sql。' +
       '若 discovery 含 group 维度或 group_queries 策略，result_grain 必须包含稳定键；每个 query_contract 必须输出该键及展示维度，且跨事实查询必须按该键合并，不能使用常量键。' +
       'report-model.json 必须写入 confirmation.discovery_revision 和 confirmation.confirmation_hash，且与 Context Pack 中的统一确认产物完全一致。' +
       `若 recommended_strategy 不是 script，同时生成 ${root}/declarative-configuration.json；不得再提第二轮业务问题，只输出模型摘要，不生成 SQL、report.ts 或报表包。` +
