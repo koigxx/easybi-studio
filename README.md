@@ -1,7 +1,6 @@
 # Easy BI Studio
 
-本地独立的 Easy BI Studio 产品工程。先对接本机 Claude Code，后续通过 AgentBridge 适配接入 Innos。
-
+本地独立的 Easy BI Studio 产品工程。先对接本机 Claude Code，初版，功能暂未完善。
 **单仓库分发**：本仓库同时包含 Studio 应用代码与内置的技能包源（`skill-source/easy-bi/`）。
 `git clone` 一个仓库即可获得运行所需的全部内容——无需另外获取技能包。
 
